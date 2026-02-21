@@ -76,7 +76,7 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 ### 2. 平台内置组件部署
 
 - R-CMP-001：组件镜像存放在平台镜像仓库（平台部署后可用）。
-- R-CMP-002：提供组件高可用部署模板，技术路线优先级为 Helm > Kustomize > 原生 YAML。
+- R-CMP-002：提供组件高可用部署模板，模板形式仅支持 Helm。
 - R-CMP-003：组件实例创建时支持目标集群、资源规格、存储配置
   （SC + 容量）、规模、环境配置、Service 暴露策略
   （ClusterIP/NodePort）等参数，不包含 Ingress 相关配置。
@@ -149,7 +149,7 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
   - 主标识：`template_id`
   - 唯一约束：`(component_name, template_version)` 唯一
   - 删除策略：软删
-  - 备注：保存参数 schema 与渲染路线
+  - 备注：保存参数 schema 与 Helm 模板元数据
 - `ComponentInstance`
   - 主标识：`component_instance_id`
   - 唯一约束：`(workspace_id, cluster_id, component_instance_name)` 唯一
