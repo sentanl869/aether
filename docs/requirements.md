@@ -66,12 +66,19 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 ## 资源分层与关键概念
 
 - 工作空间（Workspace）：资源与权限边界；每个关联集群中映射一个同名 namespace。
-- 资源类型（Resource Kind）：
+- 一级资源类型（L1 Resource Kind）：部署模块对外提供独立业务语义与管理边界的资源，固定 5 类：
   - 数据服务组件（Postgres、Redis、mem0、milvus、weaviate、pgvector、neo4j、NebulaGraph、MongoDB、MinIO）
   - 低代码平台（Dify、FastGPT、Coze Studio、n8n）
   - DevBox
   - 网关（Higress）
   - 高代码应用（openclaw、zeroclaw 等）
+- 支撑资源（Supporting Resource）：服务于一级资源的领域对象，包括
+  `AgentInstance`、`HighCodeArtifact`、`DevBoxPublishRecord`、
+  `HighCodeReleaseChart` 及各类关系引用对象。部分支撑资源可提供独立 CRUD
+  接口，但不计入“一级资源类型”口径。
+- 统一运行抽象（Runtime Abstraction）：一级资源与支撑资源最终都映射为
+  K8S Workload/Service/PVC/Secret 等对象集合；Pod 仅作为运行时观测对象，
+  不作为控制面领域主实体。
 - 资源模板（Template）：平台内置或管理员导入的 Helm Chart 模板与参数 schema。
 - 资源实例（Instance）：模板或制品在指定工作空间/集群/namespace 的运行实体。
 - 高代码制品（HighCode Artifact）：用于高代码应用部署的镜像或 Helm Chart 来源。
@@ -104,6 +111,10 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 - R-ABS-004：新增资源类型时，不得重写任务队列、鉴权、审计、状态机主流程，只允许新增资源 schema 与适配器实现。
 - R-ABS-005：统一资源标签规范：`workspace_id`、`cluster_id`、`resource_kind`、`resource_id`、`owner_kind`、`owner_id`。
 - R-ABS-006：所有资源的可观测字段（状态、事件、最近任务）结构统一，便于通用列表与运维视图复用。
+- R-ABS-007：领域模型采用“一级资源 + 支撑资源”分层；5 类一级资源口径用于权限矩阵、配额统计、审计报表与对外能力边界。
+- R-ABS-008：控制面不得以 Pod 作为业务主实体；Pod/ReplicaSet/Job
+  等仅作为运行时观测对象，并通过 `resource_kind/resource_id`
+  回挂到领域实例。
 
 ### 3. 数据服务组件
 
@@ -215,6 +226,12 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 
 ## 领域模型与唯一性约束（设计输入）
 
+模型分层约束：
+
+- 一级资源实体固定为：`DataServiceInstance`、`LowCodePlatformInstance`、`DevBoxInstance`、`GatewayInstance`、`HighCodeApplication`。
+- 支撑资源实体包括：`AgentInstance`、`HighCodeArtifact`、`DevBoxPublishRecord`、`HighCodeReleaseChart`、关系引用实体、任务实体与密钥版本实体。
+- 一级资源承担平台一级能力边界；支撑资源可独立存储或独立接口化，但不改变“5 类一级资源”口径。
+
 - `Workspace`
   - 主标识：`workspace_id`
   - 唯一约束：`workspace_name` 全局唯一
@@ -306,7 +323,7 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 
 ## 资源状态机（设计输入）
 
-### 资源状态（六类核心资源）
+### 资源状态（五类一级资源 + AgentInstance）
 
 - `Creating`：已受理创建任务，资源尚未可用。
 - `Running`：资源可用，健康检查通过。
@@ -316,6 +333,8 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 - `Deleting`：资源删除进行中。
 - `Deleted`：资源逻辑删除完成。
 - `DeleteFailed`：删除失败，需重试或人工干预。
+
+说明：上述状态为控制面领域状态，不与 K8S Pod Phase 一一对应。
 
 DevBox 补充状态：
 
