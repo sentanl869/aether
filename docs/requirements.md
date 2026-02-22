@@ -383,22 +383,74 @@ DevBox 补充状态：
 
 ### 资源接口分组
 
-- `POST/GET/LIST/PATCH/DELETE /data-service-instances`
-- `GET /data-service-templates`、`GET /data-service-templates/{id}`
-- `POST/GET/LIST/PATCH/DELETE /lowcode-platform-instances`
-- `GET /lowcode-platform-templates`、`GET /lowcode-platform-templates/{id}`
-- `POST/GET/LIST/PATCH/DELETE /devbox-instances`
-- `GET /devbox-templates`、`GET /devbox-templates/{id}`
-- `POST /devbox-instances/{id}/publish`、`GET /devbox-publishes/{publish_id}`
-- `POST/GET/LIST/PATCH/DELETE /gateway-instances`
-- `GET /highcode-artifacts`、`GET /highcode-artifacts/{id}`
-- `POST/GET/LIST/PATCH/DELETE /agent-instances`
-- `POST/GET/LIST/PATCH/DELETE /highcode-applications`
-- `GET /highcode-applications/{id}/relations`
-- `POST /highcode-applications/{id}/release`
-- `GET /highcode-applications/{id}/release-charts`
-- `GET /release-charts/{release_chart_id}/download`
-- `GET /tasks/{task_id}`、`GET /tasks/{task_id}/result`
+- 设计约束（OpenAPI 3.0）：
+  - 路径采用“资源集合 + 资源标识”建模，`LIST` 统一使用 `GET` 集合接口表达。
+  - 同一路径通过不同 HTTP Method 区分语义，不使用 `POST/GET/LIST` 混写。
+  - Path 段尽量使用单一单词的复数名词，避免连字符拼接命名。
+
+- 数据服务组件实例（shared）：
+  - `POST /dataservices`
+  - `GET /dataservices`
+  - `GET /dataservices/{dataservice_id}`
+  - `PUT /dataservices/{dataservice_id}`
+  - `DELETE /dataservices/{dataservice_id}`
+
+- 低代码平台实例：
+  - `POST /lowcodes`
+  - `GET /lowcodes`
+  - `GET /lowcodes/{lowcode_id}`
+  - `PUT /lowcodes/{lowcode_id}`
+  - `DELETE /lowcodes/{lowcode_id}`
+
+- DevBox 实例与发布记录：
+  - `POST /devboxes`
+  - `GET /devboxes`
+  - `GET /devboxes/{devbox_id}`
+  - `PUT /devboxes/{devbox_id}`
+  - `DELETE /devboxes/{devbox_id}`
+  - `POST /devboxes/{devbox_id}/publishes`
+  - `GET /devboxes/{devbox_id}/publishes`
+  - `GET /publishes/{publish_id}`
+
+- 网关实例：
+  - `POST /gateways`
+  - `GET /gateways`
+  - `GET /gateways/{gateway_id}`
+  - `PUT /gateways/{gateway_id}`
+  - `DELETE /gateways/{gateway_id}`
+
+- 资源模板（按类型过滤）：
+  - `GET /templates?kind=dataservice`
+  - `GET /templates?kind=lowcode`
+  - `GET /templates?kind=devbox`
+  - `GET /templates?kind=gateway`
+  - `GET /templates/{template_id}`
+
+- 高代码制品：
+  - `GET /artifacts`
+  - `GET /artifacts/{artifact_id}`
+
+- Agent 实例：
+  - `POST /agents`
+  - `GET /agents`
+  - `GET /agents/{agent_id}`
+  - `PUT /agents/{agent_id}`
+  - `DELETE /agents/{agent_id}`
+
+- 高代码应用与发布产物：
+  - `POST /applications`
+  - `GET /applications`
+  - `GET /applications/{application_id}`
+  - `PUT /applications/{application_id}`
+  - `DELETE /applications/{application_id}`
+  - `GET /applications/{application_id}/relations`
+  - `POST /applications/{application_id}/releases`
+  - `GET /applications/{application_id}/charts`
+  - `GET /charts/{chart_id}/package`
+
+- 异步任务：
+  - `GET /tasks/{task_id}`
+  - `GET /tasks/{task_id}/result`
 
 ## 权限动作矩阵（设计输入）
 
