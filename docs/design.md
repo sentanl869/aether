@@ -21,6 +21,7 @@
 | `v1.9.0` | `2026-02-23` | 完成 T15：补齐 R-LCP-007 四字段在模型/契约/迁移/审计/验收的闭环，并更新覆盖回标。 | `T15`、`ADR-091` |
 | `v1.10.0` | `2026-02-23` | 完成 T16：补齐低代码 Helm 导入、LowCode DELETE 与 DevBox 镜像 push 凭证链路，并完成覆盖回标。 | `T16`、`ADR-092` |
 | `v1.11.0` | `2026-02-23` | 完成 T17：冻结 403/409 错误码词典并收敛权限/引用冲突口径，完成验收与回标联动。 | `T17`、`ADR-093` |
+| `v1.12.0` | `2026-02-23` | 完成 T18：统一幂等字段 canonical 命名（`idempotency_*`），补齐别名兼容与退场策略，并完成验收/回标联动。 | `T18`、`ADR-094` |
 
 文档状态：
 
@@ -155,6 +156,17 @@ T1 阶段输出定位为“设计基线”而非“功能详设”：
 - 幂等唯一性表达：对外语义保持 `Idempotency-Key`，内部唯一键固定为 `idempotency_scope`；
   `request_fingerprint` 用于同 scope 异载荷冲突判定；`idempotency_key` 仅保留审计检索语义（`R-OPS-002`）。
 - 幂等兼容策略：历史按 `idempotency_key` 检索的链路仅用于审计查询；任务去重与冲突判定统一迁移到 `idempotency_scope + request_fingerprint`。
+- 幂等字段 canonical 命名：`idempotency_scope`、`idempotency_key`、
+  `request_fingerprint`、`idempotency_expire_at`；除兼容说明外，正文模型/索引/验收不得使用缩写字段名。
+
+历史别名兼容与退场策略（T18）：
+
+| 历史别名 | canonical 名称 | 兼容边界 | 退场策略 |
+| --- | --- | --- | --- |
+| `idem_scope` | `idempotency_scope` | 仅用于历史数据释义与迁移脚本注释 | `v1.13.0` 起禁止在设计正文、DDL、验收用例中出现 |
+| `idem_key` | `idempotency_key` | 仅用于历史日志字段映射说明 | `v1.13.0` 起仅允许出现在历史日志解析器内部映射 |
+| `fingerprint` | `request_fingerprint` | 仅用于历史任务快照对照说明 | `v1.13.0` 起统一输出 `request_fingerprint` |
+| `expire_at` | `idempotency_expire_at` | 仅用于旧索引名迁移说明 | `v1.13.0` 起统一使用 `idempotency_expire_at` 命名 |
 
 ## 3. 总体架构设计
 
@@ -995,7 +1007,7 @@ erDiagram
 | `highcode_release_charts` | `app_id,release_ver,chart_ref,digest,source,status` | `release_version` 单应用唯一 |
 | `highcode_application_agent_refs` | `application_id,agent_instance_id,created_at/by` | app-agent 唯一；agent 单归属 |
 | `highcode_application_dataservice_refs` | `application_id,data_service_instance_id,created_at/by` | 仅允许 shared 组件 |
-| `async_tasks` | `idem_scope,idem_key,fingerprint,expire_at,status,result` | `idem_scope` 24h 唯一；指纹不一致返回 `409` |
+| `async_tasks` | 幂等与任务字段见 `8.1`（canonical 命名） | `idempotency_scope` 24h 唯一；指纹不一致返回 `409` |
 | `secret_versions` | `secret_name`、`version`、`namespace`、`encrypted_data_ref`、`is_current` | 每个 `secret_name` 仅一个当前版本 |
 
 #### 5.2.4 `lowcode_platform_instances` 字段明细（T15）
@@ -1062,7 +1074,7 @@ erDiagram
 
 - 列表查询索引：`idx_<table>_workspace_cluster_status_deleted(workspace_id,cluster_id,status,deleted_at)`。
 - 任务查询索引：`idx_async_tasks_serialized_status(serialized_key,status,created_at desc)`。
-- 幂等清理索引：`idx_async_tasks_idem_expire(idempotency_expire_at)`。
+- 幂等清理索引：`idx_async_tasks_idempotency_expire(idempotency_expire_at)`。
 - 低代码平台索引：
   `idx_lc_entry_url(workspace_id,cluster_id,entry_url) where deleted_at is null`、
   `idx_lc_admin_ref(workspace_id,cluster_id,admin_account_ref) where deleted_at is null`、
@@ -2950,7 +2962,7 @@ T9 运维补充约束：
 | R-HCA-011~014 | 级联冲突 `TC-HCA-03` | cascade=false 保留共享；cascade=true `409 REFERENCE_CONFLICT`；embedded 回收 | 删除响应、关系与补偿 |
 | R-PKG-001~006 | 发布打包与导入（`TC-PKG-01`、`TC-PKG-02`） | 每次发布产出版本化 Chart；OCI 推送成功可下载；外部导入通过验证 | Release 记录、OCI 清单、下载与导入验证 |
 | R-DATA-001~008 | 关系查询（`TC-DATA-01/02`） | 详情与 `relations` 返回 4 类关系；变更可审计 | 详情响应、relations 响应、审计检索 |
-| R-OPS-001~010 | 异步任务、幂等与补偿（`TC-OPS-01`） | CUD 返回 `202+task_id`；idem_scope 命中同任务；异指纹返回 `409` | 任务流水、幂等记录、补偿、错误样本 |
+| R-OPS-001~010 | 异步任务、幂等与补偿（`TC-OPS-01`） | CUD 返回 `202+task_id`；同 scope 命中同任务；异指纹返回 `409` | 任务流水、幂等记录、补偿、错误样本 |
 | S-SEC-001~007 | Secret 边界、版本与审计（`TC-SEC-01`） | Secret 在 workspace namespace；用户不可读明文；回滚采用新版本并审计 | Secret 版本记录、RBAC、审计 |
 | NFR-001~004 | 接口延迟、排队时延、任务执行时长（`TC-NFR-01`） | 满足 13.1 阈值：提交 `P95<=300ms`、Query `P95<=800ms`、排队 `P95<=5s` | 压测报告、监控截图 |
 | NFR-005~011 | 可用性、容量、吞吐（`TC-NFR-02`） | 月可用性 `>=99.9%`；容量与吞吐达到 13.2/13.3 目标 | SLI 报表、容量与压测报告 |
@@ -3065,6 +3077,14 @@ flowchart LR
 | 403 边界收敛 | `TC-SEC-02` | 无 workspace 权限 -> `FORBIDDEN_WORKSPACE`；越权 -> `FORBIDDEN_ACTION`；无新增旧码样本 | 契约测试、错误样本、告警日志 |
 | 409 shared 引用冲突收敛 | `TC-HCA-03-A` | `cascade=true` 且 shared 外部引用时返回 `409 REFERENCE_CONFLICT`；无旧码 | 删除响应样本、契约测试、审计日志 |
 | 兼容别名窗口与退场策略 | `TC-OPS-06` | 旧码命中会被归并并计入 `error_code_legacy_alias_total`；门禁禁止 `v1.13` 后返回旧码 | 网关映射日志、指标截图、发布门禁记录 |
+
+#### 14.1.10 T18 幂等字段命名统一验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| 模型与索引命名统一 | `TC-OPS-07-A` | `5.2.3/5.4` 仅使用 canonical 幂等字段命名 | 文档 diff、DDL 草案、评审记录 |
+| 流程与冲突语义命名统一 | `TC-OPS-07-B` | `8.1/8.4` 幂等命中与冲突规则仅引用 canonical 字段 | 时序图审阅记录、接口样本、任务查询结果 |
+| 验收与回标命名统一 | `TC-OPS-07-C` | `14.1/14.4` 幂等断言与证据字段命名一致，不出现 `idem_*` | 验收报告、覆盖回标记录、检索截图 |
 
 ### 14.2 测试分层与关键场景
 
@@ -3397,16 +3417,24 @@ flowchart LR
 | `409` shared 引用冲突 canonical 统一（`REFERENCE_CONFLICT`） | R-HCA-012、R-OPS-007 | 待补充 | 已覆盖 | 7.2、11.4、14.1、14.1.9 |
 | OpenAPI、验收断言与变更流程联动收敛（含兼容别名退场） | R-ABS-002、R-OPS-010 | 待补充 | 已覆盖 | 7.5、14.1.9、15.2、`docs/decision.md`（ADR-093） |
 
+#### 14.4.15 T18 幂等字段命名统一回标记录（2026-02-23）
+
+| 回标项 | 关联需求 | T18 前状态 | T18 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| `async_tasks` 模型字段统一为 `idempotency_*` 命名 | R-OPS-002 | 待补充 | 已覆盖 | 2.6、5.2.3、5.4 |
+| 幂等流程与冲突语义仅使用 canonical 字段命名 | R-OPS-002 | 待补充 | 已覆盖 | 8.1、8.4、14.1.10 |
+| 历史缩写字段别名兼容边界与退场策略落盘 | R-OPS-002、R-OPS-010 | 待补充 | 已覆盖 | 2.6、15.2.2、`docs/decision.md`（ADR-094） |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
 
 | 交付物 ID | 交付物 | 内容范围 | 验收标准 | 责任角色 |
 | --- | --- | --- | --- | --- |
-| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T17 DoD 全满足 | 架构负责人 |
+| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T18 DoD 全满足 | 架构负责人 |
 | D-02 | 决策记录 | `docs/decision.md` ADR 闭环 | 关键决策均有“原因+影响+替代关系” | 架构负责人 |
 | D-03 | 需求基线 | `docs/requirements.md` | 需求 ID 稳定可追踪，可测试 | 产品负责人 |
-| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T17 状态与设计实际一致 | 项目负责人 |
+| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T18 状态与设计实际一致 | 项目负责人 |
 | D-05 | API 契约包 | OpenAPI 根文件与分组路径定义 | 可用于生成服务端桩代码与契约测试 | 后端负责人 |
 | D-06 | 数据模型包 | ERD、DDL 约束、迁移计划 | 可直接拆分 repository 层实现任务 | 后端负责人 |
 | D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景 | QA 负责人 |
@@ -3456,6 +3484,9 @@ flowchart LR
 14. 错误码词典一致性复核：凡涉及 `403/409` 语义变更，必须同步核对
     `7.2`（词典）、`10.2`（权限映射）、`11.4`（级联冲突）、`7.5`（OpenAPI）
     与 `14.1.9/14.4.14`（验收与回标），禁止新增 `FORBIDDEN/SHARED_RESOURCE_IN_USE` 双口径。
+15. 幂等字段命名一致性复核：凡涉及 `R-OPS-002` 幂等字段调整，必须同步核对
+    `2.6`（canonical 词汇与别名边界）、`5.2.3/5.4`（实体与索引）、
+    `8.1/8.4`（流程语义）、`14.1.10/14.4.15`（验收与回标），禁止在正文继续引入 `idem_*` 缩写命名。
 
 #### 15.2.3 版本规则
 
@@ -3485,7 +3516,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T17）
+#### 15.3.1 设计自检记录（T18）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -3502,6 +3533,7 @@ flowchart LR
 | T15 R-LCP-007 字段闭环 | 通过 | 已完成 4.4、5.2、5.4、5.8、7.3~7.5、10.4、10.5、14.1.7、14.4.12 与 ADR 回写 |
 | T16 语义补遗（二次覆盖复核） | 通过 | 已完成 4.4、4.5、7.3、7.5、8、9.3、10.5、14.1.8、14.4.13、15.2 与 ADR 回写 |
 | T17 错误码命名一致性收敛（403/409） | 通过 | 已完成 7.2、10.2、11.4、7.5、14.1.9、14.4.14、15.2 与 ADR 回写 |
+| T18 幂等字段命名统一（`idem_*` -> `idempotency_*`） | 通过 | 已完成 2.6、5.2.3、5.4、8.1、8.4、14.1.10、14.4.15、15.2 与 ADR 回写 |
 | 遗漏检查 | 有残余风险 | 仅剩 OQ-04（任务优先级策略）未关闭，不阻断当前编码 |
 
 #### 15.3.2 开放问题（需闭环）
