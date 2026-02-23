@@ -747,3 +747,31 @@
   - 验收新增 `TC-LCP-04-A~D`，用于验证四字段“可写、可读、可审计、可回滚”。
 - 替代关系：对 ADR-086 中 `R-LCP-008` 相关结论保持不变，并补齐其未覆盖的
   `R-LCP-007` 模型层缺口；以本 ADR 作为低代码四字段闭环的当前生效口径。
+
+### ADR-092: T16 语义补遗定稿为“导入可调用 + 删除可执行 + 凭证链路闭环 + 回标防回归”
+
+- 决策：
+  - `R-LCP-003` 的低代码 Helm 导入能力固定为显式异步端点
+    `POST /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/imports`，
+    仅允许 `super_admin` 调用，并强制最小请求字段
+    `instance_name/platform_type/chart_ref/chart_version/entry_url/admin_account_ref/version`。
+  - `R-LCP-004` 的 LowCode CRUD 明确补齐
+    `DELETE /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`；
+    删除请求必须携带 `Idempotency-Key + resource_version`，返回 `202 + task_id`，
+    并定义 embedded 回收失败进入补偿任务。
+  - `R-ENV-007` 的仓库凭证消费语义固定为“image/chart push/pull 同口径”：
+    DevBox 镜像发布链路必须执行
+    `registry_login -> image_push -> digest_verify`，
+    并写入 `registry_binding_version/image_ref/digest/failure_reason/retry_count`。
+  - 需求覆盖回标固定执行“先回退为待补充，再恢复为已覆盖并附证据章节”的闭环流程，
+    防止“ID 已覆盖但正文契约缺失”复发。
+- 原因：
+  - T15 完成后仍存在三类剩余缺口（GAP-20~22）：
+    导入能力仅有描述无可调用契约、LowCode DELETE 未显式落盘、镜像 push 凭证链路缺执行与审计细节。
+  - 若继续维持“覆盖表已覆盖但正文不完整”，实现阶段会出现接口不可落地、验收证据不可执行的风险。
+- 影响：
+  - `design.md` 已同步修订 `4.4`、`4.5`、`7.3`、`7.5`、`8.2.1`、`8.5`、`9.3`、
+    `10.5`、`14.1.8`、`14.4.13`、`15.2`。
+  - `task_design.md` 的 T16 与 T16-01~T16-04 可标记完成，并关闭 GAP-20~GAP-22。
+  - 验收新增 `TC-LCP-05-A/B`、`TC-DBX-03`，用于验证导入契约、DELETE 契约与凭证链路闭环。
+- 替代关系：对 ADR-089（接口缺项与权限补齐）和 ADR-091（低代码字段闭环）做二次覆盖复核收口，以本 ADR 作为 T16 生效口径。

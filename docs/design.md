@@ -19,6 +19,7 @@
 | `v1.7.0` | `2026-02-23` | 完成 T13：定稿网关灰度参数模板与发布包下载鉴权缓存策略，关闭 OQ-02/OQ-03。 | `T13`、`ADR-090` |
 | `v1.8.0` | `2026-02-23` | 完成 T14：对齐需求/设计范围边界，明确 workspace/cluster 主数据 CRUD 归属平台管理面，Aether 仅消费绑定结果与内部契约。 | `T14` |
 | `v1.9.0` | `2026-02-23` | 完成 T15：补齐 R-LCP-007 四字段在模型/契约/迁移/审计/验收的闭环，并更新覆盖回标。 | `T15`、`ADR-091` |
+| `v1.10.0` | `2026-02-23` | 完成 T16：补齐低代码 Helm 导入、LowCode DELETE 与 DevBox 镜像 push 凭证链路，并完成覆盖回标。 | `T16`、`ADR-092` |
 
 文档状态：
 
@@ -600,6 +601,26 @@ Service 命名策略（`R-DSP-007`）：
 - 内置模板固定 `Dify`、`FastGPT`（`R-LCP-001`）。
 - 导入模板仅接受 Helm Chart（`Coze Studio`、`n8n`、外部 `Dify/FastGPT`）。
 
+导入契约（`R-LCP-003`，T16）：
+
+- 导入端点：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/imports`
+  （仅 `super_admin` 可调用）。
+- 请求最小字段：
+  `instance_name`、`platform_type`、`chart_ref`、`chart_version`、
+  `entry_url`、`admin_account_ref`、`version`（`values_override` 可选）。
+- 入参校验：
+  - `chart_ref` 必须为 Helm OCI 引用（`oci://`），禁止镜像地址混用；
+  - `chart_version` 必须显式指定，禁止 `latest`；
+  - `platform_type` 仅允许 `coze/n8n/dify/fastgpt`；
+  - `admin_account_ref` 必须为 `secret://` 引用。
+- 异步语义：导入请求统一返回 `202 + task_id`，执行链路见 `8.2.1`。
+- 错误码最小集合：
+  - `400 INVALID_ARGUMENT`（参数缺失/格式错误）；
+  - `422 SCHEMA_VALIDATION_FAILED`（`import_chart_not_helm`、`import_values_invalid`）；
+  - `409 RESOURCE_VERSION_CONFLICT`（同实例版本冲突）；
+  - `403 FORBIDDEN`（非超管）；
+  - `503 DEPENDENCY_UNAVAILABLE`（仓库或集群依赖不可用）。
+
 权限与可见性：
 
 - 开通/更新/删除默认仅超级管理员（`R-LCP-002`）。
@@ -615,6 +636,17 @@ Service 命名策略（`R-DSP-007`）：
   - 生效时机：仅对“新建实例”即时生效，不追溯改写存量实例。
   - 收敛策略：从 `true -> false` 时，若现存活动实例 `>1`，系统阻断新增并提示先收敛到单实例。
 - 实例详情必须记录：`entry_url`、`admin_account_ref`、`dependency_topology`、`version`（`R-LCP-007`）。
+
+删除契约（`R-LCP-004`，T16）：
+
+- 删除端点：`DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`。
+- 请求约束：必须携带 `Idempotency-Key`，并显式提交
+  `resource_version=<n>`（`cascade` 可选，默认 `true`，仅作用于宿主派生的
+  `embedded` 依赖回收）。
+- 并发与幂等：同 `idempotency_scope + request_fingerprint` 复用同一 `task_id`；
+  同 scope 异指纹返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
+- 异步语义：返回 `202 + task_id`，删除成功后实例软删并回写 `delete_task_id`；
+  若 `embedded` 回收失败，进入 `8.6` 补偿链路。
 
 `R-LCP-007` 字段语义与约束（T15 定稿）：
 
@@ -661,6 +693,21 @@ Service 命名策略（`R-DSP-007`）：
 - DevBox 发布动作生成 `DevBoxPublishRecord`，写入 `publish_version/image_ref/digest/publisher/published_at`（`R-DBX-007`）。
 - 仅 `published` 记录可转 `highcode_artifact` 被应用选择（`R-DBX-006`）。
 - 发布流程失败不影响 DevBox 实例存活，但记录失败任务与原因。
+
+镜像 push 凭证消费链路（`R-ENV-007`、`R-DBX-005/007`，T16）：
+
+- 发布任务开始时，Worker 固定读取 `workspace_registry_bindings` 当前
+  `binding_version + credential_ref`，并将版本号写入任务上下文。
+- 推送前执行仓库登录：使用临时凭证文件完成
+  `docker/buildah login -> push -> digest verify`。
+- 推送成功后，`DevBoxPublishRecord` 除最小字段外额外记录
+  `registry_binding_version` 与 `credential_version`，用于问题回溯。
+- 推送失败分类：
+  - 可重试：网络超时、Registry `5xx`、限流；
+  - 不可重试：凭证无效、权限拒绝、仓库路径不存在。
+- 失败结果最小字段：
+  `registry_binding_version`、`image_ref`、`digest`（可空）、
+  `failure_reason`、`retry_count`。
 
 模板兼容（`R-DBX-008`）：
 
@@ -1409,9 +1456,22 @@ DevBox 发布记录接口：
 低代码平台接口（T15 字段闭环）：
 
 - 创建：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes`
+- 导入：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/imports`
 - 列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes`
 - 详情：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`
 - 更新：`PUT /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`
+- 删除：`DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`
+
+低代码 Helm 导入接口补充（T16）：
+
+- `POST /.../lowcodes/imports` 仅允许 `super_admin` 调用，返回 `202 + task_id`。
+- 请求体最小字段：
+  `instance_name/platform_type/chart_ref/chart_version/entry_url/admin_account_ref/version`。
+- 错误码最小集合：
+  `400 INVALID_ARGUMENT`、`422 SCHEMA_VALIDATION_FAILED`
+  （`import_chart_not_helm/import_values_invalid`）、
+  `409 RESOURCE_VERSION_CONFLICT`（版本冲突）、
+  `403 FORBIDDEN`、`503 DEPENDENCY_UNAVAILABLE`。
 
 低代码平台四字段契约（`R-LCP-007`）：
 
@@ -1505,6 +1565,19 @@ LowCodeCreateRequest:
     dependency_topology: { type: object, additionalProperties: true, default: {} }
     version: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
 
+LowCodeImportRequest:
+  type: object
+  required: [instance_name, platform_type, chart_ref, chart_version, entry_url, admin_account_ref, version]
+  properties:
+    instance_name: { type: string, minLength: 1, maxLength: 64 }
+    platform_type: { type: string, enum: [dify, fastgpt, coze, n8n] }
+    chart_ref: { type: string, pattern: "^oci://.+" }
+    chart_version: { type: string, minLength: 1, maxLength: 64 }
+    values_override: { type: object, additionalProperties: true }
+    entry_url: { type: string, format: uri, maxLength: 1024 }
+    admin_account_ref: { type: string, pattern: "^secret://.+" }
+    version: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
+
 LowCodeSummary:
   type: object
   required: [id, instance_name, platform_type, status, entry_url, admin_account_ref, version]
@@ -1571,6 +1644,7 @@ T7+T12 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 | `/publishes/{publish_id}` | `{scope}/publishes/{publish_id}` | `paths/devbox_publishes.yaml` |
 | `/tasks/{task_id}/result` | `{scope}/tasks/{task_id}/result` | `paths/tasks.yaml` |
 | `/lowcodes` | `{scope}/lowcodes` | `paths/lowcodes.yaml` |
+| `/lowcodes/imports` | `{scope}/lowcodes/imports` | `paths/lowcode_imports.yaml` |
 | `/lowcodes/{lowcode_id}` | `{scope}/lowcodes/{lowcode_id}` | `paths/lowcodes.yaml` |
 | `applications relations` | `{scope}/applications/{application_id}/relations` | `paths/application_relations.yaml` |
 | `/applications/{application_id}/charts` | 见 7.3「发布包列表」接口 | `paths/highcode_charts.yaml` |
@@ -1608,6 +1682,20 @@ T15 低代码平台路径落盘约束（`paths/lowcodes.yaml`）：
   - `dependency_topology` 为 object。
 - `paths/lowcodes.yaml` 必须声明操作审计动作：
   `x-audit-action: lowcode_instance_write_fields`.
+
+T16 低代码导入与删除落盘约束（`paths/lowcode_imports.yaml` + `paths/lowcodes.yaml`）：
+
+- `POST {scope}/lowcodes/imports` 必须声明：
+  - `security: BearerAuth` 且 operation 级权限限定 `super_admin`；
+  - 请求模型 `LowCodeImportRequest`；
+  - `202 AsyncAccepted` 与最小错误集
+    `400/403/409/422/503`。
+- `DELETE {scope}/lowcodes/{lowcode_id}` 必须声明：
+  - 请求头 `Idempotency-Key`（必填）；
+  - 查询参数 `resource_version`（必填）与 `cascade`（可选）；
+  - `202 AsyncAccepted`；
+  - operation 扩展审计动作
+    `x-audit-action: lowcode_instance_delete`.
 
 落地建议：
 
@@ -1804,6 +1892,27 @@ sequenceDiagram
   end
 ```
 
+#### 8.2.1 低代码 Helm 导入任务编排（T16）
+
+执行步骤（`R-LCP-003`）：
+
+1. 准入校验：校验 `super_admin` 权限、作用域边界、`LowCodeImportRequest`
+   schema。
+2. 导入校验：解析 `chart_ref/chart_version`，校验 Chart 元数据、values schema
+   与 `platform_type` 兼容性。
+3. 幂等判定：按 `idempotency_scope + request_fingerprint` 判重，命中则复用
+   `task_id`。
+4. 入队落库：写入 `async_tasks` 与低代码实例草稿（`status=Creating`）。
+5. Worker 执行：拉取 Chart、渲染、部署、健康检查、状态回写。
+6. 审计落盘：记录 `lowcode_import_requested/lowcode_import_completed`
+   事件与失败原因。
+
+失败语义：
+
+- Chart 非 Helm 或 values 校验失败：`422 SCHEMA_VALIDATION_FAILED`。
+- 版本冲突（同实例版本重复或回退非法）：`409 RESOURCE_VERSION_CONFLICT`。
+- 仓库/集群依赖异常：`503 DEPENDENCY_UNAVAILABLE`（可重试）。
+
 ### 8.3 消费者流程
 
 消费者位于 Worker（QueueConsumer -> Executor -> Adapter）：
@@ -1862,6 +1971,17 @@ flowchart TD
 - 退避：`5s -> 15s -> 45s -> 135s -> 300s`。
 - 可重试错误：`DEPENDENCY_UNAVAILABLE`、网络抖动、临时锁冲突。
 - 不可重试错误：参数错误、权限错误、引用冲突、版本冲突。
+
+DevBox 镜像 push 补充策略（`R-ENV-007`、`R-DBX-005/007`，T16）：
+
+- 发布任务固定阶段：`registry_login -> image_push -> digest_verify`。
+- 可重试错误：
+  `DEPENDENCY_UNAVAILABLE`、Registry `5xx`、网络超时、`TOO_MANY_REQUESTS`。
+- 不可重试错误：
+  `FORBIDDEN`（仓库权限拒绝）、`INVALID_ARGUMENT`（镜像地址非法）、
+  `RESOURCE_NOT_FOUND`（仓库路径不存在）。
+- 失败后 `task.result` 最小字段：
+  `registry_binding_version/image_ref/digest/failure_reason/retry_count`。
 
 超时策略：
 
@@ -2070,9 +2190,21 @@ flowchart TD
 
 消费路径：
 
-- DeployAdapter 读取目标 namespace 当前凭证版本。
-- 在 Helm 操作前完成 `helm registry login`。
-- Workload 模板注入 `imagePullSecrets`，保障运行时拉取。
+- 拉取链路（Deploy/Release）：
+  - DeployAdapter 读取目标 namespace 当前凭证版本；
+  - 在 Helm 操作前完成 `helm registry login`；
+  - Workload 模板注入 `imagePullSecrets`，保障运行时拉取。
+- 推送链路（DevBox Publish，T16）：
+  - 读取 workspace 当前 `registry_binding_version` 与凭证引用版本；
+  - 生成临时 docker config 并执行 `docker/buildah login`；
+  - 执行 `push` 并校验远端 manifest digest；
+  - 将 `registry_binding_version + image_ref + digest` 写入发布记录与任务结果。
+
+一致性约束（push/pull 同口径）：
+
+- 镜像与 Chart 均使用同一 workspace 绑定仓库凭证来源，禁止“Chart 可用但 image push 无凭证”。
+- push/pull 失败均复用 `8.5` 重试策略并写统一失败字段：
+  `failure_reason`、`retry_count`、`registry_binding_version`。
 
 ### 9.4 资源命名与标签规范
 
@@ -2357,6 +2489,27 @@ Secret 专项最小字段（`S-SEC-007`）：
 - `field_changes`：至少包含 `entry_url/admin_account_ref/dependency_topology/version` 的 before/after 哈希或摘要
 - `from_version`、`to_version`（仅版本变更场景）
 - `task_id`、`request_id`、`actor`、`result`、`failure_reason`
+
+低代码 Helm 导入专项（`R-LCP-003`，T16）：
+
+- `action`：`lowcode_import_requested`、`lowcode_import_completed`
+- `resource_kind`：`lowcode_platform`
+- `resource_id`
+- `workspace_id`、`cluster_id`
+- `chart_ref`、`chart_version`
+- `registry_binding_version`
+- `task_id`、`request_id`、`actor`、`result`、`failure_reason`
+
+DevBox 镜像 push 凭证消费专项（`R-ENV-007`、`R-DBX-005/007`，T16）：
+
+- `action`：`devbox_image_push_started`、`devbox_image_push_finished`
+- `resource_kind`：`devbox_publish_record`
+- `resource_id`（`publish_id`）
+- `workspace_id`、`cluster_id`
+- `registry_binding_version`、`credential_version`
+- `image_ref`、`digest`
+- `retry_count`、`failure_reason`
+- `task_id`、`request_id`、`actor`、`result`
 
 留存策略（`NFR-013`）：
 
@@ -2770,13 +2923,13 @@ T9 运维补充约束：
 | --- | --- | --- | --- |
 | R-ENV-001~003 | namespace 映射校验（`TC-ENV-01`） | 绑定成功；namespace 存在；binding 为 `Active` | API 响应、DB 快照、`kubectl get ns` |
 | R-ENV-004~005、008 | 跨 workspace/cluster 请求拦截（`TC-ENV-02`） | 返回 `403/422`；无任务入队；审计有拒绝记录 | 错误响应、任务表查询、审计日志 |
-| R-ENV-006~007 | 绑定变更/回滚（`TC-ENV-04/05`） | 仅超管；回滚成功；重复请求复用 `task_id` | 接口响应、任务结果、binding 快照、审计 |
+| R-ENV-006~007 | 绑定变更/回滚+凭证闭环（`TC-ENV-04/05、DBX-03`） | 超管可用；回滚成功；复用 `task_id`；镜像 push 可追溯 | 接口响应、任务结果、binding 快照、审计 |
 | R-ENV-009~010 | 解绑冻结与恢复窗口（`TC-ENV-03`） | 状态流转正确；仅超管执行且二次确认 | 状态机日志、审计日志、操作录屏 |
 | R-ABS-001~004 | 新资源类型接入不改主流程（`TC-ABS-01`） | 仅新增 schema+adapter 即可跑通 CUD；任务、鉴权、审计代码路径无分叉 | PR diff、单测、集成测试报告 |
 | R-ABS-005~008 | 标签与 L1 统计口径（`TC-ABS-02`） | K8s 对象带完整标签；控制面不以 Pod 为主资源；报表按 5 类 L1 聚合 | K8s 清单、API 契约测试、配额报表 |
 | R-DSP-001~007 | 共享组件创建、扩缩容、升级回滚（`TC-DSP-01`） | 组件 CRUD 与运维动作均走异步任务；Service 命名规则符合策略 | 任务记录、状态快照、Service 清单 |
 | R-DSP-008~012 | embedded 隔离与宿主回收（`TC-DSP-02/04`） | `embedded` 不进共享池；`dataservices` 返回 `404`；宿主删除自动回收 | 列表响应、关系表、权限审计 |
-| R-LCP-001~004 | 低代码平台内置/导入 Helm 与生命周期（`TC-LCP-01`） | 仅 Helm 导入；实例 CRUD、升级回滚成功；角色权限正确 | API 响应、任务日志、权限测试报告 |
+| R-LCP-001~004 | 低代码平台内置/导入 Helm（`TC-LCP-01/05`） | 仅 Helm 导入；实例 CRUD（含 `DELETE`）与升级回滚成功；权限正确 | API 响应、任务日志、权限报告 |
 | R-LCP-005~006、008~010 | 低代码依赖归属与多实例（`TC-LCP-02`） | 依赖组件标记 `embedded`；多实例默认关闭；普通用户仅查看 | 拓扑详情、列表响应、RBAC、策略审计 |
 | R-LCP-007 | 低代码实例四字段闭环（`TC-LCP-04`） | 四字段满足可写、可读、可审计、可回滚 | 契约测试、任务结果、审计日志、迁移回填报告 |
 | R-DBX-001~005 | DevBox 创建与发布流程（`TC-DBX-01`） | DevBox 实例可创建/更新/停止/删除；发布流程产出记录完整 | DevBox 实例详情、发布记录 |
@@ -2869,6 +3022,31 @@ flowchart LR
 | 历史数据迁移与灰度切换 | `TC-LCP-04-B` | 按“加字段 -> 回填 -> 读切换 -> 写强校验”完成；失败可回滚到兼容读模式 | 迁移日志、回填结果、回滚演练记录 |
 | `admin_account_ref` 引用语义与脱敏 | `TC-LCP-04-C` | 拒绝明文写入；super_admin 可读引用，user 仅见脱敏引用；日志无明文 | 错误响应、RBAC 测试、日志抽样 |
 | 四字段变更审计可追溯 | `TC-LCP-04-D` | 四字段变更均落审计，版本回滚含 `from/to` | 审计检索结果、任务结果、版本快照 |
+
+#### 14.1.8 T16 语义补遗验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| 低代码 Helm 导入契约补齐 | `TC-LCP-05-A` | 满足 `T16-A` 判定细则 | 接口样本、OpenAPI 契约、任务结果、审计日志 |
+| LowCode DELETE 端点补齐 | `TC-LCP-05-B` | 满足 `T16-B` 判定细则 | 契约测试、任务流水、关系快照、补偿记录 |
+| DevBox 镜像 push 凭证闭环 | `TC-DBX-03` | 满足 `T16-C` 判定细则 | 发布日志、任务结果、发布记录、审计检索 |
+
+`T16` 判定细则（对应上表）：
+
+- `T16-A`：
+  `POST /lowcodes/imports` 仅 `super_admin` 可调用；
+  返回 `202 + task_id`；
+  错误码覆盖 `400/403/409/422/503`。
+- `T16-B`：
+  `DELETE /lowcodes/{lowcode_id}` 支持
+  `resource_version + Idempotency-Key`；
+  成功写 `delete_task_id`；
+  `embedded` 回收失败进入补偿任务。
+- `T16-C`：
+  发布链路执行 `registry_login -> push -> digest_verify`；
+  失败分支按重试策略分类；
+  审计字段至少包含
+  `registry_binding_version/image_ref/digest/failure_reason`。
 
 ### 14.2 测试分层与关键场景
 
@@ -2968,10 +3146,10 @@ flowchart LR
 
 | 需求簇 | 主要章节映射 |
 | --- | --- |
-| `R-ENV` | 4.1、5.7、6.5、7.6、8.7~8.8、11.1、11.2 |
+| `R-ENV` | 4.1、4.5、5.7、6.5、7.6、8.5、8.7~8.8、9.3、10.5、11.1、11.2 |
 | `R-ABS` | 3.3、4.2、5.1、8.1~8.6 |
 | `R-DSP` | 4.3、5.2、5.3、9.1~9.5、10.2、11.3 |
-| `R-LCP` | 4.4、5.2、5.4、5.8、7.3~7.5、9.1~9.5、10.4、10.5、11.3、14.1 |
+| `R-LCP` | 4.4、5.2、5.4、5.8、7.3~7.5、8.2.1、9.1~9.5、10.4、10.5、11.3、14.1 |
 | `R-DBX` | 4.5、5.2、5.6、9.1~9.5 |
 | `R-GTW` | 4.6、5.2、9.1~9.5、11.2 |
 | `R-HCA` | 4.7、5.2、5.3、9.1~9.5、11.4 |
@@ -2991,7 +3169,7 @@ flowchart LR
 | R-ENV-004 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-005 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-006 | 4.1、5.7、6.5、7.6、8.7~8.8、11.1、11.2 | 已覆盖 | 已在 4.1、7.6、8.7~8.8 定义绑定新增/更新/回滚契约与补偿，见 `TC-ENV-04/05`。 |
-| R-ENV-007 | 4.1、5.7、6.5、7.6、8.7~8.8、11.1、11.2 | 已覆盖 | 已在 4.1、8.7~8.8 固化绑定更新/回滚后的凭证重下发与结果回写。 |
+| R-ENV-007 | 4.1、4.5、7.6、8.5、8.7~8.8、9.3、10.5、14.1.8 | 已覆盖 | 已补齐镜像与 Chart push/pull 凭证同口径，覆盖 DevBox push 失败重试与审计字段。 |
 | R-ENV-008 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-009 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-010 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
@@ -3017,8 +3195,8 @@ flowchart LR
 | R-DSP-012 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
 | R-LCP-001 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
 | R-LCP-002 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
-| R-LCP-003 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
-| R-LCP-004 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
+| R-LCP-003 | 4.4、7.3、7.5、8.2.1、10.5、14.1.8 | 已覆盖 | 已补齐 `POST /lowcodes/imports` 契约、执行链路、错误码与审计事件，形成“可调用+可验收”闭环。 |
+| R-LCP-004 | 4.4、7.3、7.5、8.6、14.1.8 | 已覆盖 | 已显式补齐 `DELETE /lowcodes/{lowcode_id}` 端点与并发/幂等/回收语义，并完成验收映射。 |
 | R-LCP-005 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
 | R-LCP-006 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
 | R-LCP-007 | 4.4、5.2.4、5.4、5.8、7.3~7.5、10.4~10.5、14.1.7 | 已覆盖 | `TC-LCP-04` 已验证四字段读写、迁移与审计闭环。 |
@@ -3185,16 +3363,24 @@ flowchart LR
 | `admin_account_ref` 引用语义与四字段审计补齐 | R-LCP-007、S-SEC-002、NFR-012 | 待补充 | 已覆盖 | 10.4、10.5、14.1.7 |
 | 验收用例与覆盖回标闭环（防回归） | R-LCP-007 | 待补充 | 已覆盖 | 14.1（`TC-LCP-04`）、14.4.3、14.4.12 |
 
+#### 14.4.13 T16 语义补遗回标记录（2026-02-23）
+
+| 回标项 | 关联需求 | T16 前状态 | T16 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| 低代码 Helm 导入接口契约补齐（端点/请求/校验/错误码） | R-LCP-003 | 待补充 | 已覆盖 | 4.4、7.3、7.5、8.2.1、10.5、14.1.8 |
+| LowCode DELETE 端点与并发幂等语义补齐 | R-LCP-004 | 待补充 | 已覆盖 | 4.4、7.3、7.5、8.6、14.1.8 |
+| DevBox 镜像 push 凭证消费闭环补齐（重试与审计） | R-ENV-007、R-DBX-005/007 | 待补充 | 已覆盖 | 4.5、8.5、9.3、10.5、14.1.8 |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
 
 | 交付物 ID | 交付物 | 内容范围 | 验收标准 | 责任角色 |
 | --- | --- | --- | --- | --- |
-| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T15 DoD 全满足 | 架构负责人 |
+| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T16 DoD 全满足 | 架构负责人 |
 | D-02 | 决策记录 | `docs/decision.md` ADR 闭环 | 关键决策均有“原因+影响+替代关系” | 架构负责人 |
 | D-03 | 需求基线 | `docs/requirements.md` | 需求 ID 稳定可追踪，可测试 | 产品负责人 |
-| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T15 状态与设计实际一致 | 项目负责人 |
+| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T16 状态与设计实际一致 | 项目负责人 |
 | D-05 | API 契约包 | OpenAPI 根文件与分组路径定义 | 可用于生成服务端桩代码与契约测试 | 后端负责人 |
 | D-06 | 数据模型包 | ERD、DDL 约束、迁移计划 | 可直接拆分 repository 层实现任务 | 后端负责人 |
 | D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景 | QA 负责人 |
@@ -3238,6 +3424,9 @@ flowchart LR
 10. 设计正文更新：更新受影响章节（如 4/5/6/7/8/9/10/11/12/13/14）。
 11. 任务同步：更新 `docs/task/task_design.md` 的任务状态、DoD 与依赖关系。
 12. 评审与发布：完成评审后再进入实现任务拆分，禁止“需求已改、设计未改”直接开发。
+13. T16 语义补遗复核：凡涉及 `R-LCP-003/R-LCP-004/R-ENV-007` 的变更，
+    必须同步核对 `4.4/4.5`、`7.3/7.5`、`8/9.3`、`10.5`、`14.1.8/14.4.13`，
+    并执行“`待补充 -> 已覆盖`”回标闭环。
 
 #### 15.2.3 版本规则
 
@@ -3267,7 +3456,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T15）
+#### 15.3.1 设计自检记录（T16）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -3282,6 +3471,7 @@ flowchart LR
 | T13 非阻断开放项收敛（灰度参数/下载鉴权） | 通过 | 已完成 4.6、7.3、7.5、14.1.6、14.4.10 与 15.3 关单回写，OQ-02/OQ-03 关闭 |
 | T14 范围边界对齐（管理面 vs Aether） | 通过 | 已完成 2.3、4.1、7.6、14.4.11 边界澄清与回标闭环 |
 | T15 R-LCP-007 字段闭环 | 通过 | 已完成 4.4、5.2、5.4、5.8、7.3~7.5、10.4、10.5、14.1.7、14.4.12 与 ADR 回写 |
+| T16 语义补遗（二次覆盖复核） | 通过 | 已完成 4.4、4.5、7.3、7.5、8、9.3、10.5、14.1.8、14.4.13、15.2 与 ADR 回写 |
 | 遗漏检查 | 有残余风险 | 仅剩 OQ-04（任务优先级策略）未关闭，不阻断当前编码 |
 
 #### 15.3.2 开放问题（需闭环）
