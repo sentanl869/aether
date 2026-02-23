@@ -638,3 +638,35 @@
     `15.2`，并新增 `14.4.7` 回标记录。
   - `task_design.md` 的 T10 与 T10-01~T10-03 可标记完成。
 - 替代关系：对 ADR-085、ADR-086 的幂等结论做“需求基线层”补全，以本 ADR 作为需求与设计的统一生效口径。
+
+### ADR-088: T11 仓库绑定回滚契约定稿为“显式内部接口 + 任务化回滚 + 证据闭环”
+
+- 决策：
+  - 为 `R-ENV-006` 固化显式内部接口
+    `POST /internal/v1/workspace-registry-bindings/{binding_id}:rollback`，
+    请求体最小字段固定为：
+    `target_binding_version`、`resource_version`、`reason`、
+    `confirmation_token`。
+  - 回滚执行链路固定为：
+    版本校验与准入 -> 绑定版本切换 -> Active clusters 凭证重下发 ->
+    结果回写 -> 审计与事件发布。
+  - 失败语义固定为：
+    版本不存在返回 `404 BINDING_VERSION_NOT_FOUND`；
+    绑定状态不允许回滚或目标版本非法返回
+    `409 BINDING_STATE_CONFLICT`；
+    同资源并发返回 `409 RESOURCE_BUSY`；
+    `confirmation_token` 校验失败返回
+    `422 CONFIRMATION_TOKEN_INVALID`。
+  - 若回滚后出现“部分 cluster 凭证重下发失败”，主任务标记失败并自动创建
+    `registry_credential_redispatch` 补偿任务，沿用同一串行键重试。
+- 原因：
+  - 在 T10 后 `design.md` 仅有“仓库绑定可回滚”的规则描述，缺少可调用接口、
+    错误模型、执行与补偿路径，无法形成可编码与可验收契约。
+  - `R-ENV-006` 要求“可审计、可变更、可回滚”，需把“可回滚”落到明确请求语义和
+    验收证据，否则存在“标记已覆盖但无法验证”的风险。
+- 影响：
+  - `design.md` 已同步修订 `4.1`、`7.2`、`7.6`、`8.1`、`8.5`、`8.6`、
+    `8.7`、`10.5`、`14.1`、`14.4`、`15.2`、`15.3`。
+  - 验收矩阵新增 `TC-ENV-04` 及四个子场景（成功回滚、版本不存在、越权调用、重复请求幂等复用）。
+  - `task_design.md` 的 T11 与 T11-01~T11-03 可标记完成，并关闭 GAP-13。
+- 替代关系：对 ADR-036（解绑恢复窗口）与 ADR-085（契约冲突修订）的“回滚可执行性”补充内部接口与任务编排层实现口径，以本 ADR 为当前生效口径。

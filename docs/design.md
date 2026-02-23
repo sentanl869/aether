@@ -14,6 +14,7 @@
 | `v1.2.0` | `2026-02-23` | 完成 T8：修复命名/更新方法/幂等口径冲突并回标。 | `T8`、`ADR-085` |
 | `v1.3.0` | `2026-02-23` | 完成 T9：补齐语义缺口（配额/报表、外部导入闭环、embedded 权限、LCP 多实例默认值）并更新覆盖回标。 | `T9`、`ADR-086` |
 | `v1.4.0` | `2026-02-23` | 完成 T10：修订 requirements/design 幂等基线一致性（scope 唯一、指纹冲突语义、回标与验收联动）。 | `T10`、`ADR-087` |
+| `v1.5.0` | `2026-02-23` | 完成 T11：补齐仓库绑定回滚接口契约、执行编排与验收回标闭环。 | `T11`、`ADR-088` |
 
 文档状态：
 
@@ -435,7 +436,9 @@ sequenceDiagram
 - `R-ENV-003`：建立 `workspace + cluster` 绑定时自动创建/复用同名 namespace，写回 `namespace_name`。
 - `R-ENV-004`：所有业务请求先校验用户是否关联工作空间，不通过直接拒绝并审计。
 - `R-ENV-005`：业务 API 路径必须显式包含 `workspace_id/cluster_id`；`namespace` 由绑定表反查注入，不接受请求体覆写。
-- `R-ENV-006`：仓库绑定变更采用版本化绑定记录（`binding_version`），支持回滚到指定版本并触发重新下发。
+- `R-ENV-006`：仓库绑定变更采用版本化绑定记录（`binding_version`），通过内部接口
+  `POST /internal/v1/workspace-registry-bindings/{binding_id}:rollback`
+  回滚到指定版本并触发重新下发。
 - `R-ENV-007`：凭证下发以 namespace 为粒度生成 `imagePullSecret` 与 Helm OCI 登录凭据，供部署器与发布器消费。
 - `R-ENV-008`：跨集群关联在提交阶段拦截，返回 `422 SCHEMA_VALIDATION_FAILED`（原因 `cross_cluster_association_forbidden`）。
 - `R-ENV-009`：解绑流程固定为 `Frozen -> Validating -> RecoveryWindow(24h) -> Reclaiming`。
@@ -451,6 +454,16 @@ sequenceDiagram
 | `RecoveryWindow` | 允许 | 拒绝 | 允许 | 仅系统触发 |
 | `Reclaiming` | 允许 | 拒绝 | 拒绝 | 进行中 |
 | `Unbound` | 允许历史读 | 拒绝 | 拒绝 | 完成 |
+
+仓库绑定回滚约束（`R-ENV-006`）：
+
+| 校验项 | 约束 | 失败码 |
+| --- | --- | --- |
+| 权限 | 仅超级管理员可调用，且必须携带 `confirmation_token` | `403 FORBIDDEN` / `422 CONFIRMATION_TOKEN_INVALID` |
+| 目标版本 | `target_binding_version` 必须存在且不可等于当前版本 | `404 BINDING_VERSION_NOT_FOUND` / `409 BINDING_STATE_CONFLICT` |
+| 绑定状态 | 仅 `Active` 允许回滚；`Frozen/Validating/RecoveryWindow/Reclaiming/Unbound` 禁止回滚 | `409 BINDING_STATE_CONFLICT` |
+| 并发 | 同一 `binding_id` 存在 `Pending/Running` 的轮转或回滚任务时拒绝新回滚 | `409 RESOURCE_BUSY` |
+| 执行结果 | 成功后更新 `binding_version`，并对 `Active` 集群 namespace 触发凭证重下发 | 失败进入 `registry_credential_redispatch` 补偿任务 |
 
 ### 4.2 统一资源抽象与可扩展部署行为（R-ABS-001~008）
 
@@ -1213,7 +1226,10 @@ flowchart LR
 | 409 | `REFERENCE_CONFLICT` | `cascade=true` 时共享组件仍被引用（R-HCA-012） | 否 |
 | 409 | `RESOURCE_BUSY` | 同资源已有 Running/Pending 任务 | 是 |
 | 409 | `IDEMPOTENCY_PAYLOAD_MISMATCH` | 同幂等作用域但请求指纹不一致 | 否 |
+| 409 | `BINDING_STATE_CONFLICT` | 绑定状态不允许回滚或目标版本与当前版本一致 | 否 |
 | 422 | `SCHEMA_VALIDATION_FAILED` | 模板/制品参数校验失败 | 否 |
+| 422 | `CONFIRMATION_TOKEN_INVALID` | 二次确认 token 缺失、失效或不匹配 | 否 |
+| 404 | `BINDING_VERSION_NOT_FOUND` | 仓库绑定目标版本不存在 | 否 |
 | 429 | `TOO_MANY_REQUESTS` | 请求超限/队列限流 | 是 |
 | 500 | `INTERNAL_ERROR` | 未分类服务端错误 | 视情况 |
 | 503 | `DEPENDENCY_UNAVAILABLE` | K8S/OCI/DB 短暂不可用 | 是 |
@@ -1375,11 +1391,44 @@ OpenAPI 统一约束：
 | `/internal/v1/workspace-cluster-bindings/{binding_id}:recover` | `POST` | 24h 窗口内撤销解绑 |
 | `/internal/v1/workspace-cluster-bindings/{binding_id}:reclaim` | `POST` | 执行 namespace 回收 |
 | `/internal/v1/workspace-registry-bindings/{binding_id}:rotate-credential` | `POST` | 轮转仓库凭证并触发下发 |
+| `/internal/v1/workspace-registry-bindings/{binding_id}:rollback` | `POST` | 回滚仓库绑定到指定历史版本并触发全量重下发 |
+
+仓库绑定回滚内部契约（T11）：
+
+- 端点：`POST /internal/v1/workspace-registry-bindings/{binding_id}:rollback`
+- 请求头：`Idempotency-Key`（必填）
+- 请求体最小字段：
+
+```json
+{
+  "target_binding_version": 12,
+  "resource_version": 39,
+  "reason": "credential_rotation_regression",
+  "confirmation_token": "confirm_01J..."
+}
+```
+
+- 成功响应：`202 Accepted`，`data` 复用 `AsyncAccepted`，并附带
+  `rollback_meta={binding_id,from_binding_version,to_binding_version}`。
+
+回滚接口错误码（最小集合）：
+
+| HTTP | 业务码 | 触发条件 |
+| --- | --- | --- |
+| `403` | `FORBIDDEN` | 非超级管理员调用 |
+| `404` | `RESOURCE_NOT_FOUND` | `binding_id` 不存在或已软删 |
+| `404` | `BINDING_VERSION_NOT_FOUND` | `target_binding_version` 不存在 |
+| `409` | `RESOURCE_VERSION_CONFLICT` | `resource_version` 不匹配 |
+| `409` | `BINDING_STATE_CONFLICT` | 绑定状态不允许回滚，或目标版本等于当前版本 |
+| `409` | `RESOURCE_BUSY` | 同 `binding_id` 已有 `Running/Pending` 轮转或回滚任务 |
+| `422` | `CONFIRMATION_TOKEN_INVALID` | 二次确认 token 校验失败 |
+| `503` | `DEPENDENCY_UNAVAILABLE` | 凭证重下发依赖不可用（可重试） |
 
 事件主题与载荷（Outbox -> EventBus）：
 
 - `workspace.binding.state.changed.v1`
 - `workspace.registry.credential.rotated.v1`
+- `workspace.registry.binding.rolledback.v1`
 - `task.lifecycle.changed.v1`
 
 `workspace.binding.state.changed.v1` 载荷示例：
@@ -1393,6 +1442,22 @@ OpenAPI 统一约束：
   "from_status": "Validating",
   "to_status": "RecoveryWindow",
   "occurred_at": "2026-02-23T10:00:00Z"
+}
+```
+
+`workspace.registry.binding.rolledback.v1` 载荷示例（按 cluster fan-out 发出）：
+
+```json
+{
+  "event_id": "evt_01J...",
+  "workspace_id": "ws_...",
+  "cluster_id": "cl_...",
+  "binding_id": "rbd_...",
+  "from_version": 15,
+  "to_version": 12,
+  "actor": "admin_01",
+  "result": "Succeeded",
+  "occurred_at": "2026-02-23T11:08:00Z"
 }
 ```
 
@@ -1426,6 +1491,7 @@ OpenAPI 统一约束：
 - 创建前无 `resource_id`：`ws:{ws}:cl:{cl}:rk:{kind}:name:{normalized_name}`
 - 发布任务：`ws:{ws}:cl:{cl}:rk:highcode_application:id:{app_id}:release`
 - 解绑链路：`ws:{ws}:cl:{cl}:rk:workspace_cluster_binding:id:{binding_id}`
+- 仓库绑定回滚链路：`ws:{ws}:rk:workspace_registry_binding:id:{binding_id}`
 
 ### 8.2 生产者流程
 
@@ -1526,7 +1592,7 @@ flowchart TD
 | `create/update` | 30 分钟 |
 | `delete` | 15 分钟 |
 | `release/export` | 20 分钟 |
-| `freeze/validate/recover/reclaim` | 10 分钟 |
+| `freeze/validate/recover/reclaim/registry_rollback` | 10 分钟 |
 
 取消策略：
 
@@ -1542,6 +1608,7 @@ flowchart TD
 - 删除宿主资源后嵌入式组件回收失败。
 - 创建/升级过程中部分 K8S 对象成功、部分失败。
 - 发布流程中“打包成功但推送失败”。
+- 仓库绑定回滚后，部分 namespace 凭证重下发失败。
 
 一致性策略：
 
@@ -1584,6 +1651,48 @@ sequenceDiagram
 - 端点：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result`
 - 语义：返回任务结果快照（若任务仍在 `Pending/Running`，`result` 可为空对象）。
 - 最小返回字段：`resource_kind/resource_id/started_at/ended_at/failure_reason/retry_count/serialized_key`。
+
+### 8.7 仓库绑定回滚任务编排（T11）
+
+执行步骤（`R-ENV-006`、`R-ENV-007`）：
+
+1. 准入校验：校验超管身份、`confirmation_token`、`resource_version`、目标版本存在性与绑定状态。
+2. 幂等判定：按 `idempotency_scope + request_fingerprint` 判重，命中则返回同一 `task_id`。
+3. 版本切换：在单事务中读取 `from_version`，切换 `workspace_registry_bindings.binding_version=target_binding_version` 并写任务阶段结果。
+4. 凭证重下发：对该 workspace 下所有 `Active` 的 `workspace_cluster_bindings` 执行 namespace 凭证重下发。
+5. 结果回写：汇总 cluster 级重下发结果，更新任务 `result` 与绑定最新下发版本。
+6. 审计与事件：写入审计日志并发送 `workspace.registry.binding.rolledback.v1`（按 cluster fan-out）。
+
+失败分支与补偿：
+
+- `步骤 1/2` 失败：直接拒绝请求，不入队或复用历史任务（幂等命中）。
+- `步骤 3` 失败：任务终态 `Failed`，不触发外部下发副作用。
+- `步骤 4` 部分失败：主任务标记 `Failed`，写 `failure_reason=credential_redispatch_partial_failed`，
+  自动创建补偿任务 `task_type=registry_credential_redispatch` 继承同一 `serialized_key` 重试。
+- 补偿任务达到重试上限仍失败：保留失败明细（按 `cluster_id`），触发 `P2` 告警并要求人工 runbook 介入。
+
+```mermaid
+sequenceDiagram
+  participant API as Internal API
+  participant DB as PostgreSQL
+  participant W as Worker
+  participant SD as Secret Distributor
+  participant A as Audit/Outbox
+
+  API->>DB: 校验权限/版本/目标版本/状态
+  API->>DB: 幂等判定并写入 rollback task
+  API-->>W: 202 + task_id
+  W->>DB: 切换 binding_version(from->to)
+  W->>SD: 对 Active clusters 执行 namespace 凭证重下发
+  alt 全部成功
+    W->>DB: task=Succeeded + 写 cluster 分发摘要
+    W->>A: emit rolledback event + audit(success)
+  else 存在失败 cluster
+    W->>DB: task=Failed + failure_reason
+    W->>DB: enqueue registry_credential_redispatch
+    W->>A: emit rolledback event + audit(failed)
+  end
+```
 
 ## 9. 资源编排与 K8s 交互设计
 
@@ -1906,6 +2015,18 @@ Secret 专项最小字段（`S-SEC-007`）：
 - `timestamp`
 - `request_id`
 - `result`
+
+仓库绑定回滚专项最小字段（`R-ENV-006`）：
+
+- `binding_id`
+- `workspace_id`
+- `cluster_id`
+- `from_version`
+- `to_version`
+- `actor`
+- `task_id`
+- `result`
+- `failure_reason`
 
 留存策略（`NFR-013`）：
 
@@ -2310,7 +2431,8 @@ T9 运维补充约束：
 | 需求 ID | 测试场景（用例 ID） | 验收标准（通过条件） | 证据产物 |
 | --- | --- | --- | --- |
 | R-ENV-001~003 | namespace 映射校验（`TC-ENV-01`） | 绑定成功；namespace 存在；binding 为 `Active` | API 响应、DB 快照、`kubectl get ns` |
-| R-ENV-004~008 | 跨 workspace/cluster 请求拦截（`TC-ENV-02`） | 返回 `403/422`；无任务入队；审计有拒绝记录 | 错误响应、任务表查询、审计日志 |
+| R-ENV-004~005、008 | 跨 workspace/cluster 请求拦截（`TC-ENV-02`） | 返回 `403/422`；无任务入队；审计有拒绝记录 | 错误响应、任务表查询、审计日志 |
+| R-ENV-006~007 | 仓库回滚与凭证重下发（`TC-ENV-04`） | 仅超管；版本切换成功并完成凭证重下发；重复请求复用 `task_id` | 接口响应、任务结果、Secret 清单、审计事件 |
 | R-ENV-009~010 | 解绑冻结与恢复窗口（`TC-ENV-03`） | 状态流转正确；仅超管执行且二次确认 | 状态机日志、审计日志、操作录屏 |
 | R-ABS-001~004 | 新资源类型接入不改主流程（`TC-ABS-01`） | 仅新增 schema+adapter 即可跑通 CUD；任务、鉴权、审计代码路径无分叉 | PR diff、单测、集成测试报告 |
 | R-ABS-005~008 | 标签与 L1 统计口径（`TC-ABS-02`） | K8s 对象带完整标签；控制面不以 Pod 为主资源；报表按 5 类 L1 聚合 | K8s 清单、API 契约测试、配额报表 |
@@ -2372,6 +2494,15 @@ flowchart LR
 | 幂等唯一约束一致性 | `TC-OPS-03` | `requirements` 与 `design` 均以 `idempotency_scope` 为唯一约束 | 文档 diff、评审记录、DDL 草案 |
 | 同 scope 异载荷冲突行为一致性 | `TC-OPS-04` | 同 scope+同指纹返回同 `task_id`；异指纹返回 `409` | 请求重放日志、错误响应样本、`async_tasks` 查询 |
 | TTL 窗口与清理语义一致性 | `TC-OPS-05` | 去重窗口统一为首次写入后 24h；过期后允许创建新任务且不影响审计检索 | 过期样本数据、清理任务日志、审计查询结果 |
+
+#### 14.1.4 T11 仓库绑定回滚验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| 成功回滚 | `TC-ENV-04-A` | `:rollback` 返回 202；任务成功；版本从 `vN` 到 `vK`；凭证重下发成功 | API 响应、任务结果、绑定快照、Secret、审计事件 |
+| 目标版本不存在 | `TC-ENV-04-B` | 返回 `404 BINDING_VERSION_NOT_FOUND`，且无新任务入队 | 错误响应、任务表查询、审计拒绝日志 |
+| 越权调用 | `TC-ENV-04-C` | 非超管调用返回 `403 FORBIDDEN`，且无绑定版本变更 | 鉴权日志、错误响应、绑定版本快照 |
+| 重复请求幂等复用 | `TC-ENV-04-D` | 同 key 同体复用同 `task_id`；同 key 异体返回 `409`（`IDEMPOTENCY_PAYLOAD_MISMATCH`） | 请求重放日志、任务记录、错误响应 |
 
 ### 14.2 测试分层与关键场景
 
@@ -2471,7 +2602,7 @@ flowchart LR
 
 | 需求簇 | 主要章节映射 |
 | --- | --- |
-| `R-ENV` | 4.1、5.7、6.5、7.6、11.1、11.2 |
+| `R-ENV` | 4.1、5.7、6.5、7.6、8.7、11.1、11.2 |
 | `R-ABS` | 3.3、4.2、5.1、8.1~8.6 |
 | `R-DSP` | 4.3、5.2、5.3、9.1~9.5、11.3 |
 | `R-LCP` | 4.4、5.2、9.1~9.5、11.3 |
@@ -2493,8 +2624,8 @@ flowchart LR
 | R-ENV-003 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-004 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-005 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
-| R-ENV-006 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
-| R-ENV-007 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
+| R-ENV-006 | 4.1、5.7、6.5、7.6、8.7、11.1、11.2 | 已覆盖 | 已在 4.1、7.6、8.7 定义 rollback 契约与补偿，并在 14.1.4（`TC-ENV-04`）给出验收证据。 |
+| R-ENV-007 | 4.1、5.7、6.5、7.6、8.7、11.1、11.2 | 已覆盖 | 已在 4.1、8.7 固化回滚后按 Active clusters 执行 namespace 凭证重下发与结果回写。 |
 | R-ENV-008 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-009 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-010 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
@@ -2645,6 +2776,14 @@ flowchart LR
 | 同 scope+异指纹冲突语义在需求/设计/验收三处一致 | R-OPS-002 | 待补充 | 已覆盖 | `docs/requirements.md`（任务规则/错误码）、8.4、14.1.3 |
 | 幂等去重窗口与 TTL 清理边界在需求/设计一致并具备验收证据 | R-OPS-002 | 待补充 | 已覆盖 | `docs/requirements.md`（任务规则）、8.4、14.1.3 |
 
+#### 14.4.8 T11 仓库绑定回滚契约回标记录（2026-02-23）
+
+| 回标项 | 关联需求 | T11 前状态 | T11 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| 仓库绑定 rollback 内部接口与请求模型补齐（路径、字段、错误码） | R-ENV-006 | 待补充 | 已覆盖 | 7.6、7.2、14.1.4 |
+| 回滚执行链路补齐（版本切换 -> 凭证重下发 -> 结果回写 -> 审计/事件） | R-ENV-006、R-ENV-007 | 待补充 | 已覆盖 | 4.1、8.7、10.5 |
+| 验收闭环补齐（成功回滚、版本不存在、越权、重复请求幂等复用） | R-ENV-006 | 待补充 | 已覆盖 | 14.1（`TC-ENV-04`）、14.1.4、15.2.2 |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
@@ -2687,10 +2826,12 @@ flowchart LR
    必须在实体定义、索引、任务编排、接口契约四处做单口径核对，
    并同步校验 `requirements.md` 的 `AsyncTask` 唯一约束与冲突语义
    （含 `IDEMPOTENCY_PAYLOAD_MISMATCH`）一致。
-6. 设计追踪更新：更新本文件 `14.4` 覆盖表，调整受影响需求 ID 的章节映射与状态。
-7. 设计正文更新：更新受影响章节（如 4/5/6/7/8/9/10/11/12/13/14）。
-8. 任务同步：更新 `docs/task/task_design.md` 的任务状态、DoD 与依赖关系。
-9. 评审与发布：完成评审后再进入实现任务拆分，禁止“需求已改、设计未改”直接开发。
+6. 绑定回滚契约复核：凡涉及 `R-ENV-006/R-ENV-007` 的变更，必须同步核对
+   回滚接口契约（7.6）、执行链路（8.7）与验收用例（14.1.4），确保“可回滚”可调用、可审计、可验收。
+7. 设计追踪更新：更新本文件 `14.4` 覆盖表，调整受影响需求 ID 的章节映射与状态。
+8. 设计正文更新：更新受影响章节（如 4/5/6/7/8/9/10/11/12/13/14）。
+9. 任务同步：更新 `docs/task/task_design.md` 的任务状态、DoD 与依赖关系。
+10. 评审与发布：完成评审后再进入实现任务拆分，禁止“需求已改、设计未改”直接开发。
 
 #### 15.2.3 版本规则
 
@@ -2720,7 +2861,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T10）
+#### 15.3.1 设计自检记录（T11）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -2730,6 +2871,7 @@ flowchart LR
 | 冲突检查 | 通过 | 未发现与第 4~13 章的语义冲突 |
 | T9 语义补齐 | 通过 | 已补齐 5 个缺口并在 14.4.6 回标，未触发需求基线偏离 |
 | T10 幂等基线一致性修订 | 通过 | 已完成 requirements/design/decision/task 四文档联动，14.1.3 与 14.4.7 证据闭环 |
+| T11 仓库绑定回滚契约补齐 | 通过 | 已补齐 7.2/7.6/8.7/10.5 契约与执行链路，14.1.4 与 14.4.8 证据闭环 |
 | 遗漏检查 | 有残余风险 | 以下开放问题不阻断编码，但会影响上线效率或运维成本 |
 
 #### 15.3.2 开放问题（需闭环）
