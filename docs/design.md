@@ -12,6 +12,7 @@
 | `v1.0.0` | `2026-02-23` | 完成第 1 章文档元信息收口（版本、术语、参考），形成可评审基线版本。 | 文档收口 |
 | `v1.1.0` | `2026-02-23` | 完成 T7：补齐端点、统一路径并更新覆盖回标。 | `T7`、`ADR-084` |
 | `v1.2.0` | `2026-02-23` | 完成 T8：修复命名/更新方法/幂等口径冲突并回标。 | `T8`、`ADR-085` |
+| `v1.3.0` | `2026-02-23` | 完成 T9：补齐语义缺口（配额/报表、外部导入闭环、embedded 权限、LCP 多实例默认值）并更新覆盖回标。 | `T9`、`ADR-086` |
 
 文档状态：
 
@@ -141,6 +142,8 @@ T1 阶段输出定位为“设计基线”而非“功能详设”：
 - 实例（Instance）：模板/制品在 workspace+cluster+namespace 的运行实体。
 - 可见性（Visibility）：`shared` 与 `embedded` 必须在 API、权限、展示上隔离。
 - 宿主归属（Owner）：`embedded` 资源必须绑定 `owner_kind/owner_id` 并随宿主生命周期回收。
+- L1 统计口径：配额统计与审计报表仅按 5 类一级资源聚合，支撑资源只作为明细维度，不改变一级口径（`R-ABS-007`）。
+- 幂等唯一性表达：对外语义保持 `Idempotency-Key`，内部唯一键固定为 `idempotency_scope`，`idempotency_key` 仅保留审计检索语义（`R-OPS-002`）。
 
 ## 3. 总体架构设计
 
@@ -472,6 +475,21 @@ sequenceDiagram
 }
 ```
 
+`R-ABS-007` 配额统计与审计报表口径落地：
+
+- 统计对象：仅统计 5 类一级资源：
+  `DataServiceInstance`、`LowCodePlatformInstance`、`DevBoxInstance`、
+  `GatewayInstance`、`HighCodeApplication`。
+- 聚合键：`workspace_id + cluster_id + resource_kind + status + day`。
+- 统计边界：`deleted_at is null` 参与“当前配额”；软删资源仅进入审计报表历史视图。
+- 支撑资源口径：`AgentInstance`、`HighCodeReleaseChart` 等仅作为 drill-down 明细，不参与一级配额占用计数。
+- 读模型路径：
+  - 配额统计：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/quota-summary?date=YYYY-MM-DD`
+  - 审计报表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/audit-reports/resources?from=&to=&resource_kind=`
+- 报表示例：
+  - 配额统计示例：`resource_kind=highcode_application, limit=2000, used=438, utilization=21.9%`。
+  - 审计报表示例：`2026-02-23` 日内 `application.release` 成功 `154` 次，失败 `7` 次，失败 Top1 原因为 `image_dependency_unavailable`。
+
 扩展约束：
 
 - 新增资源类型只允许新增：
@@ -540,8 +558,13 @@ Service 命名策略（`R-DSP-007`）：
 
 实例规则：
 
-- 同 workspace+cluster 下同 `platform_type` 默认单活动实例。
+- `allow_multi_instance` 默认值固定为 `false`（同 workspace+cluster+platform_type 默认单活动实例）。
 - 若工作空间配置 `allow_multi_instance=true`，可放开为多实例（`R-LCP-008`）。
+- 配置范围与变更策略：
+  - 配置域：`workspace + cluster + platform_type`。
+  - 变更权限：仅超级管理员可修改。
+  - 生效时机：仅对“新建实例”即时生效，不追溯改写存量实例。
+  - 收敛策略：从 `true -> false` 时，若现存活动实例 `>1`，系统阻断新增并提示先收敛到单实例。
 - 实例详情必须记录：`entry_url`、`admin_account_ref`、`dependency_topology`、`version`（`R-LCP-007`）。
 
 依赖组件策略：
@@ -663,6 +686,22 @@ Chart 专属规则（`R-HCA-007`）：
 3. 推送 OCI Artifact 到工作空间绑定仓库（`R-PKG-003`）。
 4. 写入 `HighCodeReleaseChart` 元数据与状态。
 5. 提供下载导出接口（`R-PKG-004`）。
+
+外部环境导入闭环（`R-PKG-004`）：
+
+1. 用户下载发布包：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package`。
+2. 下载后执行产物校验：校验 `sha256`、`chart_ref`、`digest` 与 `values_digest` 一致。
+3. 在外部环境执行导入：`helm registry login` + `helm pull` 或离线包 `helm install`。
+4. 外部环境运行验证：校验 release 状态 `deployed`、核心 workload ready、服务入口可达。
+5. 回传验收证据：记录导入命令输出、`helm status`、`kubectl get pods/svc` 与访问探活结果。
+
+E2E 通过条件（发布验收门禁）：
+
+- 下载产物可校验通过；
+- 外部环境导入命令执行成功（无重试失败残留）；
+- 导入后 10 分钟内关键 workload ready；
+- 入口健康检查连续 3 次成功；
+- 证据归档可追溯到 `application_id + release_version + chart_id`。
 
 元数据最小集（`R-PKG-005`）：
 
@@ -788,27 +827,25 @@ erDiagram
 
 #### 5.2.2 一级资源实体
 
-<!-- markdownlint-disable MD013 -->
-
 | 实体 | 关键字段（除通用列） | 唯一性/约束 |
 | --- | --- | --- |
-| `data_service_instances` | `data_service_type text`、`instance_name text`、`visibility text`、`owner_kind text`、`owner_id uuid`、`template_id uuid`、`spec jsonb`、`connection_secret_ref text` | `visibility in ('shared','embedded')`；`embedded` 必须带 `owner_kind/owner_id` |
-| `lowcode_platform_instances` | `platform_type text`、`instance_name text`、`entry_url text`、`template_id uuid`、`spec jsonb` | 同 workspace+cluster 下按 `platform_type+instance_name` 唯一 |
-| `devbox_instances` | `instance_name text`、`template_id uuid`、`repo_url text`、`runtime_spec jsonb` | 支持 `Stopped/Publishing` 扩展状态 |
+| `data_service_instances` | `type,name,visibility,owner,template,spec,secret` | `shared/embedded`；embedded 必带 owner |
+| `lowcode_platform_instances` | `ptype,name,url,template,spec` | `platform_type+instance_name` 唯一 |
+| `devbox_instances` | `instance_name`、`template_id`、`repo_url`、`runtime_spec` | 支持 `Stopped/Publishing` 扩展状态 |
 | `gateway_instances` | `instance_name text`、`template_id uuid`、`gateway_spec jsonb` | `workspace_id+cluster_id` 全局单例 |
-| `highcode_applications` | `application_name text`、`source_type text`、`release_channel text`、`runtime_spec jsonb` | 创建时必须至少关联 1 个 Agent |
+| `highcode_applications` | `application_name`、`source_type`、`release_channel`、`runtime_spec` | 创建时必须至少关联 1 个 Agent |
 
 #### 5.2.3 支撑资源实体
 
 | 实体 | 关键字段 | 唯一性/约束 |
 | --- | --- | --- |
-| `highcode_artifacts` | `artifact_name`、`artifact_version`、`artifact_type`、`image_ref`、`chart_ref`、`digest` | `artifact_type in ('devbox_published_image','uploaded_image','uploaded_helm_chart')` |
+| `highcode_artifacts` | `name,version,type,image/chart,digest` | `artifact_type` 仅三种来源 |
 | `agent_instances` | `agent_instance_name`、`artifact_id`、`deploy_spec jsonb` | 同时刻仅允许归属一个 Application（由关系表约束） |
 | `devbox_publish_records` | `devbox_instance_id`、`publish_version`、`image_ref`、`digest`、`published_at/by` | 只归档不物理删除 |
-| `highcode_release_charts` | `application_id`、`release_version`、`chart_ref`、`digest`、`source_type`、`source_version`、`status` | `release_version` 在单应用内唯一 |
-| `highcode_application_agent_refs` | `application_id`、`agent_instance_id`、`created_at/by` | `(application_id,agent_instance_id)` 唯一，且 `agent_instance_id` 唯一 |
-| `highcode_application_dataservice_refs` | `application_id`、`data_service_instance_id`、`created_at/by` | 仅允许引用 `visibility='shared'` 组件 |
-| `async_tasks` | `idempotency_key`、`idempotency_scope`、`request_fingerprint`、`idempotency_expire_at`、`task_type`、`serialized_key`、`status`、`retry_count`、`result jsonb` | `idempotency_scope` 在 24h 窗口内唯一；同 scope 的 `request_fingerprint` 必须一致 |
+| `highcode_release_charts` | `app_id,release_ver,chart_ref,digest,source,status` | `release_version` 单应用唯一 |
+| `highcode_application_agent_refs` | `application_id,agent_instance_id,created_at/by` | app-agent 唯一；agent 单归属 |
+| `highcode_application_dataservice_refs` | `application_id,data_service_instance_id,created_at/by` | 仅允许 shared 组件 |
+| `async_tasks` | `idem*,fingerprint,type,skey,status,retry,result` | idem_scope 24h 唯一且指纹一致 |
 | `secret_versions` | `secret_name`、`version`、`namespace`、`encrypted_data_ref`、`is_current` | 每个 `secret_name` 仅一个当前版本 |
 
 ### 5.3 关系模型（Application-Agent-DataService）
@@ -845,25 +882,24 @@ erDiagram
 | `resource_templates` | `uq_tpl_kind_name_ver(template_kind,template_name,template_version)` |
 | `highcode_artifacts` | `uq_art_workspace_name_ver_type(workspace_id,artifact_name,artifact_version,artifact_type)` |
 | `data_service_instances` | `uq_ds_workspace_cluster_name(workspace_id,cluster_id,instance_name)` |
-| `lowcode_platform_instances` | `uq_lc_workspace_cluster_type_name(workspace_id,cluster_id,platform_type,instance_name)` |
+| `lowcode_platform_instances` | `uq_lc_ws_cl_type_name(workspace_id,cluster_id,platform_type,instance_name)` |
 | `devbox_instances` | `uq_db_workspace_cluster_name(workspace_id,cluster_id,instance_name)` |
 | `gateway_instances` | `uq_gw_workspace_cluster(workspace_id,cluster_id)` |
 | `highcode_applications` | `uq_app_workspace_cluster_name(workspace_id,cluster_id,application_name)` |
 | `agent_instances` | `uq_agent_workspace_cluster_name(workspace_id,cluster_id,agent_instance_name)` |
-| `highcode_application_agent_refs` | `uq_ref_app_agent(application_id,agent_instance_id)` + `uq_ref_agent_single_owner(agent_instance_id)` |
+| `highcode_application_agent_refs` | `uq_ref_app_agent(...) + uq_ref_agent_single_owner(...)` |
 | `highcode_application_dataservice_refs` | `uq_ref_app_ds(application_id,data_service_instance_id)` |
 | `highcode_release_charts` | `uq_chart_app_release(application_id,release_version)` |
 | `async_tasks` | `uq_task_idempotency_scope(idempotency_scope)` |
 | `secret_versions` | `uq_secret_workspace_ns_name_ver(workspace_id,namespace,secret_name,version)` |
-
-<!-- markdownlint-enable MD013 -->
 
 索引策略：
 
 - 列表查询索引：`idx_<table>_workspace_cluster_status_deleted(workspace_id,cluster_id,status,deleted_at)`。
 - 任务查询索引：`idx_async_tasks_serialized_status(serialized_key,status,created_at desc)`。
 - 幂等清理索引：`idx_async_tasks_idem_expire(idempotency_expire_at)`。
-- 关系查询索引：`idx_ref_agent_app(agent_instance_id,application_id)`、`idx_ref_ds_app(data_service_instance_id,application_id)`。
+- 关系查询索引：`idx_ref_agent_app(agent_instance_id,application_id)`、
+  `idx_ref_ds_app(data_service_instance_id,application_id)`。
 - 审计追踪索引：`idx_<table>_last_task(last_task_id)`、`idx_<table>_delete_task(delete_task_id)`。
 
 实现说明：
@@ -1190,21 +1226,21 @@ flowchart LR
 
 资源分组：
 
-<!-- markdownlint-disable MD013 -->
+- 作用域前缀：`{scope}=/workspaces/{workspace_id}/clusters/{cluster_id}`
+
 | 分组 | Tag | 路径前缀 |
 | --- | --- | --- |
-| 数据服务组件 | `DataService` | `/workspaces/{workspace_id}/clusters/{cluster_id}/dataservices` |
-| 低代码平台 | `LowCodePlatform` | `/workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes` |
-| DevBox | `DevBox` | `/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes` |
-| 网关 | `Gateway` | `/workspaces/{workspace_id}/clusters/{cluster_id}/gateways` |
-| 高代码应用 | `HighCodeApplication` | `/workspaces/{workspace_id}/clusters/{cluster_id}/applications` |
-| Agent 实例 | `AgentInstance` | `/workspaces/{workspace_id}/clusters/{cluster_id}/agents` |
-| 资源模板 | `Template` | `/workspaces/{workspace_id}/clusters/{cluster_id}/templates` |
-| 高代码制品 | `HighCodeArtifact` | `/workspaces/{workspace_id}/clusters/{cluster_id}/artifacts` |
-| DevBox 发布记录 | `DevBoxPublishRecord` | `/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes` |
-| 发布 Chart 包 | `ReleaseChart` | `/workspaces/{workspace_id}/clusters/{cluster_id}/charts` |
-| 异步任务 | `AsyncTask` | `/workspaces/{workspace_id}/clusters/{cluster_id}/tasks` |
-<!-- markdownlint-enable MD013 -->
+| 数据服务组件 | `DataService` | `{scope}/dataservices` |
+| 低代码平台 | `LowCodePlatform` | `{scope}/lowcodes` |
+| DevBox | `DevBox` | `{scope}/devboxes` |
+| 网关 | `Gateway` | `{scope}/gateways` |
+| 高代码应用 | `HighCodeApplication` | `{scope}/applications` |
+| Agent 实例 | `AgentInstance` | `{scope}/agents` |
+| 资源模板 | `Template` | `{scope}/templates` |
+| 高代码制品 | `HighCodeArtifact` | `{scope}/artifacts` |
+| DevBox 发布记录 | `DevBoxPublishRecord` | `{scope}/devboxes/{devbox_id}/publishes` |
+| 发布 Chart 包 | `ReleaseChart` | `{scope}/charts` |
+| 异步任务 | `AsyncTask` | `{scope}/tasks` |
 
 标准 CRUD 模板（示例）：
 
@@ -1302,17 +1338,15 @@ ReleaseCreateRequest:
 
 T7 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 
-<!-- markdownlint-disable MD013 -->
 | 要求端点（需求口径） | Canonical path（设计口径） | OpenAPI 文件建议 |
 | --- | --- | --- |
-| `/templates` | `/workspaces/{workspace_id}/clusters/{cluster_id}/templates` | `paths/templates.yaml` |
-| `/artifacts` | `/workspaces/{workspace_id}/clusters/{cluster_id}/artifacts` | `paths/artifacts.yaml` |
-| `/devboxes/{devbox_id}/publishes` | `/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes` | `paths/devbox_publishes.yaml` |
-| `/publishes/{publish_id}` | `/workspaces/{workspace_id}/clusters/{cluster_id}/publishes/{publish_id}` | `paths/devbox_publishes.yaml` |
-| `/tasks/{task_id}/result` | `/workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result` | `paths/tasks.yaml` |
-| `/applications/{application_id}/charts` | `/workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts` | `paths/highcode_charts.yaml` |
-| `/charts/{chart_id}/package` | `/workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package` | `paths/highcode_charts.yaml` |
-<!-- markdownlint-enable MD013 -->
+| `/templates` | `{scope}/templates` | `paths/templates.yaml` |
+| `/artifacts` | `{scope}/artifacts` | `paths/artifacts.yaml` |
+| `/devboxes/{devbox_id}/publishes` | `{scope}/devboxes/{devbox_id}/publishes` | `paths/devbox_publishes.yaml` |
+| `/publishes/{publish_id}` | `{scope}/publishes/{publish_id}` | `paths/devbox_publishes.yaml` |
+| `/tasks/{task_id}/result` | `{scope}/tasks/{task_id}/result` | `paths/tasks.yaml` |
+| `/applications/{application_id}/charts` | 见 7.3「发布包列表」接口 | `paths/highcode_charts.yaml` |
+| `/charts/{chart_id}/package` | `{scope}/charts/{chart_id}/package` | `paths/highcode_charts.yaml` |
 
 OpenAPI 统一约束：
 
@@ -1331,7 +1365,6 @@ OpenAPI 统一约束：
 
 内部接口（平台内调用，不对租户开放）：
 
-<!-- markdownlint-disable MD013 -->
 | 接口 | 方法 | 语义 |
 | --- | --- | --- |
 | `/internal/v1/workspace-cluster-bindings/{binding_id}:freeze` | `POST` | 发起解绑冻结（含二次确认） |
@@ -1339,7 +1372,6 @@ OpenAPI 统一约束：
 | `/internal/v1/workspace-cluster-bindings/{binding_id}:recover` | `POST` | 24h 窗口内撤销解绑 |
 | `/internal/v1/workspace-cluster-bindings/{binding_id}:reclaim` | `POST` | 执行 namespace 回收 |
 | `/internal/v1/workspace-registry-bindings/{binding_id}:rotate-credential` | `POST` | 轮转仓库凭证并触发下发 |
-<!-- markdownlint-enable MD013 -->
 
 事件主题与载荷（Outbox -> EventBus）：
 
@@ -1750,6 +1782,15 @@ type RequestContext struct {
   `task.read`（用户在已关联工作空间可执行）。
 - 受限动作：`secret.read_plaintext` 永久拒绝，保留平台服务账号内部能力。
 
+`embedded` 组件运维权限收敛（`R-DSP-010`、`R-DSP-011`）：
+
+| 场景 | super_admin | user | 说明 |
+| --- | --- | --- | --- |
+| 通过 `dataservices` 独立接口读取/更新/删除 `embedded` | 拒绝（`404`） | 拒绝（`404`） | API 可见性对齐：`embedded` 不作为独立资源暴露 |
+| 通过高代码应用宿主执行 `embedded` 运维（升级/重启/回收） | 允许 | 允许（需有该应用权限） | 以宿主动作鉴权，不单独下发 `embedded` 权限 |
+| 通过低代码平台宿主执行 `embedded` 运维 | 允许 | 拒绝（`403 FORBIDDEN_ACTION`） | 低代码平台管理动作仅超管 |
+| 宿主删除触发 `embedded` 回收补偿 | 允许 | 允许触发宿主删除；补偿由系统执行 | 审计记录操作者与系统补偿任务 |
+
 实现约束：
 
 - 鉴权中间件只做“是否可进入 handler”。
@@ -1927,6 +1968,19 @@ Secret 专项最小字段（`S-SEC-007`）：
   `GET /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/relations`、
   `GET /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`
   的详情读模型返回嵌入式关系。
+- 对 `embedded` 资源 ID 的独立接口访问（`GET/PUT/DELETE /dataservices/{id}`）统一返回 `404 RESOURCE_NOT_FOUND`，避免形成“超管可见、用户不可见”双口径。
+
+操作权限与审计动作：
+
+- 权限判定：
+  - `embedded` 运维权限由宿主权限派生，不单独存在 `embedded.*` 动作。
+  - 高代码宿主：`application.update/delete` 通过后允许执行对应 `embedded` 运维。
+  - 低代码宿主：仅 `lowcode.manage`（超管）可触发 `embedded` 运维。
+- 审计动作：
+  - `embedded_dataservice.operate_via_owner`
+  - `embedded_dataservice.recycle_via_owner_delete`
+  - `embedded_dataservice.compensation_retry`
+- 审计最小字段补充：`owner_kind`、`owner_id`、`visibility=embedded`、`trigger_action`。
 
 ### 11.4 级联删除与引用冲突处理
 
@@ -2213,6 +2267,15 @@ NFR-019（状态更新延迟 <=30s）：
 - 状态投影优先消费任务事件流，回退周期性对账（15s 周期）。
 - 观测指标 `aether_status_projection_lag_ms` 作为硬阈值告警输入。
 
+T9 运维补充约束：
+
+- 配额与报表任务与业务任务隔离：
+  - 统计投影任务运行在独立队列 `report-projector`，避免影响 CUD 主链路。
+  - 统计刷新 SLA：T+1 分钟内可见，失败重试不阻断业务任务。
+- 外部导入验收可操作性：
+  - 发布任务必须输出外部导入指引元数据（`import_command_hint`、`values_digest`、`chart_digest`）。
+  - 运维手册需包含“外部导入失败排障”步骤，并在 `TC-PKG-02` 验证可执行性。
+
 ### 13.6 压测与容量验收方案
 
 压测分层：
@@ -2240,35 +2303,31 @@ NFR-019（状态更新延迟 <=30s）：
 - 一个用例可覆盖多个需求 ID，但每个需求 ID 在本表至少出现一次。
 - 与 `14.4` 逐条覆盖核对表联动；若 `14.4` 状态不是 `已覆盖`，该需求不得进入发布验收。
 
-<!-- markdownlint-disable MD013 -->
-
 | 需求 ID | 测试场景（用例 ID） | 验收标准（通过条件） | 证据产物 |
 | --- | --- | --- | --- |
-| R-ENV-001~003 | 工作空间绑定集群后自动映射同名 namespace（`TC-ENV-01`） | 绑定成功；目标集群存在同名 namespace；绑定表写入 `namespace_name` 与状态 `Active` | API 响应、DB 快照、`kubectl get ns` |
+| R-ENV-001~003 | namespace 映射校验（`TC-ENV-01`） | 绑定成功；namespace 存在；binding 为 `Active` | API 响应、DB 快照、`kubectl get ns` |
 | R-ENV-004~008 | 跨 workspace/cluster 请求拦截（`TC-ENV-02`） | 返回 `403/422`；无任务入队；审计有拒绝记录 | 错误响应、任务表查询、审计日志 |
-| R-ENV-009~010 | 解绑冻结到 24h 恢复窗口与回收（`TC-ENV-03`） | 状态流转满足 `Frozen->Validating->RecoveryWindow->Reclaiming/Active`；仅超管可执行且二次确认必填 | 状态机日志、审计日志、操作录屏 |
+| R-ENV-009~010 | 解绑冻结与恢复窗口（`TC-ENV-03`） | 状态流转正确；仅超管执行且二次确认 | 状态机日志、审计日志、操作录屏 |
 | R-ABS-001~004 | 新资源类型接入不改主流程（`TC-ABS-01`） | 仅新增 schema+adapter 即可跑通 CUD；任务、鉴权、审计代码路径无分叉 | PR diff、单测、集成测试报告 |
-| R-ABS-005~008 | 标签规范与 Pod 非主实体约束（`TC-ABS-02`） | K8s 对象带完整标签；控制面 API 不暴露 Pod 作为领域主资源 | K8s 清单、API 契约测试 |
+| R-ABS-005~008 | 标签与 L1 统计口径（`TC-ABS-02`） | K8s 对象带完整标签；控制面不以 Pod 为主资源；报表按 5 类 L1 聚合 | K8s 清单、API 契约测试、配额报表 |
 | R-DSP-001~007 | 共享组件创建、扩缩容、升级回滚（`TC-DSP-01`） | 组件 CRUD 与运维动作均走异步任务；Service 命名规则符合策略 | 任务记录、状态快照、Service 清单 |
-| R-DSP-008~012 | 嵌入式组件隔离与宿主回收（`TC-DSP-02`） | `embedded` 不出现在共享列表；删除宿主后嵌入式组件回收；不可被他应用复用 | 列表响应、关系表、删除任务日志 |
+| R-DSP-008~012 | embedded 隔离与宿主回收（`TC-DSP-02`） | `embedded` 不进共享池；独立接口不可运维；宿主删除后回收 | 列表响应、关系表、删除日志、权限审计 |
 | R-LCP-001~004 | 低代码平台内置/导入 Helm 与生命周期（`TC-LCP-01`） | 仅 Helm 导入；实例 CRUD、升级回滚成功；角色权限正确 | API 响应、任务日志、权限测试报告 |
-| R-LCP-005~010 | 低代码依赖嵌入式归属与可见性（`TC-LCP-02`） | Dify/FastGPT 依赖组件被标记嵌入式；普通用户仅可查看入口与状态 | 拓扑详情、列表响应、RBAC 测试 |
+| R-LCP-005~010 | 低代码依赖归属与多实例（`TC-LCP-02`） | 依赖组件标记 `embedded`；多实例默认关闭；普通用户仅查看 | 拓扑详情、列表响应、RBAC、策略审计 |
 | R-DBX-001~005 | DevBox 创建与发布流程（`TC-DBX-01`） | DevBox 实例可创建/更新/停止/删除；发布流程产出记录完整 | DevBox 实例详情、发布记录 |
 | R-DBX-006~009 | 已发布镜像门禁与历史保留（`TC-DBX-02`） | 未发布镜像创建应用被拒绝；删除 DevBox 不删发布记录 | 错误响应、发布记录保留验证 |
-| R-GTW-001~006 | 网关单例、灰度变更、发布前校验（`TC-GTW-01`） | workspace+cluster 仅 1 网关实例；灰度失败可回滚；应用发布前网关可用性校验生效 | 唯一约束验证、任务日志、发布校验日志 |
+| R-GTW-001~006 | 网关单例、灰度变更、发布前校验（`TC-GTW-01`） | workspace+cluster 仅 1 网关实例；灰度失败可回滚；发布前网关可用校验 | 唯一约束验证、任务日志、发布校验日志 |
 | R-HCA-001~006 | 高代码应用来源与关系约束（`TC-HCA-01`） | 三类来源均可创建；Application-Agent 关系与跨边界校验生效 | 创建响应、关系表、校验错误日志 |
 | R-HCA-007~010 | Chart 版本、values 覆盖、运行编排（`TC-HCA-02`） | Chart 版本可选；values 覆盖优先级正确；Secret 明文不可读 | 渲染产物、部署清单、权限测试 |
-| R-HCA-011~014 | 级联删除与 409 引用冲突（`TC-HCA-03`） | `cascade=false` 不删共享组件；`cascade=true` 遇共享引用返回 `409`；embedded 随宿主回收 | 删除响应、关系校验、补偿日志 |
-| R-PKG-001~006 | 发布打包、入库、下载导出（`TC-PKG-01`） | 每次发布产出版本化 Chart；推送 OCI 成功并可下载；元数据字段齐全可复现 | Release 记录、OCI 清单、下载校验 |
+| R-HCA-011~014 | 级联冲突（`TC-HCA-03`） | `cascade=false` 保留共享组件；`cascade=true` 冲突返回 `409`；embedded 随宿主回收 | 删除响应、关系校验、补偿 |
+| R-PKG-001~006 | 发布打包与导入（`TC-PKG-01`、`TC-PKG-02`） | 每次发布产出版本化 Chart；OCI 推送成功可下载；外部导入通过验证 | Release 记录、OCI 清单、下载与导入验证 |
 | R-DATA-001~008 | 关系持久化与可见性查询（`TC-DATA-01`） | 应用详情完整输出 agent/shared/embedded/release；关系变更均可审计追溯 | 详情响应、关系表、审计检索结果 |
-| R-OPS-001~010 | 异步任务、幂等、串行与补偿（`TC-OPS-01`） | CUD 返回 `202+task_id`；24h 幂等命中同任务；同资源串行；失败触发补偿 | 任务流水、幂等命中记录、补偿任务 |
-| S-SEC-001~007 | Secret 边界、版本、回滚与审计（`TC-SEC-01`） | Secret 仅在 workspace namespace；普通用户不可读明文；回滚采用新版本写入并可审计 | Secret 版本记录、RBAC 测试、审计日志 |
-| NFR-001~004 | 接口延迟、排队时延、任务执行时长（`TC-NFR-01`） | 满足 13.1 指标阈值：提交 `P95<=300ms`、Query `P95<=800ms`、排队 `P95<=5s`、任务时长达标 | 压测报告、监控面板截图 |
-| NFR-005~011 | 可用性、容量、吞吐（`TC-NFR-02`） | 月可用性 `>=99.9%`；容量与吞吐达到 13.2/13.3 目标 | SLI 报表、容量报告、压测报告 |
+| R-OPS-001~010 | 异步任务、幂等与补偿（`TC-OPS-01`） | CUD 返回 `202+task_id`；idem_scope 命中同任务；异指纹返回 `409` | 任务流水、幂等记录、补偿、错误样本 |
+| S-SEC-001~007 | Secret 边界、版本与审计（`TC-SEC-01`） | Secret 在 workspace namespace；用户不可读明文；回滚采用新版本并审计 | Secret 版本记录、RBAC、审计 |
+| NFR-001~004 | 接口延迟、排队时延、任务执行时长（`TC-NFR-01`） | 满足 13.1 阈值：提交 `P95<=300ms`、Query `P95<=800ms`、排队 `P95<=5s` | 压测报告、监控截图 |
+| NFR-005~011 | 可用性、容量、吞吐（`TC-NFR-02`） | 月可用性 `>=99.9%`；容量与吞吐达到 13.2/13.3 目标 | SLI 报表、容量与压测报告 |
 | NFR-012~015 | 安全与审计可追溯（`TC-NFR-03`） | 敏感信息不明文持久化；日志留存策略生效；跨边界拒绝强制审计 | 配置检查报告、审计抽样报告 |
 | NFR-016~019 | 可扩展、可诊断、状态投影延迟（`TC-NFR-04`） | 新资源扩展不改主流程；`failure_reason` 字段齐全；状态更新延迟 `<=30s` | 扩展演示、故障注入报告、监控曲线 |
-
-<!-- markdownlint-enable MD013 -->
 
 端到端验收链路（需求到发布）：
 
@@ -2283,7 +2342,6 @@ flowchart LR
 
 #### 14.1.1 T7 接口路径复核样例（canonical path）
 
-<!-- markdownlint-disable MD013 -->
 | 场景 | Canonical path（统一示例） |
 | --- | --- |
 | 模板查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/templates?kind=dataservice` |
@@ -2292,13 +2350,20 @@ flowchart LR
 | 高代码应用发布包列表 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts` |
 | 发布包下载 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package` |
 | 任务结果查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result` |
-<!-- markdownlint-enable MD013 -->
+
+#### 14.1.2 T9 语义补齐验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| 幂等唯一性口径一致化 | `TC-OPS-02` | 同 `idempotency_scope` 且同指纹复用同 `task_id`；异指纹返回 `409` | 请求重放日志、`async_tasks` 查询、错误响应 |
+| 配额统计/审计报表口径 | `TC-ABS-03` | 配额与报表按 5 类一级资源聚合，支撑资源仅作为明细展示 | 报表接口响应、SQL 核对结果 |
+| 外部导入闭环 | `TC-PKG-02` | 下载校验通过、外部 `helm install` 成功、运行态验证通过 | 下载摘要、命令输出、`helm status`、探活结果 |
+| embedded 运维权限统一 | `TC-DSP-03` | 独立 `dataservices/{id}` 对 embedded 返回 `404`；宿主路径按宿主权限执行 | API 调用记录、RBAC 测试、审计事件 |
+| 多实例默认值定稿 | `TC-LCP-03` | `allow_multi_instance` 默认 `false`；策略变更仅影响新建实例 | 配置变更审计、实例创建结果 |
 
 ### 14.2 测试分层与关键场景
 
 #### 14.2.1 测试分层
-
-<!-- markdownlint-disable MD013 -->
 
 | 层级 | 范围 | 目标 | 通过门槛 |
 | --- | --- | --- | --- |
@@ -2322,8 +2387,8 @@ flowchart LR
 | KS-08 | Secret 回滚与新版本生成 | S-SEC-003~005、ADR-078 | 回滚生成 `v(n+1)`，不覆盖历史版本 |
 | KS-09 | 漂移修复与业务任务串行 | R-ABS-002、ADR-077 | 漂移修复与变更任务不并发执行，状态不互相覆盖 |
 | KS-10 | 状态投影延迟阈值验证 | NFR-019 | `aether_status_projection_lag_ms` 满足 `<=30s` |
-
-<!-- markdownlint-enable MD013 -->
+| KS-11 | 发布包外部环境导入闭环验证 | R-PKG-004、R-PKG-006 | 下载校验、外部导入、运行态验证三步均成功并可追溯到发布版本 |
+| KS-12 | embedded 独立接口封闭与宿主派生运维 | R-DSP-010、R-DSP-011 | 独立接口返回 `404`；宿主运维路径按角色规则执行且审计完整 |
 
 #### 14.2.3 缺陷分级与退出标准
 
@@ -2339,16 +2404,12 @@ flowchart LR
 
 #### 14.3.1 发布准入门禁（Gate）
 
-<!-- markdownlint-disable MD013 -->
-
 | Gate | 检查项 | 责任角色 | 阻断条件 |
 | --- | --- | --- | --- |
 | Gate-1 需求与设计一致性 | `requirements.md`、`design.md`、`decision.md` 三文档一致；`14.4` 全部为已覆盖 | 架构负责人 | 任一需求 ID 状态非 `已覆盖` |
 | Gate-2 测试准入 | `14.1` P0 用例全部通过；无未关闭 P0 缺陷 | QA 负责人 | 任一 P0 用例失败或 P0 缺陷未关闭 |
 | Gate-3 NFR 准入 | 满足 `13.1~13.6` 阈值与演练门槛 | SRE 负责人 | 任一 NFR 指标未达标 |
 | Gate-4 变更安全 | 迁移脚本回滚验证通过；发布 Runbook 演练通过 | 后端负责人 | migration 无回滚路径或演练失败 |
-
-<!-- markdownlint-enable MD013 -->
 
 #### 14.3.2 发布步骤（按批次灰度）
 
@@ -2413,8 +2474,6 @@ flowchart LR
 
 #### 14.4.3 逐条需求 ID 覆盖核对表
 
-<!-- markdownlint-disable MD013 -->
-
 | 需求 ID | 映射章节 | 当前状态 | 备注 |
 | --- | --- | --- | --- |
 | R-ENV-001 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
@@ -2433,7 +2492,7 @@ flowchart LR
 | R-ABS-004 | 3.3、4.2、5.1、8.1~8.6 | 已覆盖 | 已在 3.2/3.3 明确新增资源仅扩展 schema+adapter。 |
 | R-ABS-005 | 3.3、4.2、5.1、8.1~8.6 | 已覆盖 | 已在 3.3 定义统一标签规范。 |
 | R-ABS-006 | 3.3、4.2、5.1、8.1~8.6 | 已覆盖 | 已在 3.3/6.6 定义统一状态快照与观测回写机制。 |
-| R-ABS-007 | 3.3、4.2、5.1、8.1~8.6 | 已覆盖 | 已在 2.6 固化分层与 Pod 观测边界。 |
+| R-ABS-007 | 3.3、4.2、5.1、8.1~8.6 | 已覆盖 | 已在 2.6、4.2 补齐“5 类一级资源用于配额统计与审计报表”的聚合口径与查询路径。 |
 | R-ABS-008 | 3.3、4.2、5.1、8.1~8.6 | 已覆盖 | 已在 2.6 固化分层与 Pod 观测边界。 |
 | R-DSP-001 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
 | R-DSP-002 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
@@ -2444,8 +2503,8 @@ flowchart LR
 | R-DSP-007 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
 | R-DSP-008 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
 | R-DSP-009 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
-| R-DSP-010 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
-| R-DSP-011 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
+| R-DSP-010 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 10.2、11.3 补齐 embedded 仅通过宿主运维的权限与审计规则。 |
+| R-DSP-011 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 10.2、11.3 固化 API 可见性隔离（独立接口统一 `404`）与操作权限一致性。 |
 | R-DSP-012 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
 | R-LCP-001 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
 | R-LCP-002 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
@@ -2454,7 +2513,7 @@ flowchart LR
 | R-LCP-005 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
 | R-LCP-006 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
 | R-LCP-007 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
-| R-LCP-008 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
+| R-LCP-008 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 定稿 `allow_multi_instance` 默认 `false`、变更权限与生效时机。 |
 | R-LCP-009 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
 | R-LCP-010 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
 | R-DBX-001 | 4.5、5.2、5.6、9.1~9.5 | 已覆盖 | 已在 4.5 与 9.1~9.3 补齐 DevBox 生命周期与发布门禁。 |
@@ -2489,7 +2548,7 @@ flowchart LR
 | R-PKG-001 | 4.8、5.6、8.2~8.6、9.1~9.5 | 已覆盖 | 已在 4.8 与 9.1~9.5 补齐打包、入库、下载导出链路。 |
 | R-PKG-002 | 4.8、5.6、8.2~8.6、9.1~9.5 | 已覆盖 | 已在 4.8 与 9.1~9.5 补齐打包、入库、下载导出链路。 |
 | R-PKG-003 | 4.8、5.6、8.2~8.6、9.1~9.5 | 已覆盖 | 已在 4.8 与 9.1~9.5 补齐打包、入库、下载导出链路。 |
-| R-PKG-004 | 4.8、5.6、8.2~8.6、9.1~9.5 | 已覆盖 | 已在 4.8 与 9.1~9.5 补齐打包、入库、下载导出链路。 |
+| R-PKG-004 | 4.8、5.6、8.2~8.6、9.1~9.5 | 已覆盖 | 已在 4.8、14.1.2 补齐“下载 -> 外部导入 -> 运行验证”闭环与证据要求。 |
 | R-PKG-005 | 4.8、5.6、8.2~8.6、9.1~9.5 | 已覆盖 | 已在 4.8 与 9.1~9.5 补齐打包、入库、下载导出链路。 |
 | R-PKG-006 | 4.8、5.6、8.2~8.6、9.1~9.5 | 已覆盖 | 已在 4.8 与 9.1~9.5 补齐打包、入库、下载导出链路。 |
 | R-DATA-001 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义关系持久化。 |
@@ -2501,7 +2560,7 @@ flowchart LR
 | R-DATA-007 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义应用详情读模型字段集合。 |
 | R-DATA-008 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.5 定义关系变更审计事件最小字段。 |
 | R-OPS-001 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
-| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、8.4 固化 24h 幂等去重。 |
+| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.6、5.2.3、8.1、8.4 统一幂等口径（scope 唯一，key 审计）。 |
 | R-OPS-003 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
 | R-OPS-004 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、7.3 固化工作空间/集群边界与错误模型。 |
 | R-OPS-005 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.1 固化串行化键模型与同资源串行执行。 |
@@ -2537,36 +2596,38 @@ flowchart LR
 | NFR-018 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 8.6、12.5、13.5 固化失败诊断字段与运维路径。 |
 | NFR-019 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 12.2、12.4、13.5 固化状态延迟指标、阈值与告警。 |
 
-<!-- markdownlint-enable MD013 -->
-
 #### 14.4.4 T7 覆盖回标记录（2026-02-23）
 
-<!-- markdownlint-disable MD013 -->
 | 回标项 | 关联需求 | T7 前状态 | T7 后状态 | 证据章节 |
 | --- | --- | --- | --- | --- |
-| 模板/制品/发布记录端点缺失补齐（`/templates`、`/artifacts`、`/devboxes/{devbox_id}/publishes`、`/publishes/{publish_id}`） | R-DBX-007、R-DBX-009、R-ABS-001 | 待补充 | 已覆盖 | 7.3、7.5、14.1.1 |
-| 发布包与下载端点补齐（`/applications/{application_id}/charts`、`/charts/{chart_id}/package`） | R-PKG-001~006 | 待补充 | 已覆盖 | 7.3、7.5、14.1.1 |
+| 模板/制品/发布记录端点补齐（见 7.3 端点清单） | R-DBX-007、R-DBX-009、R-ABS-001 | 待补充 | 已覆盖 | 7.3、7.5、14.1.1 |
+| 发布包与下载端点补齐（`applications/*/charts`、`charts/*/package`） | R-PKG-001~006 | 待补充 | 已覆盖 | 7.3、7.5、14.1.1 |
 | 任务结果端点补齐（`/tasks/{task_id}/result`） | R-OPS-008 | 待补充 | 已覆盖 | 7.3、8.6、14.1.1 |
 | 文档路径示例统一为 canonical path（去除旧路径示例） | R-ENV-005、R-OPS-004 | 待补充 | 已覆盖 | 3.5、11.3、14.1.1 |
-<!-- markdownlint-enable MD013 -->
 
 #### 14.4.5 T8 冲突修订回标记录（2026-02-23）
 
-<!-- markdownlint-disable MD013 -->
 | 回标项 | 关联需求 | T8 前状态 | T8 后状态 | 证据章节 |
 | --- | --- | --- | --- | --- |
-| API Path 命名冲突修正（`data-services/lowcode-platforms/highcode-applications/agent-instances` -> `dataservices/lowcodes/applications/agents`） | 接口契约要求（路径命名） | 待补充 | 已覆盖 | 7.3、7.5、11.3、14.1.1 |
+| API Path 命名冲突修正（旧路径 -> `dataservices/lowcodes/applications/agents`） | 接口契约要求（路径命名） | 待补充 | 已覆盖 | 7.3、7.5、11.3、14.1.1 |
 | Update 方法统一（`PATCH` -> `PUT`） | 接口契约要求（资源更新语义） | 待补充 | 已覆盖 | 7.1、7.3 |
-| Service 自动命名统一（`svc-{application_name}-{component_alias}` 与 `svc-{kind}-{resource_name}` 按优先级并存） | R-DSP-007 | 待补充 | 已覆盖 | 4.3、9.4 |
+| Service 自动命名统一（两种规则按优先级并存） | R-DSP-007 | 待补充 | 已覆盖 | 4.3、9.4 |
 | 幂等落库口径统一（`idempotency_key` 与 `idempotency_scope`、唯一索引、24h TTL） | R-OPS-002 | 待补充 | 已覆盖 | 5.2.3、5.4、8.1、8.4 |
 | 冲突修订留痕与需求变更流程补充 | 变更流程治理要求 | 待补充 | 已覆盖 | 15.2、`docs/decision.md`（ADR-085） |
-<!-- markdownlint-enable MD013 -->
+
+#### 14.4.6 T9 语义补齐回标记录（2026-02-23）
+
+| 回标项 | 关联需求 | T9 前状态 | T9 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| 幂等唯一性表达统一为“`idempotency_scope` 唯一 + `idempotency_key` 审计” | R-OPS-002 | 待补充 | 已覆盖 | 2.6、5.2.3、8.1、8.4、14.1.2 |
+| 配额统计与审计报表仅按 5 类一级资源聚合 | R-ABS-007 | 待补充 | 已覆盖 | 4.2、13.5、14.1.2 |
+| 下载导出到外部环境导入成功闭环与 E2E 证据定义 | R-PKG-004、R-PKG-006 | 待补充 | 已覆盖 | 4.8、14.1、14.1.2、14.2.2 |
+| embedded 组件独立运维权限与可见性统一 | R-DSP-010、R-DSP-011 | 待补充 | 已覆盖 | 10.2、11.3、14.1.2 |
+| `allow_multi_instance` 默认值与变更策略定稿，并收敛开放问题 | R-LCP-008 | 待补充 | 已覆盖 | 4.4、15.3.3 |
 
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
-
-<!-- markdownlint-disable MD013 -->
 
 | 交付物 ID | 交付物 | 内容范围 | 验收标准 | 责任角色 |
 | --- | --- | --- | --- | --- |
@@ -2578,8 +2639,6 @@ flowchart LR
 | D-06 | 数据模型包 | ERD、DDL 约束、迁移计划 | 可直接拆分 repository 层实现任务 | 后端负责人 |
 | D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景 | QA 负责人 |
 | D-08 | 发布运行包 | `14.3` 发布与回滚 Runbook | 完成一次演练并可在值班手册落地 | SRE 负责人 |
-
-<!-- markdownlint-enable MD013 -->
 
 交付完成判定：
 
@@ -2604,10 +2663,11 @@ flowchart LR
 4. 基线偏离处理：若设计拟偏离需求基线（如 API 路径命名、
    HTTP Method、核心数据约束），必须先 ADR 说明并同步修订
    `requirements.md`，禁止仅修改 `design.md` 形成双口径。
-5. 设计追踪更新：更新本文件 `14.4` 覆盖表，调整受影响需求 ID 的章节映射与状态。
-6. 设计正文更新：更新受影响章节（如 4/5/6/7/8/9/10/11/12/13/14）。
-7. 任务同步：更新 `docs/task/task_design.md` 的任务状态、DoD 与依赖关系。
-8. 评审与发布：完成评审后再进入实现任务拆分，禁止“需求已改、设计未改”直接开发。
+5. 幂等与并发口径复核：凡涉及 `R-OPS-002`、`R-OPS-006` 的变更，必须在实体定义、索引、任务编排、接口契约四处做单口径核对。
+6. 设计追踪更新：更新本文件 `14.4` 覆盖表，调整受影响需求 ID 的章节映射与状态。
+7. 设计正文更新：更新受影响章节（如 4/5/6/7/8/9/10/11/12/13/14）。
+8. 任务同步：更新 `docs/task/task_design.md` 的任务状态、DoD 与依赖关系。
+9. 评审与发布：完成评审后再进入实现任务拆分，禁止“需求已改、设计未改”直接开发。
 
 #### 15.2.3 版本规则
 
@@ -2637,7 +2697,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T6）
+#### 15.3.1 设计自检记录（T9）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -2645,22 +2705,24 @@ flowchart LR
 | 章节完整性 | 通过 | 14、15 章已补齐验收矩阵、测试分层、发布回滚、交付清单、开放问题 |
 | 可编码性 | 通过 | 已给出接口契约、任务语义、状态机、异常码、回滚 Runbook |
 | 冲突检查 | 通过 | 未发现与第 4~13 章的语义冲突 |
+| T9 语义补齐 | 通过 | 已补齐 5 个缺口并在 14.4.6 回标，未触发需求基线偏离 |
 | 遗漏检查 | 有残余风险 | 以下开放问题不阻断编码，但会影响上线效率或运维成本 |
 
 #### 15.3.2 开放问题（需闭环）
 
-<!-- markdownlint-disable MD013 -->
-
 | 问题 ID | 问题描述 | 影响范围 | Owner | 目标关闭日期 | 关闭条件 |
 | --- | --- | --- | --- | --- | --- |
-| OQ-01 | 低代码平台多实例开关（`allow_multi_instance`）的默认值尚未产品定稿 | R-LCP-008、配额与运维策略 | 产品负责人 | 2026-03-05 | 在 `requirements.md` 明确默认值与变更策略，并补充对应用例 |
 | OQ-02 | 网关灰度发布参数模板（权重步长、失败回切阈值）尚未统一 | R-GTW-006、发布稳定性 | 网关负责人 | 2026-03-08 | 输出统一参数模板并完成一次灰度演练 |
-| OQ-03 | 高代码发布 Chart 下载链路的鉴权缓存策略未定（直连下载 vs 临时签名 URL） | R-PKG-004、审计与安全 | 后端负责人 | 2026-03-10 | 形成方案 ADR，完成安全评审并更新 OpenAPI |
+| OQ-03 | 高代码发布包下载链路的鉴权缓存策略未定（直连或临时签名 URL） | R-PKG-004、审计与安全 | 后端负责人 | 2026-03-10 | 形成方案 ADR，完成安全评审并更新 OpenAPI |
 | OQ-04 | 大规模回收场景下（解绑回收 + 批量删除）任务优先级策略未细化 | R-ENV-009、R-OPS-007、NFR-003 | SRE 负责人 | 2026-03-12 | 明确优先级队列策略并补充压测结果 |
-
-<!-- markdownlint-enable MD013 -->
 
 跟踪机制：
 
 - 每周例会检查 OQ 状态；到期未关闭必须给出延期原因与新日期。
 - OQ 关闭后需同步更新 `decision.md`（若形成决策）与 `design.md` 对应章节。
+
+#### 15.3.3 已关闭问题（T9）
+
+| 问题 ID | 关闭日期 | 关闭结论 | 回写章节 |
+| --- | --- | --- | --- |
+| OQ-01 | 2026-02-23 | `allow_multi_instance` 默认值定稿为 `false`，仅超管可配置，变更仅影响新建实例 | 4.4、14.4.6、`docs/decision.md`（ADR-086） |
