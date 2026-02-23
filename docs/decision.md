@@ -570,3 +570,13 @@
 - 决策：`design.md` 的开放问题清单必须为每条问题定义 `Owner`、`目标关闭日期` 与 `关闭条件`，并在周会进行状态复核。
 - 原因：待决策项若只做文本记录，容易长期悬置并在实现阶段形成隐性风险。
 - 影响：延期需显式说明原因和新日期；问题关闭后需同步回写 `decision.md` 与 `design.md` 相关章节。
+
+### ADR-084: T7 契约一致性收口采用“必选端点补齐 + canonical path 单口径 + 覆盖回标”三联动作
+
+- 决策：T7 阶段统一采用 `/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/...`
+  作为文档内唯一 canonical path；同时补齐以下必选端点并在 OpenAPI 组织中落盘：
+  `/templates`、`/artifacts`、`/devboxes/{devbox_id}/publishes`、
+  `/publishes/{publish_id}`、`/tasks/{task_id}/result`、
+  `/applications/{application_id}/charts`、`/charts/{chart_id}/package`。
+- 原因：T6 收口后仍存在“需求端点已声明但接口章节未完整定义”与“时序/隔离章节示例路径仍沿用旧写法”的一致性缺口，导致 `14.4` 可能出现“状态已覆盖但证据不足”的风险。
+- 影响：`design.md` 的 `3.5`、`7.3`、`7.5`、`8.6`、`11.3`、`14.1`、`14.4` 已同步修订；T7 相关条目完成从“待补充”到“已覆盖”的回标，并保留可审计证据路径。

@@ -10,6 +10,7 @@
 | `v0.2.0` | `2026-02-11` | 补齐架构、模型、状态机与接口主链路。 | `T2~T4`、`ADR-016~ADR-031` |
 | `v0.3.0` | `2026-02-19` | 补齐安全、观测、NFR 与回滚方案。 | `T5~T6`、`ADR-032~ADR-038` |
 | `v1.0.0` | `2026-02-23` | 完成第 1 章文档元信息收口（版本、术语、参考），形成可评审基线版本。 | 文档收口 |
+| `v1.1.0` | `2026-02-23` | 完成 T7：补齐端点、统一路径并更新覆盖回标。 | `T7`、`ADR-084` |
 
 文档状态：
 
@@ -370,7 +371,7 @@ sequenceDiagram
   participant W as Release Worker
   participant OCI as OCI Registry
 
-  User->>API: POST /applications/{id}/releases
+  User->>API: POST /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/releases
   API->>DB: 校验应用归属/网关可用性/镜像依赖
   API->>DB: 创建发布任务 + ReleaseChart(Packaging)
   API-->>User: 202 + task_id
@@ -394,7 +395,7 @@ sequenceDiagram
   participant W as Delete Worker
   participant K8S as Managed Cluster
 
-  User->>API: DELETE /applications/{id}?cascade=true
+  User->>API: DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}?cascade=true
   API->>DB: 查询共享组件引用关系
   alt 存在被其他应用引用
     API-->>User: 409 Conflict(阻断组件删除)
@@ -1194,6 +1195,10 @@ flowchart LR
 | 网关 | `Gateway` | `/workspaces/{workspace_id}/clusters/{cluster_id}/gateways` |
 | 高代码应用 | `HighCodeApplication` | `/workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications` |
 | Agent 实例 | `AgentInstance` | `/workspaces/{workspace_id}/clusters/{cluster_id}/agent-instances` |
+| 资源模板 | `Template` | `/workspaces/{workspace_id}/clusters/{cluster_id}/templates` |
+| 高代码制品 | `HighCodeArtifact` | `/workspaces/{workspace_id}/clusters/{cluster_id}/artifacts` |
+| DevBox 发布记录 | `DevBoxPublishRecord` | `/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes` |
+| 发布 Chart 包 | `ReleaseChart` | `/workspaces/{workspace_id}/clusters/{cluster_id}/charts` |
 | 异步任务 | `AsyncTask` | `/workspaces/{workspace_id}/clusters/{cluster_id}/tasks` |
 <!-- markdownlint-enable MD013 -->
 
@@ -1205,15 +1210,31 @@ flowchart LR
 - Update：`PATCH /.../{resources}/{resource_id}`
 - Delete：`DELETE /.../{resources}/{resource_id}?resource_version=<n>&cascade=<bool>`
 
-高代码发布与制品接口：
+以下端点为文档 canonical path（T7 统一口径）：
+
+模板与制品查询接口：
+
+- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/templates?kind={dataservice|lowcode|devbox|gateway}`
+- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/templates/{template_id}`
+- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/artifacts`
+- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/artifacts/{artifact_id}`
+
+DevBox 发布记录接口：
+
+- `POST /workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes`
+- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes`
+- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/publishes/{publish_id}`
+
+高代码发布与发布包接口：
 
 - 发布：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/releases`
-- 发布记录：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/releases`
-- 下载 Chart：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/releases/{release_version}/download`
+- 发布包列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/charts`
+- 下载发布包：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package`
 
 任务接口：
 
 - 查询任务：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}`
+- 查询任务结果：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result`
 - 任务列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks?resource_kind=&resource_id=&status=`
 - 取消任务：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}:cancel`
 
@@ -1274,6 +1295,20 @@ ReleaseCreateRequest:
 - 分文件：按 tag 拆分 `paths/*.yaml`，共用模型放 `components/schemas/*.yaml`
 - 复用对象：`components/parameters`（分页、路径参数、`resource_version`）
 - 安全定义：`components/securitySchemes/BearerAuth`
+
+T7 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
+
+<!-- markdownlint-disable MD013 -->
+| 要求端点（需求口径） | Canonical path（设计口径） | OpenAPI 文件建议 |
+| --- | --- | --- |
+| `/templates` | `/workspaces/{workspace_id}/clusters/{cluster_id}/templates` | `paths/templates.yaml` |
+| `/artifacts` | `/workspaces/{workspace_id}/clusters/{cluster_id}/artifacts` | `paths/artifacts.yaml` |
+| `/devboxes/{devbox_id}/publishes` | `/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes` | `paths/devbox_publishes.yaml` |
+| `/publishes/{publish_id}` | `/workspaces/{workspace_id}/clusters/{cluster_id}/publishes/{publish_id}` | `paths/devbox_publishes.yaml` |
+| `/tasks/{task_id}/result` | `/workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result` | `paths/tasks.yaml` |
+| `/applications/{application_id}/charts` | `/workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/charts` | `paths/highcode_charts.yaml` |
+| `/charts/{chart_id}/package` | `/workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package` | `paths/highcode_charts.yaml` |
+<!-- markdownlint-enable MD013 -->
 
 OpenAPI 统一约束：
 
@@ -1494,6 +1529,12 @@ sequenceDiagram
 - `failure_reason`
 - `retry_count`
 - `serialized_key`
+
+任务结果查询契约（T7 补齐）：
+
+- 端点：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result`
+- 语义：返回任务结果快照（若任务仍在 `Pending/Running`，`result` 可为空对象）。
+- 最小返回字段：`resource_kind/resource_id/started_at/ended_at/failure_reason/retry_count/serialized_key`。
 
 ## 9. 资源编排与 K8s 交互设计
 
@@ -1867,9 +1908,11 @@ Secret 专项最小字段（`S-SEC-007`）：
 
 接口层过滤规则：
 
-- `GET /dataservices` 默认 `visibility=shared`。
-- 仅 `GET /applications/{id}/relations`、
-  `GET /lowcodes/{id}` 的详情读模型返回嵌入式关系。
+- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/data-services` 默认 `visibility=shared`。
+- 仅
+  `GET /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/relations`、
+  `GET /workspaces/{workspace_id}/clusters/{cluster_id}/lowcode-platforms/{lowcode_id}`
+  的详情读模型返回嵌入式关系。
 
 ### 11.4 级联删除与引用冲突处理
 
@@ -2224,6 +2267,19 @@ flowchart LR
   P --> A["验收记录归档(审计+报告)"]
 ```
 
+#### 14.1.1 T7 接口路径复核样例（canonical path）
+
+<!-- markdownlint-disable MD013 -->
+| 场景 | Canonical path（统一示例） |
+| --- | --- |
+| 模板查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/templates?kind=dataservice` |
+| DevBox 发布记录创建 | `POST /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes` |
+| 发布记录详情 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/publishes/{publish_id}` |
+| 高代码应用发布包列表 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/charts` |
+| 发布包下载 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package` |
+| 任务结果查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result` |
+<!-- markdownlint-enable MD013 -->
+
 ### 14.2 测试分层与关键场景
 
 #### 14.2.1 测试分层
@@ -2467,6 +2523,17 @@ flowchart LR
 | NFR-018 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 8.6、12.5、13.5 固化失败诊断字段与运维路径。 |
 | NFR-019 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 12.2、12.4、13.5 固化状态延迟指标、阈值与告警。 |
 
+<!-- markdownlint-enable MD013 -->
+
+#### 14.4.4 T7 覆盖回标记录（2026-02-23）
+
+<!-- markdownlint-disable MD013 -->
+| 回标项 | 关联需求 | T7 前状态 | T7 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| 模板/制品/发布记录端点缺失补齐（`/templates`、`/artifacts`、`/devboxes/{devbox_id}/publishes`、`/publishes/{publish_id}`） | R-DBX-007、R-DBX-009、R-ABS-001 | 待补充 | 已覆盖 | 7.3、7.5、14.1.1 |
+| 发布包与下载端点补齐（`/applications/{application_id}/charts`、`/charts/{chart_id}/package`） | R-PKG-001~006 | 待补充 | 已覆盖 | 7.3、7.5、14.1.1 |
+| 任务结果端点补齐（`/tasks/{task_id}/result`） | R-OPS-008 | 待补充 | 已覆盖 | 7.3、8.6、14.1.1 |
+| 文档路径示例统一为 canonical path（去除旧路径示例） | R-ENV-005、R-OPS-004 | 待补充 | 已覆盖 | 3.5、11.3、14.1.1 |
 <!-- markdownlint-enable MD013 -->
 
 ## 15. 交付物与需求管理
