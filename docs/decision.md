@@ -580,3 +580,24 @@
   `/applications/{application_id}/charts`、`/charts/{chart_id}/package`。
 - 原因：T6 收口后仍存在“需求端点已声明但接口章节未完整定义”与“时序/隔离章节示例路径仍沿用旧写法”的一致性缺口，导致 `14.4` 可能出现“状态已覆盖但证据不足”的风险。
 - 影响：`design.md` 的 `3.5`、`7.3`、`7.5`、`8.6`、`11.3`、`14.1`、`14.4` 已同步修订；T7 相关条目完成从“待补充”到“已覆盖”的回标，并保留可审计证据路径。
+
+### ADR-085: T8 契约冲突修订定稿为“需求基线优先 + 单口径实现”
+
+- 决策：T8 统一按 `requirements.md` 口径修订 `design.md`，不采用“设计偏离需求”的路线，具体包括：
+  - API Path 命名统一为无连字符复数：`dataservices`、`lowcodes`、`applications`、`agents`。
+  - 资源 Update 方法统一为 `PUT`（移除 `PATCH` 作为标准更新方法）。
+  - Service 自动命名统一采用优先级：
+    `P1 svc-{application_name}-{component_alias}`
+    （应用直关联 shared 组件） >
+    `P2` 用户显式 `service_name`（shared 独立创建） >
+    `P3 svc-{kind}-{resource_name}`（其余自动命名场景）。
+  - 幂等落库统一采用 `idempotency_scope` 作为 24h 去重唯一约束；
+    `idempotency_key` 仅保留原始请求头审计语义；并引入
+    `request_fingerprint` 与 `idempotency_expire_at` 明确冲突判定和
+    TTL 清理。
+- 原因：T7 后仍存在路径命名、更新方法、Service 命名、幂等字段在多章节间的双口径冲突，直接影响接口实现一致性与数据库约束可落地性。
+- 影响：
+  - `design.md` 已同步修订 `4.3`、`5.2.3`、`5.4`、`7.1~7.3`、`7.5`、`8.1~8.4`、`9.4`、`11.3`、`14.1`、`14.4`、`15.2`。
+  - `14.4` 新增 T8 回标记录，受影响项从 `待补充` 回标为 `已覆盖`。
+  - 后续若需偏离 `requirements.md` 契约，必须先执行 ADR + 需求基线同步，再更新设计正文。
+- 替代关系：在 T8 范围内对 ADR-073（路径示例口径）与 ADR-074（幂等判定落地口径）进行实现级细化，以本 ADR 为当前生效口径。

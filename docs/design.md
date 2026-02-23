@@ -11,6 +11,7 @@
 | `v0.3.0` | `2026-02-19` | 补齐安全、观测、NFR 与回滚方案。 | `T5~T6`、`ADR-032~ADR-038` |
 | `v1.0.0` | `2026-02-23` | 完成第 1 章文档元信息收口（版本、术语、参考），形成可评审基线版本。 | 文档收口 |
 | `v1.1.0` | `2026-02-23` | 完成 T7：补齐端点、统一路径并更新覆盖回标。 | `T7`、`ADR-084` |
+| `v1.2.0` | `2026-02-23` | 完成 T8：修复命名/更新方法/幂等口径冲突并回标。 | `T8`、`ADR-085` |
 
 文档状态：
 
@@ -371,7 +372,7 @@ sequenceDiagram
   participant W as Release Worker
   participant OCI as OCI Registry
 
-  User->>API: POST /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/releases
+  User->>API: POST /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/releases
   API->>DB: 校验应用归属/网关可用性/镜像依赖
   API->>DB: 创建发布任务 + ReleaseChart(Packaging)
   API-->>User: 202 + task_id
@@ -395,7 +396,7 @@ sequenceDiagram
   participant W as Delete Worker
   participant K8S as Managed Cluster
 
-  User->>API: DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}?cascade=true
+  User->>API: DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}?cascade=true
   API->>DB: 查询共享组件引用关系
   alt 存在被其他应用引用
     API-->>User: 409 Conflict(阻断组件删除)
@@ -513,8 +514,10 @@ sequenceDiagram
 
 Service 命名策略（`R-DSP-007`）：
 
-- 应用创建时直接关联：平台生成 `svc-{application_name}-{component_alias}`。
-- 独立创建组件：允许用户显式指定 `service_name`，约束 namespace 唯一。
+- 冲突优先级 `P1 > P2 > P3`（与 `9.4` 一致）：
+  - `P1`：应用创建时直接关联 shared 组件，强制自动生成 `svc-{application_name}-{component_alias}`。
+  - `P2`：shared 组件独立创建且显式传入 `service_name`，使用用户名称（同 namespace 唯一）。
+  - `P3`：其余自动命名场景统一使用 `svc-{kind}-{resource_name}`。
 
 隔离规则（`R-DSP-008~012`）：
 
@@ -805,7 +808,7 @@ erDiagram
 | `highcode_release_charts` | `application_id`、`release_version`、`chart_ref`、`digest`、`source_type`、`source_version`、`status` | `release_version` 在单应用内唯一 |
 | `highcode_application_agent_refs` | `application_id`、`agent_instance_id`、`created_at/by` | `(application_id,agent_instance_id)` 唯一，且 `agent_instance_id` 唯一 |
 | `highcode_application_dataservice_refs` | `application_id`、`data_service_instance_id`、`created_at/by` | 仅允许引用 `visibility='shared'` 组件 |
-| `async_tasks` | `idempotency_key`、`task_type`、`serialized_key`、`status`、`retry_count`、`result jsonb` | `idempotency_key` 全局唯一（24h 去重） |
+| `async_tasks` | `idempotency_key`、`idempotency_scope`、`request_fingerprint`、`idempotency_expire_at`、`task_type`、`serialized_key`、`status`、`retry_count`、`result jsonb` | `idempotency_scope` 在 24h 窗口内唯一；同 scope 的 `request_fingerprint` 必须一致 |
 | `secret_versions` | `secret_name`、`version`、`namespace`、`encrypted_data_ref`、`is_current` | 每个 `secret_name` 仅一个当前版本 |
 
 ### 5.3 关系模型（Application-Agent-DataService）
@@ -850,7 +853,7 @@ erDiagram
 | `highcode_application_agent_refs` | `uq_ref_app_agent(application_id,agent_instance_id)` + `uq_ref_agent_single_owner(agent_instance_id)` |
 | `highcode_application_dataservice_refs` | `uq_ref_app_ds(application_id,data_service_instance_id)` |
 | `highcode_release_charts` | `uq_chart_app_release(application_id,release_version)` |
-| `async_tasks` | `uq_task_idempotency(idempotency_key)` |
+| `async_tasks` | `uq_task_idempotency_scope(idempotency_scope)` |
 | `secret_versions` | `uq_secret_workspace_ns_name_ver(workspace_id,namespace,secret_name,version)` |
 
 <!-- markdownlint-enable MD013 -->
@@ -859,6 +862,7 @@ erDiagram
 
 - 列表查询索引：`idx_<table>_workspace_cluster_status_deleted(workspace_id,cluster_id,status,deleted_at)`。
 - 任务查询索引：`idx_async_tasks_serialized_status(serialized_key,status,created_at desc)`。
+- 幂等清理索引：`idx_async_tasks_idem_expire(idempotency_expire_at)`。
 - 关系查询索引：`idx_ref_agent_app(agent_instance_id,application_id)`、`idx_ref_ds_app(data_service_instance_id,application_id)`。
 - 审计追踪索引：`idx_<table>_last_task(last_task_id)`、`idx_<table>_delete_task(delete_task_id)`。
 
@@ -1089,7 +1093,7 @@ flowchart LR
   - 服务端以路径参数为准注入租户上下文，禁止请求体覆盖 `workspace_id/cluster_id/namespace`。
 - 同步与异步语义：
   - Query（GET）：同步返回领域读模型。
-  - CUD（POST/PATCH/DELETE）：统一返回 `202 Accepted + task_id`，由任务系统异步执行。
+  - CUD（POST/PUT/DELETE）：统一返回 `202 Accepted + task_id`，由任务系统异步执行。
 - 幂等控制：
   - 所有 CUD 必须携带 `Idempotency-Key`（长度 8~128）。
   - 24h 内同作用域重复提交返回首次 `task_id`（见 8.4）。
@@ -1189,12 +1193,12 @@ flowchart LR
 <!-- markdownlint-disable MD013 -->
 | 分组 | Tag | 路径前缀 |
 | --- | --- | --- |
-| 数据服务组件 | `DataService` | `/workspaces/{workspace_id}/clusters/{cluster_id}/data-services` |
-| 低代码平台 | `LowCodePlatform` | `/workspaces/{workspace_id}/clusters/{cluster_id}/lowcode-platforms` |
+| 数据服务组件 | `DataService` | `/workspaces/{workspace_id}/clusters/{cluster_id}/dataservices` |
+| 低代码平台 | `LowCodePlatform` | `/workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes` |
 | DevBox | `DevBox` | `/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes` |
 | 网关 | `Gateway` | `/workspaces/{workspace_id}/clusters/{cluster_id}/gateways` |
-| 高代码应用 | `HighCodeApplication` | `/workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications` |
-| Agent 实例 | `AgentInstance` | `/workspaces/{workspace_id}/clusters/{cluster_id}/agent-instances` |
+| 高代码应用 | `HighCodeApplication` | `/workspaces/{workspace_id}/clusters/{cluster_id}/applications` |
+| Agent 实例 | `AgentInstance` | `/workspaces/{workspace_id}/clusters/{cluster_id}/agents` |
 | 资源模板 | `Template` | `/workspaces/{workspace_id}/clusters/{cluster_id}/templates` |
 | 高代码制品 | `HighCodeArtifact` | `/workspaces/{workspace_id}/clusters/{cluster_id}/artifacts` |
 | DevBox 发布记录 | `DevBoxPublishRecord` | `/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes` |
@@ -1207,7 +1211,7 @@ flowchart LR
 - Create：`POST /.../{resources}`
 - List：`GET /.../{resources}`
 - Get：`GET /.../{resources}/{resource_id}`
-- Update：`PATCH /.../{resources}/{resource_id}`
+- Update：`PUT /.../{resources}/{resource_id}`
 - Delete：`DELETE /.../{resources}/{resource_id}?resource_version=<n>&cascade=<bool>`
 
 以下端点为文档 canonical path（T7 统一口径）：
@@ -1227,8 +1231,8 @@ DevBox 发布记录接口：
 
 高代码发布与发布包接口：
 
-- 发布：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/releases`
-- 发布包列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/charts`
+- 发布：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/releases`
+- 发布包列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts`
 - 下载发布包：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package`
 
 任务接口：
@@ -1306,7 +1310,7 @@ T7 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 | `/devboxes/{devbox_id}/publishes` | `/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes` | `paths/devbox_publishes.yaml` |
 | `/publishes/{publish_id}` | `/workspaces/{workspace_id}/clusters/{cluster_id}/publishes/{publish_id}` | `paths/devbox_publishes.yaml` |
 | `/tasks/{task_id}/result` | `/workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result` | `paths/tasks.yaml` |
-| `/applications/{application_id}/charts` | `/workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/charts` | `paths/highcode_charts.yaml` |
+| `/applications/{application_id}/charts` | `/workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts` | `paths/highcode_charts.yaml` |
 | `/charts/{chart_id}/package` | `/workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package` | `paths/highcode_charts.yaml` |
 <!-- markdownlint-enable MD013 -->
 
@@ -1371,7 +1375,10 @@ OpenAPI 统一约束：
 | `resource_id` | `uuid/null` | 目标资源 ID（创建前可空） |
 | `workspace_id/cluster_id` | `uuid` | 租户与部署边界 |
 | `serialized_key` | `text` | 串行化执行键 |
-| `idempotency_scope` | `text` | 幂等作用域哈希（见 8.4） |
+| `idempotency_key` | `text` | 原始请求头值（审计追溯） |
+| `idempotency_scope` | `text` | 幂等作用域哈希（24h 去重唯一键） |
+| `request_fingerprint` | `text` | 规范化 `body+query` 哈希 |
+| `idempotency_expire_at` | `timestamptz` | 幂等过期时间（首次接收 + 24h） |
 | `status` | `text` | `Pending/Running/Succeeded/Failed/Canceled` |
 | `retry_count/max_retry` | `int` | 重试计数与上限 |
 | `timeout_seconds` | `int` | 任务超时阈值 |
@@ -1390,11 +1397,12 @@ OpenAPI 统一约束：
 生产者位于 API Service（Handler -> Service -> TaskProducer）：
 
 1. 校验认证、工作空间边界、参数 schema、`resource_version`。
-2. 计算幂等作用域并查重（24h）。
-3. 命中幂等记录：直接返回历史 `task_id`。
-4. 未命中：在单事务内写入 `async_tasks`、审计草稿、Outbox 事件。
-5. 提交事务后投递队列（至少一次）。
-6. 返回 `202 + task_id`。
+2. 计算 `idempotency_scope + request_fingerprint` 并查重（24h）。
+3. 命中幂等记录且指纹一致：直接返回历史 `task_id`。
+4. 命中幂等记录但指纹不一致：返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
+5. 未命中：在单事务内写入 `async_tasks`、审计草稿、Outbox 事件。
+6. 提交事务后投递队列（至少一次）。
+7. 返回 `202 + task_id`。
 
 ```mermaid
 sequenceDiagram
@@ -1405,9 +1413,11 @@ sequenceDiagram
 
   H->>S: CUD 请求 + Idempotency-Key
   S->>DB: 参数/权限/resource_version 校验
-  S->>DB: 幂等作用域查重
-  alt 命中
+  S->>DB: 幂等作用域 + 请求指纹查重
+  alt 命中且指纹一致
     S-->>H: 返回历史 task_id
+  else 命中但指纹不一致
+    S-->>H: 409 IDEMPOTENCY_PAYLOAD_MISMATCH
   else 未命中
     S->>DB: 事务写 async_tasks + outbox + audit_draft
     S->>Q: publish(task_id)
@@ -1444,22 +1454,25 @@ flowchart TD
 
 ### 8.4 幂等与去重策略
 
-幂等作用域（避免全局键冲突）：
+幂等字段与作用域（落库统一口径）：
 
-- `idempotency_scope = hash(`
-  `actor_id + workspace_id + cluster_id + method + route_template + idempotency_key)`
-- 去重窗口：24 小时（从首次接收时间起算）。
+- `idempotency_key`：原始请求头，保留用于审计检索。
+- `idempotency_scope = sha256(`
+  `actor_id + workspace_id + cluster_id + method + route_template + idempotency_key)`。
+- `request_fingerprint = sha256(canonical_json_body + canonical_query)`。
+- `idempotency_expire_at = first_seen_at + 24h`（去重窗口从首次接收时间起算）。
 
 判定规则：
 
-- 作用域存在且请求指纹（规范化 body + query）一致：返回原 `task_id`。
-- 作用域存在但请求指纹不一致：返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
-- 作用域不存在：创建新任务并写入作用域记录。
+- 作用域存在且当前时间未超过 `idempotency_expire_at`，且请求指纹一致：返回原 `task_id`。
+- 作用域存在且当前时间未超过 `idempotency_expire_at`，但请求指纹不一致：返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
+- 作用域不存在或已过期：创建新任务并写入幂等字段。
 
 实现要点：
 
 - 幂等记录与任务写入同事务提交，避免“查重命中但任务不存在”。
-- 过期记录按 TTL 定时清理，不影响历史审计表。
+- DDL 使用唯一约束 `uq_task_idempotency_scope(idempotency_scope)`。
+- TTL 清理任务每 10 分钟执行：删除 `idempotency_expire_at < now()` 的过期幂等记录，不影响审计事件表。
 
 ### 8.5 重试、超时与取消策略
 
@@ -1614,8 +1627,9 @@ flowchart TD
 
 - Release 名：`{kind}-{resource_name}-{short_id}`
 - Service 名：
-  - 平台自动：`svc-{kind}-{resource_name}`
-  - 用户自定义（仅 shared 组件独立创建时）：校验 DNS-1123 + 唯一性
+  - `P1`：应用创建时直接关联 shared 数据服务组件，强制 `svc-{application_name}-{component_alias}`。
+  - `P2`：shared 组件独立创建且显式传入 `service_name`，使用用户名称（校验 DNS-1123 + 唯一性）。
+  - `P3`：其余平台自动命名统一 `svc-{kind}-{resource_name}`。
 - Secret 名：`{secret_name}.v{version}`
 - ConfigMap 名：`cfg-{kind}-{resource_name}-v{resource_version}`
 
@@ -1908,10 +1922,10 @@ Secret 专项最小字段（`S-SEC-007`）：
 
 接口层过滤规则：
 
-- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/data-services` 默认 `visibility=shared`。
+- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/dataservices` 默认 `visibility=shared`。
 - 仅
-  `GET /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/relations`、
-  `GET /workspaces/{workspace_id}/clusters/{cluster_id}/lowcode-platforms/{lowcode_id}`
+  `GET /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/relations`、
+  `GET /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`
   的详情读模型返回嵌入式关系。
 
 ### 11.4 级联删除与引用冲突处理
@@ -2275,7 +2289,7 @@ flowchart LR
 | 模板查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/templates?kind=dataservice` |
 | DevBox 发布记录创建 | `POST /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes` |
 | 发布记录详情 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/publishes/{publish_id}` |
-| 高代码应用发布包列表 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/charts` |
+| 高代码应用发布包列表 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts` |
 | 发布包下载 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package` |
 | 任务结果查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result` |
 <!-- markdownlint-enable MD013 -->
@@ -2536,6 +2550,18 @@ flowchart LR
 | 文档路径示例统一为 canonical path（去除旧路径示例） | R-ENV-005、R-OPS-004 | 待补充 | 已覆盖 | 3.5、11.3、14.1.1 |
 <!-- markdownlint-enable MD013 -->
 
+#### 14.4.5 T8 冲突修订回标记录（2026-02-23）
+
+<!-- markdownlint-disable MD013 -->
+| 回标项 | 关联需求 | T8 前状态 | T8 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| API Path 命名冲突修正（`data-services/lowcode-platforms/highcode-applications/agent-instances` -> `dataservices/lowcodes/applications/agents`） | 接口契约要求（路径命名） | 待补充 | 已覆盖 | 7.3、7.5、11.3、14.1.1 |
+| Update 方法统一（`PATCH` -> `PUT`） | 接口契约要求（资源更新语义） | 待补充 | 已覆盖 | 7.1、7.3 |
+| Service 自动命名统一（`svc-{application_name}-{component_alias}` 与 `svc-{kind}-{resource_name}` 按优先级并存） | R-DSP-007 | 待补充 | 已覆盖 | 4.3、9.4 |
+| 幂等落库口径统一（`idempotency_key` 与 `idempotency_scope`、唯一索引、24h TTL） | R-OPS-002 | 待补充 | 已覆盖 | 5.2.3、5.4、8.1、8.4 |
+| 冲突修订留痕与需求变更流程补充 | 变更流程治理要求 | 待补充 | 已覆盖 | 15.2、`docs/decision.md`（ADR-085） |
+<!-- markdownlint-enable MD013 -->
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
@@ -2575,10 +2601,13 @@ flowchart LR
 1. 变更提案：在需求评审中提交变更项，至少包含 `change_id`、影响需求 ID、变更原因、风险、期望生效版本。
 2. 决策固化：在 `docs/decision.md` 新增 ADR，记录决策、原因、影响、替代关系。
 3. 需求更新：更新 `docs/requirements.md` 对应条目，确保需求文本可验收、可测试。
-4. 设计追踪更新：更新本文件 `14.4` 覆盖表，调整受影响需求 ID 的章节映射与状态。
-5. 设计正文更新：更新受影响章节（如 4/5/6/7/8/9/10/11/12/13/14）。
-6. 任务同步：更新 `docs/task/task_design.md` 的任务状态、DoD 与依赖关系。
-7. 评审与发布：完成评审后再进入实现任务拆分，禁止“需求已改、设计未改”直接开发。
+4. 基线偏离处理：若设计拟偏离需求基线（如 API 路径命名、
+   HTTP Method、核心数据约束），必须先 ADR 说明并同步修订
+   `requirements.md`，禁止仅修改 `design.md` 形成双口径。
+5. 设计追踪更新：更新本文件 `14.4` 覆盖表，调整受影响需求 ID 的章节映射与状态。
+6. 设计正文更新：更新受影响章节（如 4/5/6/7/8/9/10/11/12/13/14）。
+7. 任务同步：更新 `docs/task/task_design.md` 的任务状态、DoD 与依赖关系。
+8. 评审与发布：完成评审后再进入实现任务拆分，禁止“需求已改、设计未改”直接开发。
 
 #### 15.2.3 版本规则
 
