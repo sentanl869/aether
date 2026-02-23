@@ -1525,7 +1525,7 @@ flowchart TD
 - Service 名：
   - 平台自动：`svc-{kind}-{resource_name}`
   - 用户自定义（仅 shared 组件独立创建时）：校验 DNS-1123 + 唯一性
-- Secret 名：`sec-{kind}-{resource_name}-v{version}`
+- Secret 名：`{secret_name}.v{version}`
 - ConfigMap 名：`cfg-{kind}-{resource_name}-v{resource_version}`
 
 K8s 标签规范（强制）：
@@ -1598,53 +1598,528 @@ flowchart TD
 
 ### 10.1 认证与授权模型
 
+认证链路采用“统一身份 + 工作空间边界注入 + 动作级授权”三段式，默认拒绝（fail closed）：
+
+1. `AuthN`：接入层校验来自统一认证系统的访问令牌，提取
+   `actor_id`、`role`、`workspace_memberships`。
+2. `TenantContext`：从路径解析 `workspace_id`、`cluster_id`，查询
+   `WorkspaceClusterBinding` 获得 `namespace_name` 与绑定状态。
+3. `AuthZ`：按 `role + action + resource_scope` 判定是否允许。
+
+控制面上下文对象（供 handler/service/worker 透传）：
+
+```go
+type RequestContext struct {
+    RequestID    string
+    ActorID      string
+    Role         string // super_admin | user
+    WorkspaceID  string
+    ClusterID    string
+    Namespace    string
+    BindingState string // Active/Frozen/Validating/RecoveryWindow/Reclaiming/...
+}
+```
+
+授权判定规则：
+
+- `super_admin`：允许跨工作空间执行平台管理动作，但仍需显式传入目标
+  `workspace_id/cluster_id` 并记录审计。
+- `user`：必须满足“已关联目标工作空间 + 资源归属一致”；否则拒绝。
+- 资源不存在或不在可见范围时，读取接口返回 `404`；变更接口返回 `403` 并审计。
+
 ### 10.2 权限动作矩阵落地
+
+策略引擎输入：
+
+- `actor_role`
+- `action`（如 `dataservice.create`、`application.release`）
+- `workspace_id`
+- `cluster_id`
+- `resource_kind/resource_id`
+
+动作分层：
+
+- 平台管理动作：`workspace.*`、`cluster.*`、`registry.*`、`template.import`、
+  `gateway.manage`、`lowcode.manage`（默认仅超管）。
+- 租户内业务动作：`dataservice.*`、`devbox.*`、`agent.*`、`application.*`、
+  `task.read`（用户在已关联工作空间可执行）。
+- 受限动作：`secret.read_plaintext` 永久拒绝，保留平台服务账号内部能力。
+
+实现约束：
+
+- 鉴权中间件只做“是否可进入 handler”。
+- 领域服务再次执行资源归属校验，防止越过路径校验直接构造跨边界引用。
+- Worker 执行任务前重放一次授权快照（防止长队列期间权限变化导致越权执行）。
+
+错误映射：
+
+| 场景 | HTTP | 业务码 |
+| --- | --- | --- |
+| 未认证 | `401` | `UNAUTHORIZED` |
+| 无工作空间权限 | `403` | `FORBIDDEN_WORKSPACE` |
+| 操作超管限定动作 | `403` | `FORBIDDEN_ACTION` |
+| 资源不存在或不可见 | `404` | `RESOURCE_NOT_FOUND` |
 
 ### 10.3 Secret 生命周期与版本化
 
+Secret 采用“版本对象 + 当前版本指针”模型：
+
+- K8S 对象命名：`{secret_name}.v{n}`（对应 `S-SEC-003`）。
+- 数据库主表：`SecretVersion`（记录版本元数据、哈希、状态、创建人）。
+- 指针表：`SecretCurrentPointer(secret_name, current_version)`。
+- 命名空间范围：固定为工作空间映射 namespace（`S-SEC-001`）。
+
+生命周期动作：
+
+- 创建：写入 `v1`，更新当前指针到 `1`。
+- 更新：写入新版本 `v(n+1)`，切换当前指针，旧版本保留。
+- 回滚：选择历史版本 `vk` 作为源内容，创建新版本 `v(n+1)`，再切换指针；
+  不直接把当前指针回拨到旧版本，避免“历史被覆盖”。
+- 清理：默认保留最近 `10` 个版本；超出部分标记 `Archived` 并删除对应 K8S
+  Secret 对象（`S-SEC-004`）。
+
+版本状态：
+
+- `Active`：当前指针版本。
+- `Retained`：历史可回滚版本。
+- `Archived`：超过保留窗口，仅保留审计元数据。
+
+Secret 版本时序：
+
+```mermaid
+sequenceDiagram
+  participant U as User/API
+  participant S as SecretService
+  participant K as K8S
+  participant DB as PostgreSQL
+  participant A as Audit
+
+  U->>S: update secret_ref(name, value)
+  S->>DB: lock current pointer
+  S->>K: apply Secret {name}.v{n+1}
+  K-->>S: ok
+  S->>DB: insert SecretVersion(v{n+1}) + switch pointer
+  S->>DB: archive versions > 10
+  S->>A: emit secret.updated
+```
+
+并发控制：
+
+- Secret 更新使用 `resource_version` + 行级锁，避免并发写同名版本号冲突。
+- 幂等更新按 `Idempotency-Key` 去重，重复请求返回同一 `task_id`。
+
 ### 10.4 敏感数据保护与加密策略
 
+敏感信息范围：
+
+- 仓库凭证、组件账号密码、应用连接串、管理员初始化口令等。
+
+保护策略（满足 `S-SEC-006` 与 `NFR-012`）：
+
+- 不引入额外 KMS；运行时机密统一落 K8S Secret 默认机制。
+- 控制面数据库仅持久化 `secret_ref`、版本号、内容哈希与审计元数据；
+  不持久化明文字段。
+- API schema 将敏感字段标记为 `writeOnly`，响应仅返回 `secret_ref`。
+- 日志脱敏：命中字段名 `password/token/secret/key` 自动替换为 `******`。
+- 任务失败详情禁止回显 Secret 原文，只输出定位所需错误上下文。
+
+传输与访问控制：
+
+- 控制面与集群、仓库通信统一 TLS。
+- 仅控制面服务账号具备 Secret 明文读取权限；普通用户只可引用不可读取（`S-SEC-002`）。
+
 ### 10.5 审计日志设计
+
+审计事件为独立存储模型，写入不可阻断主业务路径（异步缓冲 + 失败重试）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `audit_id` | 审计主键 |
+| `request_id` | 请求链路 ID |
+| `task_id` | 关联任务 ID（可空） |
+| `actor` | 操作者 |
+| `action` | 动作（create/update/delete/release/export/rollback/...） |
+| `resource_kind/resource_id` | 资源定位 |
+| `workspace_id/cluster_id` | 租户与部署边界 |
+| `result` | success/failed |
+| `failure_reason` | 失败原因（可空） |
+| `created_at` | 事件时间 |
+
+Secret 专项最小字段（`S-SEC-007`）：
+
+- `secret_name`
+- `version`
+- `action`
+- `actor`
+- `workspace_id`
+- `cluster_id`
+- `timestamp`
+- `request_id`
+- `result`
+
+留存策略（`NFR-013`）：
+
+- 审计日志保留 `>= 180` 天。
+- 任务执行日志保留 `>= 30` 天。
+- 清理任务按天分区删除，保留汇总统计。
 
 ## 11. 多租户与隔离设计
 
 ### 11.1 租户上下文接入（Workspace/Cluster/Namespace 约束）
 
+租户上下文固定由路径 + 绑定表推导，不接受请求体覆盖：
+
+- 路径：`/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/...`
+- namespace：从 `WorkspaceClusterBinding.namespace_name` 自动注入。
+- 工作空间与集群解绑状态参与准入判定。
+
+准入规则：
+
+- `Active`：允许全部读写。
+- `Frozen/Validating/Reclaiming`：仅允许读与恢复相关动作，拒绝新增变更任务。
+- `RecoveryWindow`：允许 `recover`，禁止普通业务变更。
+
+错误码：
+
+- 绑定不存在：`422 BINDING_NOT_FOUND`
+- 绑定冻结：`422 WORKSPACE_CLUSTER_FROZEN`
+
 ### 11.2 跨边界校验策略
+
+跨边界校验在三个阶段执行：
+
+1. 请求阶段：校验路径边界与操作者权限。
+2. 关系阶段：校验被引用资源（Agent、DataService、Gateway）与请求边界一致。
+3. 执行阶段：Worker 根据标签二次校验资源归属，防止脏数据执行。
+
+硬性一致性约束：
+
+- `workspace_id` 必须一致。
+- `cluster_id` 必须一致。
+- `namespace` 必须等于工作空间映射 namespace。
+
+拒绝策略（满足 `NFR-014`）：
+
+- 跨工作空间/跨集群/跨 namespace 引用一律拒绝并记录审计。
+- 返回 `422 CROSS_SCOPE_REFERENCE`，审计事件 `result=failed`。
 
 ### 11.3 共享与嵌入式资源隔离策略
 
+隔离模型基于 `visibility` + `owner_kind/owner_id`：
+
+| 维度 | shared | embedded |
+| --- | --- | --- |
+| 创建入口 | 独立资源接口 | 仅随宿主资源创建 |
+| 列表可见性 | 出现在共享列表/选择器 | 不出现在共享列表/选择器 |
+| 运维入口 | 可独立更新/删除 | 仅通过宿主运维 |
+| 复用能力 | 可被多个应用引用 | 仅宿主可用 |
+| 回收策略 | 非级联默认保留 | 宿主删除时自动回收 |
+
+接口层过滤规则：
+
+- `GET /dataservices` 默认 `visibility=shared`。
+- 仅 `GET /applications/{id}/relations`、
+  `GET /lowcodes/{id}` 的详情读模型返回嵌入式关系。
+
 ### 11.4 级联删除与引用冲突处理
 
+高代码应用删除决策表：
+
+| 参数 | shared 组件存在外部引用 | 结果 |
+| --- | --- | --- |
+| `cascade=false` | 任意 | 删除应用与独占派生资源，保留 shared 组件 |
+| `cascade=true` | 否 | 删除应用 + Agent + 独占派生资源 + 可删 shared 组件 |
+| `cascade=true` | 是 | 返回 `409 SHARED_RESOURCE_IN_USE` 并阻断 shared 删除 |
+
+执行流程：
+
+```mermaid
+flowchart TD
+  A[Delete Application Request] --> B{cascade?}
+  B -- No --> C[Delete App + Agent + Exclusive Derived Resources]
+  B -- Yes --> D[Check shared refs count]
+  D --> E{Any refs > 1?}
+  E -- Yes --> F[409 Conflict + Audit]
+  E -- No --> G[Delete App + Shared + Embedded + Derived]
+  C --> H[Submit Compensation if embedded cleanup failed]
+  G --> H
+```
+
+低代码平台删除策略：
+
+- 仅回收其 `embedded` 组件，不影响共享组件池。
+- 回收失败进入补偿任务（`task_type=compensation`）。
+
 ### 11.5 工作空间-集群解绑保护机制（冻结、恢复窗口、回收）
+
+解绑状态机（对应 `R-ENV-009/010` 与 ADR-072）：
+
+```mermaid
+stateDiagram-v2
+  [*] --> Active
+  Active --> Frozen: unbind request (super_admin + confirm)
+  Frozen --> Validating: start validation task
+  Validating --> RecoveryWindow: validation pass
+  Validating --> Active: validation fail + rollback
+  RecoveryWindow --> Active: recover within 24h
+  RecoveryWindow --> Reclaiming: window timeout
+  Reclaiming --> Unbound: reclaim success
+  Reclaiming --> ReclaimFailed: reclaim failed
+  ReclaimFailed --> Reclaiming: retry reclaim
+```
+
+关键控制点：
+
+- 进入 `Frozen` 后拒绝所有新建/更新/发布/删除任务。
+- `RecoveryWindow` 固定 `24h`，可显式恢复到 `Active`。
+- 回收阶段按“namespace -> Helm release -> 残留对象”顺序清理并审计。
+- 全流程仅超级管理员可触发，且需要二次确认。
 
 ## 12. 可观测性与运维设计
 
 ### 12.1 日志设计
 
+日志采用结构化 JSON，统一字段规范：
+
+- `timestamp`
+- `level`
+- `service`
+- `request_id`
+- `task_id`
+- `workspace_id`
+- `cluster_id`
+- `resource_kind/resource_id`
+- `action`
+- `message`
+- `error_code`（失败时）
+
+日志分层：
+
+| 日志类型 | 产生日志组件 | 用途 | 保留期 |
+| --- | --- | --- | --- |
+| 访问日志 | API Server | 请求审计、延迟统计 | 30 天 |
+| 任务日志 | Worker/Adapter | 执行步骤与故障定位 | 30 天 |
+| 审计日志 | Audit Service | 合规追溯 | 180 天 |
+
+质量约束：
+
+- 任何日志不得输出 Secret 明文。
+- 大字段（manifest、values）仅输出摘要与 hash，原文写对象存储并受控访问。
+
 ### 12.2 指标设计
+
+指标体系按 `黄金信号 + 业务指标 + 任务指标` 设计，并限制标签基数。
+
+核心指标：
+
+- `aether_api_submit_latency_ms`（`Histogram`）：
+  `labels=route/method/code`；`P95<=300ms`，`P99<=800ms`。
+- `aether_api_query_latency_ms`（`Histogram`）：
+  `labels=route/code`；`P95<=800ms`，`P99<=2s`。
+- `aether_task_queue_wait_ms`（`Histogram`）：
+  `labels=task_type/resource_kind`；`P95<=5s`。
+- `aether_task_duration_ms`（`Histogram`）：
+  `labels=task_type/result`；`create/update<=10m`、`delete<=5m`、
+  `release<=8m`。
+- `aether_status_projection_lag_ms`（`Gauge`）：
+  `labels=resource_kind`；`<=30s`。
+- `aether_task_submit_total`（`Counter`）：
+  `labels=task_type/result`；日均 `>=10000` 可承载。
+- `aether_release_chart_total`（`Counter`）：
+  `labels=result`；日均 `>=2000` 可承载。
+
+标签基数控制：
+
+- 禁止在 Prometheus 标签中直接使用 `workspace_id/resource_id/task_id`。
+- 高基数字段仅写日志与追踪；指标层使用 `resource_kind/task_type/result` 聚合。
 
 ### 12.3 追踪设计
 
+追踪基于 OpenTelemetry，覆盖 API -> Domain -> Queue -> Worker -> Helm Adapter
+端到端链路。
+
+Span 分层：
+
+- `http.request`
+- `authorization.check`
+- `task.enqueue`
+- `task.execute`
+- `helm.render`
+- `helm.apply/upgrade/delete`
+- `status.project`
+- `audit.emit`
+
+采样策略：
+
+- 成功请求基础采样率 `10%`。
+- 错误请求与超时任务强制 `100%` 采样。
+- 通过 `request_id + task_id` 关联日志、指标和 trace。
+
 ### 12.4 告警与值班策略
+
+告警分级：
+
+- `P1`：控制面不可用；或 5 分钟错误率 `>5%`；
+  或月可用性趋势跌破 `99.9%`。响应时限 `5` 分钟。
+- `P2`：`task_queue_wait_p95 > 5s` 持续 10 分钟；
+  或 `task_failed_rate > 10%` 持续 10 分钟。响应时限 `15` 分钟。
+- `P3`：审计写入失败；或状态投影延迟 `>30s`；
+  或单资源失败重试超过阈值。响应时限 `30` 分钟。
+
+值班机制：
+
+- 7x24 值班，P1 自动电话 + IM 双通道通知。
+- 告警需绑定 runbook 链接与 owner（后端/SRE）。
 
 ### 12.5 运维操作手册
 
+最小 runbook 集合：
+
+1. 任务堆积：检查队列长度、Worker 并发、外部依赖健康，按资源类型限流或扩容 Worker。
+2. 任务失败率升高：按 `failure_reason` 聚类，区分参数类错误与依赖类错误。
+3. 状态投影延迟：检查 Reconciler 消费滞后与 DB 写入压力。
+4. Secret 回滚：执行版本回滚任务并验证关联工作负载重启是否完成。
+5. 解绑回收失败：进入 `ReclaimFailed` 后执行补偿重试与残留对象清理。
+
+每份 runbook 必须包含：
+
+- 触发条件
+- 影响范围判定
+- 操作步骤
+- 回滚步骤
+- 升级路径（何时升级 P1）
+
 ### 12.6 审计检索与追溯（关键操作与关系变更）
+
+审计检索接口（Query 同步）：
+
+- `GET /api/v1/audits?workspace_id=&cluster_id=&action=&actor=&from=&to=`
+- `GET /api/v1/audits/{audit_id}`
+- `GET /api/v1/resources/{resource_kind}/{resource_id}/audits`
+
+关键追溯场景：
+
+- 资源生命周期：`create -> update -> release -> delete`。
+- 关系变更：`bind_dataservice`、`unbind_dataservice`、`cascade_delete`。
+- Secret 变更：`secret.create`、`secret.update`、`secret.rollback`。
+
+索引建议：
+
+- `(workspace_id, created_at desc)`
+- `(resource_kind, resource_id, created_at desc)`
+- `(task_id)`
+- `(request_id)`
 
 ## 13. 非功能与容量设计
 
 ### 13.1 性能目标与预算（NFR-001~005）
 
+性能预算拆解（服务端）：
+
+- CUD 提交延迟：目标 `P95<=300ms`、`P99<=800ms`。
+  预算拆分：认证鉴权 `<=80ms` + 参数校验 `<=70ms` + DB 事务 `<=90ms` +
+  入队 `<=40ms` + 裕量 `<=20ms`。
+- Query 延迟（非聚合）：目标 `P95<=800ms`、`P99<=2s`。
+  预算拆分：鉴权 `<=80ms` + DB 读取 `<=500ms` + 结果组装 `<=120ms` +
+  裕量 `<=100ms`。
+- 排队时延：目标 `P95<=5s`。预算来源为队列消费滞后与 Worker 可用并发。
+- 任务执行时长：
+  `create/update P95<=10m`；`delete P95<=5m`；`release P95<=8m`。
+  预算来源为 Helm 操作、依赖可达性与补偿开销。
+
+超预算处理：
+
+- 连续 3 个观测窗口超预算触发 P2 告警。
+- 自动降级策略：限制低优先级任务并保留 delete/recover 高优先级任务配额。
+
 ### 13.2 可用性与稳定性目标（NFR-005）
+
+可用性目标：
+
+- 控制面月度可用性 `>=99.9%`（月错误预算 `<=43m12s`）。
+
+SLI 定义：
+
+- `SLI-1`：`2xx/3xx` 的 Query 请求比例。
+- `SLI-2`：CUD 提交接口成功受理比例（返回 `task_id`）。
+- `SLI-3`：任务系统可消费性（`Pending->Running` 延迟达标率）。
+
+稳定性策略：
+
+- API/Worker 多副本部署，最少 `3` 副本。
+- DB 开启主从与定期备份恢复演练。
+- 外部依赖不可用时快速失败并返回可诊断错误码，不长时间阻塞连接池。
 
 ### 13.3 容量规划（NFR-006~011）
 
+容量目标：
+
+- 工作空间/集群：`>=100` workspace，`>=50` cluster。
+- 资源实例下限：
+  shared dataservice `>=5000`；lowcode `>=2000`；devbox `>=5000`；
+  gateway `>=5000`；application `>=5000`；agent `>=10000`。
+- 任务吞吐：日均异步任务 `>=10000`。
+- 发布吞吐：日均 Chart 生成入库 `>=2000`。
+
+容量推导（用于初始部署）：
+
+- `10000` 任务/日约等于 `0.12 task/s` 平均负载；按峰值系数 `20x`
+  设计，目标峰值处理能力 `>=2.4 task/s`。
+- 发布任务按峰值系数 `10x` 设计，目标峰值处理能力 `>=0.25 release/s`。
+- Worker 默认并发建议：`50`（可按 `task_type` 分池）。
+
+数据库容量与索引策略：
+
+- 高频表（`AsyncTask`、`AuditLog`）按月分区。
+- 归档前在线存储预留 `>=6` 个月容量。
+- 所有列表查询必须命中组合索引，禁止全表扫描作为默认路径。
+
 ### 13.4 安全与审计约束（NFR-012~015）
+
+| NFR | 约束 | 设计响应 |
+| --- | --- | --- |
+| NFR-012 | 敏感信息不得明文持久化 | 仅存 `secret_ref` 与摘要；明文仅存 K8S Secret |
+| NFR-013 | 审计与任务日志留存 | 审计 `>=180` 天，任务日志 `>=30` 天，按分区清理 |
+| NFR-014 | 跨边界请求拒绝并审计 | 三阶段跨边界校验 + `422 CROSS_SCOPE_REFERENCE` + 强制审计 |
+| NFR-015 | 发布制品可追溯 | `HighCodeReleaseChart` 固化来源、版本、digest、操作者 |
 
 ### 13.5 可扩展性与运维约束（NFR-016~019）
 
+NFR-016（新增资源类型可扩展）：
+
+- 新资源接入仅允许新增：schema、模板解析、适配器实现、资源读模型。
+- 禁止修改：任务队列主模型、鉴权主流程、审计主流程。
+
+NFR-017（模板参数 schema 校验）：
+
+- 提交阶段执行 JSONSchema 校验，失败直接 `422 SCHEMA_VALIDATION_FAILED`。
+- 校验结果写任务外审计事件（请求被拒绝也需追溯）。
+
+NFR-018（失败可诊断）：
+
+- `failure_reason` 结构：`error_code`、`error_message`、`failed_step`、
+  `retryable`、`external_ref`。
+- 任务详情接口返回该结构，便于前端与运维定位。
+
+NFR-019（状态更新延迟 <=30s）：
+
+- 状态投影优先消费任务事件流，回退周期性对账（15s 周期）。
+- 观测指标 `aether_status_projection_lag_ms` 作为硬阈值告警输入。
+
 ### 13.6 压测与容量验收方案
+
+压测分层：
+
+1. 接口压测：CUD 提交与 Query 延迟（验证 `NFR-001/002`）。
+2. 队列压测：任务排队与消费能力（验证 `NFR-003/010/011`）。
+3. 端到端压测：部署、删除、发布全链路耗时（验证 `NFR-004`）。
+4. 稳定性压测：72 小时 soak test + 依赖故障注入（验证 `NFR-005/019`）。
+
+验收门禁：
+
+- 所有 `NFR-001~019` 对应指标均达到阈值。
+- P1/P2 告警在演练中可触发且可恢复。
+- 审计追溯可在 5 分钟内定位任一关键高风险操作。
 
 ## 14. 验收与追踪矩阵
 
@@ -1680,6 +2155,7 @@ flowchart TD
 | `R-PKG` | 4.8、5.6、8.2~8.6、9.1~9.5 |
 | `R-DATA` | 4.9、5.3、5.5、11.3、12.6 |
 | `R-OPS` | 4.10、7.1~7.6、8.1~8.6、12.6 |
+| `S-SEC` | 10.3、10.4、10.5、12.6、13.4 |
 | `NFR` | 10、11、12、13、14.1、14.2 |
 
 #### 14.4.3 逐条需求 ID 覆盖核对表
@@ -1781,25 +2257,32 @@ flowchart TD
 | R-OPS-008 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 明确任务结果最小字段集合。 |
 | R-OPS-009 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 固化补偿触发与一致性策略。 |
 | R-OPS-010 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、8.2、8.3 纳入关键动作审计点。 |
-| NFR-001 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-002 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-003 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-004 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-005 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-006 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-007 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-008 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-009 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-010 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-011 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-012 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-013 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-014 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-015 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-016 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-017 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-018 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
-| NFR-019 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
+| S-SEC-001 | 10.3、11.1、11.2 | 已覆盖 | 已在 10.3 固化 Secret 存放范围为工作空间 namespace。 |
+| S-SEC-002 | 10.1、10.4 | 已覆盖 | 已在 10.1/10.4 固化“可引用不可明文读取”权限边界。 |
+| S-SEC-003 | 10.3 | 已覆盖 | 已在 10.3 固化版本化命名 `{secret_name}.v{n}`。 |
+| S-SEC-004 | 10.3 | 已覆盖 | 已在 10.3 固化“新版本写入 + 指针切换 + 保留 10 版”。 |
+| S-SEC-005 | 10.3、12.5 | 已覆盖 | 已在 10.3/12.5 固化 Secret 版本回滚流程与运维手册。 |
+| S-SEC-006 | 10.4 | 已覆盖 | 已在 10.4 固化“仅使用 K8S Secret 默认机制，不引入额外 KMS”。 |
+| S-SEC-007 | 10.5、12.6 | 已覆盖 | 已在 10.5/12.6 固化审计字段与检索路径。 |
+| NFR-001 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 12.2、13.1 固化接口延迟指标、预算与告警阈值。 |
+| NFR-002 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 12.2、13.1 固化 Query 延迟预算与观测口径。 |
+| NFR-003 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 12.2、12.4、13.1 固化队列等待时延指标与告警。 |
+| NFR-004 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 12.2、13.1、13.6 固化任务时长目标与验收方法。 |
+| NFR-005 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 12.4、13.2、13.6 固化可用性目标、SLI 与演练门禁。 |
+| NFR-006 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 13.3 固化 workspace/cluster 容量下限与推导方法。 |
+| NFR-007 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 13.3 固化 shared 数据服务实例容量目标。 |
+| NFR-008 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 13.3 固化 lowcode/devbox/gateway 容量目标。 |
+| NFR-009 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 13.3 固化 application/agent 容量目标。 |
+| NFR-010 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 12.2、13.3、13.6 固化任务吞吐目标与压测方案。 |
+| NFR-011 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 12.2、13.3、13.6 固化发布吞吐目标与压测方案。 |
+| NFR-012 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 10.4、13.4 固化敏感数据持久化边界。 |
+| NFR-013 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 10.5、12.1、13.4 固化日志留存策略。 |
+| NFR-014 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 11.2、13.4 固化跨边界拒绝与强制审计。 |
+| NFR-015 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 10.5、13.4 固化发布制品追溯字段与检索。 |
+| NFR-016 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 13.5 固化新增资源接入边界与禁改项。 |
+| NFR-017 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 9.2、13.5 固化 schema 校验前置失败策略。 |
+| NFR-018 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 8.6、12.5、13.5 固化失败诊断字段与运维路径。 |
+| NFR-019 | 10、11、12、13、14.1、14.2 | 已覆盖 | 已在 12.2、12.4、13.5 固化状态延迟指标、阈值与告警。 |
 
 <!-- markdownlint-enable MD013 -->
 
