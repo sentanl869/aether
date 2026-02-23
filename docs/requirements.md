@@ -365,6 +365,8 @@ DevBox 补充状态：
 ### 通用契约
 
 - API 前缀统一为 `/api/v1`。
+- 资源作用域前缀统一为
+  `{scope}=/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}`。
 - CUD 接口必须支持 `Idempotency-Key`。
 - 更新/删除必须使用 `resource_version` 并发控制。
 - Query 同步返回，支持分页、过滤、排序。
@@ -389,68 +391,68 @@ DevBox 补充状态：
   - Path 段尽量使用单一单词的复数名词，避免连字符拼接命名。
 
 - 数据服务组件实例（shared）：
-  - `POST /dataservices`
-  - `GET /dataservices`
-  - `GET /dataservices/{dataservice_id}`
-  - `PUT /dataservices/{dataservice_id}`
-  - `DELETE /dataservices/{dataservice_id}`
+  - `POST {scope}/dataservices`
+  - `GET {scope}/dataservices`
+  - `GET {scope}/dataservices/{dataservice_id}`
+  - `PUT {scope}/dataservices/{dataservice_id}`
+  - `DELETE {scope}/dataservices/{dataservice_id}`
 
 - 低代码平台实例：
-  - `POST /lowcodes`
-  - `GET /lowcodes`
-  - `GET /lowcodes/{lowcode_id}`
-  - `PUT /lowcodes/{lowcode_id}`
-  - `DELETE /lowcodes/{lowcode_id}`
+  - `POST {scope}/lowcodes`
+  - `GET {scope}/lowcodes`
+  - `GET {scope}/lowcodes/{lowcode_id}`
+  - `PUT {scope}/lowcodes/{lowcode_id}`
+  - `DELETE {scope}/lowcodes/{lowcode_id}`
 
 - DevBox 实例与发布记录：
-  - `POST /devboxes`
-  - `GET /devboxes`
-  - `GET /devboxes/{devbox_id}`
-  - `PUT /devboxes/{devbox_id}`
-  - `DELETE /devboxes/{devbox_id}`
-  - `POST /devboxes/{devbox_id}/publishes`
-  - `GET /devboxes/{devbox_id}/publishes`
-  - `GET /publishes/{publish_id}`
+  - `POST {scope}/devboxes`
+  - `GET {scope}/devboxes`
+  - `GET {scope}/devboxes/{devbox_id}`
+  - `PUT {scope}/devboxes/{devbox_id}`
+  - `DELETE {scope}/devboxes/{devbox_id}`
+  - `POST {scope}/devboxes/{devbox_id}/publishes`
+  - `GET {scope}/devboxes/{devbox_id}/publishes`
+  - `GET {scope}/publishes/{publish_id}`
 
 - 网关实例：
-  - `POST /gateways`
-  - `GET /gateways`
-  - `GET /gateways/{gateway_id}`
-  - `PUT /gateways/{gateway_id}`
-  - `DELETE /gateways/{gateway_id}`
+  - `POST {scope}/gateways`
+  - `GET {scope}/gateways`
+  - `GET {scope}/gateways/{gateway_id}`
+  - `PUT {scope}/gateways/{gateway_id}`
+  - `DELETE {scope}/gateways/{gateway_id}`
 
 - 资源模板（按类型过滤）：
-  - `GET /templates?kind=dataservice`
-  - `GET /templates?kind=lowcode`
-  - `GET /templates?kind=devbox`
-  - `GET /templates?kind=gateway`
-  - `GET /templates/{template_id}`
+  - `GET {scope}/templates?kind=dataservice`
+  - `GET {scope}/templates?kind=lowcode`
+  - `GET {scope}/templates?kind=devbox`
+  - `GET {scope}/templates?kind=gateway`
+  - `GET {scope}/templates/{template_id}`
 
 - 高代码制品：
-  - `GET /artifacts`
-  - `GET /artifacts/{artifact_id}`
+  - `GET {scope}/artifacts`
+  - `GET {scope}/artifacts/{artifact_id}`
 
 - Agent 实例：
-  - `POST /agents`
-  - `GET /agents`
-  - `GET /agents/{agent_id}`
-  - `PUT /agents/{agent_id}`
-  - `DELETE /agents/{agent_id}`
+  - `POST {scope}/agents`
+  - `GET {scope}/agents`
+  - `GET {scope}/agents/{agent_id}`
+  - `PUT {scope}/agents/{agent_id}`
+  - `DELETE {scope}/agents/{agent_id}`
 
 - 高代码应用与发布产物：
-  - `POST /applications`
-  - `GET /applications`
-  - `GET /applications/{application_id}`
-  - `PUT /applications/{application_id}`
-  - `DELETE /applications/{application_id}`
-  - `GET /applications/{application_id}/relations`
-  - `POST /applications/{application_id}/releases`
-  - `GET /applications/{application_id}/charts`
-  - `GET /charts/{chart_id}/package`
+  - `POST {scope}/applications`
+  - `GET {scope}/applications`
+  - `GET {scope}/applications/{application_id}`
+  - `PUT {scope}/applications/{application_id}`
+  - `DELETE {scope}/applications/{application_id}`
+  - `GET {scope}/applications/{application_id}/relations`
+  - `POST {scope}/applications/{application_id}/releases`
+  - `GET {scope}/applications/{application_id}/charts`
+  - `GET {scope}/charts/{chart_id}/package`
 
 - 异步任务：
-  - `GET /tasks/{task_id}`
-  - `GET /tasks/{task_id}/result`
+  - `GET {scope}/tasks/{task_id}`
+  - `GET {scope}/tasks/{task_id}/result`
 
 ## 权限动作矩阵（设计输入）
 
