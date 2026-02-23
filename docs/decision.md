@@ -775,3 +775,27 @@
   - `task_design.md` 的 T16 与 T16-01~T16-04 可标记完成，并关闭 GAP-20~GAP-22。
   - 验收新增 `TC-LCP-05-A/B`、`TC-DBX-03`，用于验证导入契约、DELETE 契约与凭证链路闭环。
 - 替代关系：对 ADR-089（接口缺项与权限补齐）和 ADR-091（低代码字段闭环）做二次覆盖复核收口，以本 ADR 作为 T16 生效口径。
+
+### ADR-093: T17 错误码词典定稿为“403 双码互斥 + 409 引用冲突单码 + 兼容别名限窗退场”
+
+- 决策：
+  - 403 权限拒绝固定为两个 canonical 业务码并互斥触发：
+    `FORBIDDEN_WORKSPACE`（无工作空间权限或跨边界调用）、
+    `FORBIDDEN_ACTION`（动作越权，含非超管执行超管动作、租户调用 internal 接口）。
+  - 409 shared 引用冲突固定为单一 canonical 业务码
+    `REFERENCE_CONFLICT`，统一用于删除决策表、OpenAPI 与验收断言。
+  - 旧码兼容策略固定为限窗退场：
+    `FORBIDDEN`、`SHARED_RESOURCE_IN_USE` 仅在 `v1.11~v1.12`
+    做响应解析兼容与日志归并，`v1.13` 起禁止继续返回。
+  - 兼容窗口期间必须产出告警与监控：
+    `error_code_legacy_alias_total{alias=*}`，用于发布门禁检查。
+- 原因：
+  - T16 后仍存在同类场景多业务码并存（`FORBIDDEN/FORBIDDEN_WORKSPACE`、
+    `REFERENCE_CONFLICT/SHARED_RESOURCE_IN_USE`），导致实现方无法建立稳定错误处理分支，
+    且验收断言与 OpenAPI 存在双口径风险。
+  - `R-OPS` 与 `R-HCA-012` 需要“单场景单错误码”以支持自动化重试、告警聚合与跨章节一致性审计。
+- 影响：
+  - `design.md` 已同步修订 `7.2`、`7.5`、`10.2`、`11.4`、`14.1.9`、`14.4.14`、`15.2`。
+  - `task_design.md` 的 T17 与 T17-01~T17-03 可标记完成，并关闭 GAP-23。
+  - 后续新增接口若涉及 403/409，必须先通过“错误码词典一致性复核”检查点。
+- 替代关系：对 ADR-089（权限口径）与 ADR-044（级联冲突 409 语义）补充实现级错误码命名约束，以本 ADR 作为 T17 生效口径。
