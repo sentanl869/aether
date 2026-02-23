@@ -695,3 +695,32 @@
   - 验收补齐 `TC-DSP-04`、`TC-DATA-02`、`TC-ENV-05`，并将 `KS-12` 更新为权限分流口径。
   - `task_design.md` 的 T12 与 T12-01~T12-04 可标记完成并关闭 GAP-14~GAP-16。
 - 替代关系：对 ADR-086（embedded 权限旧口径）与 ADR-088（仅回滚契约）做实现级补全，以本 ADR 为当前生效口径。
+
+### ADR-090: T13 非阻断开放项定稿为“网关灰度参数模板统一 + 发布包下载签名链路”
+
+- 决策：
+  - `R-GTW-006` 的灰度变更参数模板统一为 `weighted_route` 策略，固定参数集合：
+    `initial_weight`、`step_weight`、`interval_seconds`、
+    `success_threshold`、`error_rate_threshold`、
+    `latency_p95_ratio_threshold`、`max_consecutive_failures`、
+    `rollback_mode`、`post_stable_observe_seconds`。
+  - 失败回切阈值定稿为“任一命中即回滚”：
+    连续失败超阈、连续两窗口错误率超阈、连续两窗口 P95 时延倍率超阈、
+    控制面健康检查失败/任务超时。
+  - 发布包下载链路定稿为“API 鉴权 + 临时签名 URL”，不采用控制面直连流式下载；
+    签名 URL TTL 固定 `300s`，控制面响应 `Cache-Control: no-store`，
+    对象侧响应 `Cache-Control: private, max-age=60, must-revalidate`。
+  - 下载签名必须绑定
+    `workspace_id + cluster_id + chart_id + chart_digest + requester_id`，
+    并落审计字段 `chart_id/release_version/digest/requested_by/request_ip/download_request_id`。
+- 原因：
+  - T12 之后仍存在两项未闭环开放问题（OQ-02/OQ-03），导致
+    `TC-GTW-01`、`TC-PKG-02` 仍依赖“待定策略”，影响上线前验收可执行性。
+  - 在安全与审计约束（`NFR-012~015`）下，签名 URL 方案可在不暴露持久化敏感参数的前提下，
+    降低控制面回源压力并保留可追溯性。
+- 影响：
+  - `design.md` 已同步修订 `4.6`、`7.3`、`7.5`、`14.1.6`、`14.4.10`、`15.3`，
+    并关闭 OQ-02/OQ-03。
+  - `task_design.md` 的 T13 与 T13-01~T13-03 可标记完成，并关闭 GAP-17/GAP-18。
+  - 验收新增 `TC-GTW-01-A`、`TC-PKG-02-A`、`TC-NFR-03-A` 作为策略落盘后必跑样例。
+- 替代关系：对 ADR-089 中“开放问题待定”状态做定稿收敛；以本 ADR 作为网关灰度与下载鉴权缓存策略的当前生效口径。
