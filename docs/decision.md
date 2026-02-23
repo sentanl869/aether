@@ -616,3 +616,25 @@
   - `design.md` 新增 T9 回标记录（`14.4.6`），并关闭 OQ-01（`15.3.3`）。
   - `task_design.md` 的 T9 与 T9-01~T9-05 可标记完成。
 - 替代关系：对 ADR-074（幂等双重校验）与 ADR-081（验收矩阵结构）补充实施级闭环要求，以本 ADR 为当前生效口径。
+
+### ADR-087: T10 幂等基线一致性定稿为“scope 唯一 + 指纹冲突判定 + 四文档联动”
+
+- 决策：
+  - 将 `requirements.md` 中 `AsyncTask` 的唯一约束从
+    `idempotency_key` 收敛为 `idempotency_scope`，固定 24h 去重窗口。
+  - 固化冲突语义：同 `idempotency_scope` 且
+    `request_fingerprint` 一致复用同 `task_id`；同 scope 异指纹返回
+    `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
+  - `idempotency_key` 仅保留原始请求头与审计检索语义，不再承载唯一约束。
+  - 兼容策略固定为“历史 key 语义仅用于审计查询，新请求统一按
+    `idempotency_scope + request_fingerprint` 判重”。
+- 原因：T9 后 `design.md` 已收敛为 scope 唯一，但 `requirements.md`
+  仍残留 `idempotency_key` 唯一约束文本，导致需求与设计双口径，影响
+  DDL 与验收判定的一致性。
+- 影响：
+  - `requirements.md` 已同步修订 `R-OPS-002`、`AsyncTask` 唯一约束、
+    任务规则与 `409` 错误语义。
+  - `design.md` 已同步修订 `2.6`、`5.2.3`、`8.4`、`14.1`、`14.4`、
+    `15.2`，并新增 `14.4.7` 回标记录。
+  - `task_design.md` 的 T10 与 T10-01~T10-03 可标记完成。
+- 替代关系：对 ADR-085、ADR-086 的幂等结论做“需求基线层”补全，以本 ADR 作为需求与设计的统一生效口径。

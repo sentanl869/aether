@@ -13,6 +13,7 @@
 | `v1.1.0` | `2026-02-23` | 完成 T7：补齐端点、统一路径并更新覆盖回标。 | `T7`、`ADR-084` |
 | `v1.2.0` | `2026-02-23` | 完成 T8：修复命名/更新方法/幂等口径冲突并回标。 | `T8`、`ADR-085` |
 | `v1.3.0` | `2026-02-23` | 完成 T9：补齐语义缺口（配额/报表、外部导入闭环、embedded 权限、LCP 多实例默认值）并更新覆盖回标。 | `T9`、`ADR-086` |
+| `v1.4.0` | `2026-02-23` | 完成 T10：修订 requirements/design 幂等基线一致性（scope 唯一、指纹冲突语义、回标与验收联动）。 | `T10`、`ADR-087` |
 
 文档状态：
 
@@ -143,7 +144,9 @@ T1 阶段输出定位为“设计基线”而非“功能详设”：
 - 可见性（Visibility）：`shared` 与 `embedded` 必须在 API、权限、展示上隔离。
 - 宿主归属（Owner）：`embedded` 资源必须绑定 `owner_kind/owner_id` 并随宿主生命周期回收。
 - L1 统计口径：配额统计与审计报表仅按 5 类一级资源聚合，支撑资源只作为明细维度，不改变一级口径（`R-ABS-007`）。
-- 幂等唯一性表达：对外语义保持 `Idempotency-Key`，内部唯一键固定为 `idempotency_scope`，`idempotency_key` 仅保留审计检索语义（`R-OPS-002`）。
+- 幂等唯一性表达：对外语义保持 `Idempotency-Key`，内部唯一键固定为 `idempotency_scope`；
+  `request_fingerprint` 用于同 scope 异载荷冲突判定；`idempotency_key` 仅保留审计检索语义（`R-OPS-002`）。
+- 幂等兼容策略：历史按 `idempotency_key` 检索的链路仅用于审计查询；任务去重与冲突判定统一迁移到 `idempotency_scope + request_fingerprint`。
 
 ## 3. 总体架构设计
 
@@ -845,7 +848,7 @@ erDiagram
 | `highcode_release_charts` | `app_id,release_ver,chart_ref,digest,source,status` | `release_version` 单应用唯一 |
 | `highcode_application_agent_refs` | `application_id,agent_instance_id,created_at/by` | app-agent 唯一；agent 单归属 |
 | `highcode_application_dataservice_refs` | `application_id,data_service_instance_id,created_at/by` | 仅允许 shared 组件 |
-| `async_tasks` | `idem*,fingerprint,type,skey,status,retry,result` | idem_scope 24h 唯一且指纹一致 |
+| `async_tasks` | `idem_scope,idem_key,fingerprint,expire_at,status,result` | `idem_scope` 24h 唯一；指纹不一致返回 `409` |
 | `secret_versions` | `secret_name`、`version`、`namespace`、`encrypted_data_ref`、`is_current` | 每个 `secret_name` 仅一个当前版本 |
 
 ### 5.3 关系模型（Application-Agent-DataService）
@@ -1209,7 +1212,7 @@ flowchart LR
 | 409 | `RESOURCE_VERSION_CONFLICT` | `resource_version` 冲突 | 否 |
 | 409 | `REFERENCE_CONFLICT` | `cascade=true` 时共享组件仍被引用（R-HCA-012） | 否 |
 | 409 | `RESOURCE_BUSY` | 同资源已有 Running/Pending 任务 | 是 |
-| 409 | `IDEMPOTENCY_PAYLOAD_MISMATCH` | 同幂等键但请求指纹不一致 | 否 |
+| 409 | `IDEMPOTENCY_PAYLOAD_MISMATCH` | 同幂等作用域但请求指纹不一致 | 否 |
 | 422 | `SCHEMA_VALIDATION_FAILED` | 模板/制品参数校验失败 | 否 |
 | 429 | `TOO_MANY_REQUESTS` | 请求超限/队列限流 | 是 |
 | 500 | `INTERNAL_ERROR` | 未分类服务端错误 | 视情况 |
@@ -1505,6 +1508,7 @@ flowchart TD
 - 幂等记录与任务写入同事务提交，避免“查重命中但任务不存在”。
 - DDL 使用唯一约束 `uq_task_idempotency_scope(idempotency_scope)`。
 - TTL 清理任务每 10 分钟执行：删除 `idempotency_expire_at < now()` 的过期幂等记录，不影响审计事件表。
+- 兼容策略：历史数据中仅带 `idempotency_key` 的记录继续用于审计检索；新请求统一按 `idempotency_scope + request_fingerprint` 判重，禁止回退到 key 唯一判重。
 
 ### 8.5 重试、超时与取消策略
 
@@ -2361,6 +2365,14 @@ flowchart LR
 | embedded 运维权限统一 | `TC-DSP-03` | 独立 `dataservices/{id}` 对 embedded 返回 `404`；宿主路径按宿主权限执行 | API 调用记录、RBAC 测试、审计事件 |
 | 多实例默认值定稿 | `TC-LCP-03` | `allow_multi_instance` 默认 `false`；策略变更仅影响新建实例 | 配置变更审计、实例创建结果 |
 
+#### 14.1.3 T10 幂等基线一致性验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| 幂等唯一约束一致性 | `TC-OPS-03` | `requirements` 与 `design` 均以 `idempotency_scope` 为唯一约束 | 文档 diff、评审记录、DDL 草案 |
+| 同 scope 异载荷冲突行为一致性 | `TC-OPS-04` | 同 scope+同指纹返回同 `task_id`；异指纹返回 `409` | 请求重放日志、错误响应样本、`async_tasks` 查询 |
+| TTL 窗口与清理语义一致性 | `TC-OPS-05` | 去重窗口统一为首次写入后 24h；过期后允许创建新任务且不影响审计检索 | 过期样本数据、清理任务日志、审计查询结果 |
+
 ### 14.2 测试分层与关键场景
 
 #### 14.2.1 测试分层
@@ -2560,7 +2572,7 @@ flowchart LR
 | R-DATA-007 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义应用详情读模型字段集合。 |
 | R-DATA-008 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.5 定义关系变更审计事件最小字段。 |
 | R-OPS-001 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
-| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.6、5.2.3、8.1、8.4 统一幂等口径（scope 唯一，key 审计）。 |
+| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.6、5.2.3、8.1、8.4 统一幂等口径并与 `requirements.md` 对齐。 |
 | R-OPS-003 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
 | R-OPS-004 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、7.3 固化工作空间/集群边界与错误模型。 |
 | R-OPS-005 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.1 固化串行化键模型与同资源串行执行。 |
@@ -2625,6 +2637,14 @@ flowchart LR
 | embedded 组件独立运维权限与可见性统一 | R-DSP-010、R-DSP-011 | 待补充 | 已覆盖 | 10.2、11.3、14.1.2 |
 | `allow_multi_instance` 默认值与变更策略定稿，并收敛开放问题 | R-LCP-008 | 待补充 | 已覆盖 | 4.4、15.3.3 |
 
+#### 14.4.7 T10 幂等基线一致性回标记录（2026-02-23）
+
+| 回标项 | 关联需求 | T10 前状态 | T10 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| `AsyncTask` 唯一约束已收敛为 `idempotency_scope` | R-OPS-002 | 待补充 | 已覆盖 | `requirements`（模型/规则）、5.2.3、5.4 |
+| 同 scope+异指纹冲突语义在需求/设计/验收三处一致 | R-OPS-002 | 待补充 | 已覆盖 | `docs/requirements.md`（任务规则/错误码）、8.4、14.1.3 |
+| 幂等去重窗口与 TTL 清理边界在需求/设计一致并具备验收证据 | R-OPS-002 | 待补充 | 已覆盖 | `docs/requirements.md`（任务规则）、8.4、14.1.3 |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
@@ -2663,7 +2683,10 @@ flowchart LR
 4. 基线偏离处理：若设计拟偏离需求基线（如 API 路径命名、
    HTTP Method、核心数据约束），必须先 ADR 说明并同步修订
    `requirements.md`，禁止仅修改 `design.md` 形成双口径。
-5. 幂等与并发口径复核：凡涉及 `R-OPS-002`、`R-OPS-006` 的变更，必须在实体定义、索引、任务编排、接口契约四处做单口径核对。
+5. 幂等与并发口径复核：凡涉及 `R-OPS-002`、`R-OPS-006` 的变更，
+   必须在实体定义、索引、任务编排、接口契约四处做单口径核对，
+   并同步校验 `requirements.md` 的 `AsyncTask` 唯一约束与冲突语义
+   （含 `IDEMPOTENCY_PAYLOAD_MISMATCH`）一致。
 6. 设计追踪更新：更新本文件 `14.4` 覆盖表，调整受影响需求 ID 的章节映射与状态。
 7. 设计正文更新：更新受影响章节（如 4/5/6/7/8/9/10/11/12/13/14）。
 8. 任务同步：更新 `docs/task/task_design.md` 的任务状态、DoD 与依赖关系。
@@ -2697,7 +2720,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T9）
+#### 15.3.1 设计自检记录（T10）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -2706,6 +2729,7 @@ flowchart LR
 | 可编码性 | 通过 | 已给出接口契约、任务语义、状态机、异常码、回滚 Runbook |
 | 冲突检查 | 通过 | 未发现与第 4~13 章的语义冲突 |
 | T9 语义补齐 | 通过 | 已补齐 5 个缺口并在 14.4.6 回标，未触发需求基线偏离 |
+| T10 幂等基线一致性修订 | 通过 | 已完成 requirements/design/decision/task 四文档联动，14.1.3 与 14.4.7 证据闭环 |
 | 遗漏检查 | 有残余风险 | 以下开放问题不阻断编码，但会影响上线效率或运维成本 |
 
 #### 15.3.2 开放问题（需闭环）

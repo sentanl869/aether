@@ -214,7 +214,10 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 ### 10. CRUD、权限与异步任务
 
 - R-OPS-001：数据服务组件、低代码平台、DevBox、网关、高代码应用 5 类资源的 CUD 统一走异步任务模型；Query 同步返回。
-- R-OPS-002：所有 CUD 请求必须支持 `Idempotency-Key`，24h 内重复请求返回同一 `task_id`。
+- R-OPS-002：所有 CUD 请求必须支持 `Idempotency-Key`；
+  控制面以 `idempotency_scope` 作为 24h 去重唯一键，
+  同 scope+同请求指纹返回同一 `task_id`，
+  同 scope+异指纹返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
 - R-OPS-003：权限模型固定为“超级管理员 + 普通用户”，并按工作空间做资源边界控制。
 - R-OPS-004：用户只能操作其已关联工作空间资源；跨工作空间、跨集群、跨 namespace 请求必须拒绝并审计。
 - R-OPS-005：同资源串行化执行，防止并发更新破坏状态一致性。
@@ -306,8 +309,9 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
   - 备注：记录 chart OCI 地址、digest、导出包元数据
 - `AsyncTask`
   - 主标识：`task_id`
-  - 唯一约束：`(idempotency_key)` 唯一
+  - 唯一约束：`(idempotency_scope)` 唯一（24h 去重窗口内）
   - 删除策略：不删除（归档）
+  - 备注：`idempotency_key` 保留原始请求头审计语义；`request_fingerprint` 用于同键异载荷冲突判定；`idempotency_expire_at` 用于 TTL 清理。
 - `SecretVersion`
   - 主标识：`secret_version_id`
   - 唯一约束：`(workspace_id, namespace, secret_name, version)` 唯一
@@ -354,7 +358,11 @@ DevBox 补充状态：
 
 任务执行规则：
 
-- CUD 请求必须携带 `Idempotency-Key`；24 小时内重复请求返回同一 `task_id`。
+- CUD 请求必须携带 `Idempotency-Key`；服务端计算
+  `idempotency_scope = sha256(actor_id + workspace_id + cluster_id + method + route_template + idempotency_key)`。
+- `idempotency_scope` 命中且 `request_fingerprint` 一致：返回同一 `task_id`。
+- `idempotency_scope` 命中但 `request_fingerprint` 不一致：返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
+- 去重窗口 24 小时，自首次写入起算；窗口到期后允许生成新任务。
 - 串行化键：`workspace_id:cluster_id:resource_kind:resource_id_or_name`。
 - 重试策略：最多 5 次，指数退避（5s、15s、45s、135s、300s）。
 - 超时策略：创建/更新默认 30 分钟，删除默认 15 分钟，发布导出默认 20 分钟。
@@ -378,7 +386,7 @@ DevBox 补充状态：
 - `401`：未认证。
 - `403`：无权限。
 - `404`：资源不存在。
-- `409`：并发冲突或引用冲突。
+- `409`：并发冲突、引用冲突或 `IDEMPOTENCY_PAYLOAD_MISMATCH`（同作用域幂等键但请求载荷不一致）。
 - `422`：业务规则校验失败（跨边界、单例冲突、发布前置条件不满足等）。
 - `429`：请求限流。
 - `500`：系统内部错误。
