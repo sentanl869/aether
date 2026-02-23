@@ -15,6 +15,7 @@
 | `v1.3.0` | `2026-02-23` | 完成 T9：补齐语义缺口（配额/报表、外部导入闭环、embedded 权限、LCP 多实例默认值）并更新覆盖回标。 | `T9`、`ADR-086` |
 | `v1.4.0` | `2026-02-23` | 完成 T10：修订 requirements/design 幂等基线一致性（scope 唯一、指纹冲突语义、回标与验收联动）。 | `T10`、`ADR-087` |
 | `v1.5.0` | `2026-02-23` | 完成 T11：补齐仓库绑定回滚接口契约、执行编排与验收回标闭环。 | `T11`、`ADR-088` |
+| `v1.6.0` | `2026-02-23` | 完成 T12：补齐 embedded 权限、relations 端点与绑定可变更契约，并更新覆盖回标。 | `T12`、`ADR-089` |
 
 文档状态：
 
@@ -428,17 +429,22 @@ sequenceDiagram
 
 - 集群纳管（kubeconfig）与工作空间绑定属于平台管理面能力，由超级管理员通过内部接口触发。
 - 业务资源 API 仅消费已生效的 `workspace_cluster_bindings` 与 `workspace_registry_bindings`，不直接修改绑定关系。
+- 绑定管理动作统一任务化（新增/更新/冻结解绑/恢复/回收/凭证轮转/回滚），并按 `binding_id` 串行执行。
 
 规则落地：
 
 - `R-ENV-001`：纳管集群以 `ManagedCluster` 为事实源，保存 `kubeconfig_ref` 与连通性状态；部署前做集群可达性探测。
 - `R-ENV-002`：仅超级管理员可创建工作空间并关联集群、仓库；普通用户调用返回 `403 FORBIDDEN`。
+  关联入口固定为内部契约：
+  `POST/PUT /internal/v1/workspace-cluster-bindings`、
+  `POST/PUT /internal/v1/workspace-registry-bindings`。
 - `R-ENV-003`：建立 `workspace + cluster` 绑定时自动创建/复用同名 namespace，写回 `namespace_name`。
 - `R-ENV-004`：所有业务请求先校验用户是否关联工作空间，不通过直接拒绝并审计。
 - `R-ENV-005`：业务 API 路径必须显式包含 `workspace_id/cluster_id`；`namespace` 由绑定表反查注入，不接受请求体覆写。
-- `R-ENV-006`：仓库绑定变更采用版本化绑定记录（`binding_version`），通过内部接口
+- `R-ENV-006`：仓库绑定变更采用版本化绑定记录（`binding_version`），动作覆盖“新增、更新、轮转、回滚”。
+  其中回滚通过内部接口
   `POST /internal/v1/workspace-registry-bindings/{binding_id}:rollback`
-  回滚到指定版本并触发重新下发。
+  执行到指定历史版本，并触发凭证重新下发。
 - `R-ENV-007`：凭证下发以 namespace 为粒度生成 `imagePullSecret` 与 Helm OCI 登录凭据，供部署器与发布器消费。
 - `R-ENV-008`：跨集群关联在提交阶段拦截，返回 `422 SCHEMA_VALIDATION_FAILED`（原因 `cross_cluster_association_forbidden`）。
 - `R-ENV-009`：解绑流程固定为 `Frozen -> Validating -> RecoveryWindow(24h) -> Reclaiming`。
@@ -454,6 +460,26 @@ sequenceDiagram
 | `RecoveryWindow` | 允许 | 拒绝 | 允许 | 仅系统触发 |
 | `Reclaiming` | 允许 | 拒绝 | 拒绝 | 进行中 |
 | `Unbound` | 允许历史读 | 拒绝 | 拒绝 | 完成 |
+
+绑定可变更动作矩阵（T12，`R-ENV-002`、`R-ENV-006`）：
+
+| 动作 | 接口索引 | 权限 | 并发与幂等 | 审计动作 |
+| --- | --- | --- | --- | --- |
+| 新增工作空间-集群绑定 | `I1` | super_admin | `Idempotency-Key`；按 binding 串行 | `created` |
+| 更新工作空间-集群绑定 | `I2` | super_admin | `resource_version`；按 binding 串行 | `updated` |
+| 发起解绑（冻结） | `I3` | super_admin | `confirmation_token`；按 binding 串行 | `freeze_requested` |
+| 新增工作空间-仓库绑定 | `I4` | super_admin | `Idempotency-Key`；按 binding 串行 | `created` |
+| 更新工作空间-仓库绑定 | `I5` | super_admin | `resource_version`；按 binding 串行 | `updated` |
+| 仓库绑定回滚 | `I6` | super_admin | `Idempotency-Key`；按 binding 串行 | `rolledback` |
+
+接口索引（对应 7.6）：
+
+- `I1`: `POST /internal/v1/workspace-cluster-bindings`
+- `I2`: `PUT /internal/v1/workspace-cluster-bindings/{binding_id}`
+- `I3`: `POST /internal/v1/workspace-cluster-bindings/{binding_id}:freeze`
+- `I4`: `POST /internal/v1/workspace-registry-bindings`
+- `I5`: `PUT /internal/v1/workspace-registry-bindings/{binding_id}`
+- `I6`: `POST /internal/v1/workspace-registry-bindings/{binding_id}:rollback`
 
 仓库绑定回滚约束（`R-ENV-006`）：
 
@@ -1221,6 +1247,7 @@ flowchart LR
 | 400 | `INVALID_ARGUMENT` | 参数缺失、格式非法 | 否 |
 | 401 | `UNAUTHORIZED` | Token 无效或过期 | 否 |
 | 403 | `FORBIDDEN` | 非法工作空间、角色越权 | 否 |
+| 403 | `FORBIDDEN_ACTION` | 角色不具备目标动作权限（如 user 访问 `embeddeddataservices`） | 否 |
 | 404 | `RESOURCE_NOT_FOUND` | 资源不存在或已软删 | 否 |
 | 409 | `RESOURCE_VERSION_CONFLICT` | `resource_version` 冲突 | 否 |
 | 409 | `REFERENCE_CONFLICT` | `cascade=true` 时共享组件仍被引用（R-HCA-012） | 否 |
@@ -1255,6 +1282,7 @@ flowchart LR
 | 网关 | `Gateway` | `{scope}/gateways` |
 | 高代码应用 | `HighCodeApplication` | `{scope}/applications` |
 | Agent 实例 | `AgentInstance` | `{scope}/agents` |
+| 嵌入式组件运维（超管） | `EmbeddedDataServiceAdmin` | `{scope}/embeddeddataservices` |
 | 资源模板 | `Template` | `{scope}/templates` |
 | 高代码制品 | `HighCodeArtifact` | `{scope}/artifacts` |
 | DevBox 发布记录 | `DevBoxPublishRecord` | `{scope}/devboxes/{devbox_id}/publishes` |
@@ -1286,9 +1314,16 @@ DevBox 发布记录接口：
 
 高代码发布与发布包接口：
 
+- 关系查询：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/relations`
 - 发布：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/releases`
 - 发布包列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts`
 - 下载发布包：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package`
+
+超管专用 `embedded` 组件独立运维接口（满足权限矩阵）：
+
+- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/embeddeddataservices/{embedded_dataservice_id}`
+- `PUT /workspaces/{workspace_id}/clusters/{cluster_id}/embeddeddataservices/{embedded_dataservice_id}`
+- `DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/embeddeddataservices/{embedded_dataservice_id}`
 
 任务接口：
 
@@ -1355,7 +1390,7 @@ ReleaseCreateRequest:
 - 复用对象：`components/parameters`（分页、路径参数、`resource_version`）
 - 安全定义：`components/securitySchemes/BearerAuth`
 
-T7 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
+T7+T12 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 
 | 要求端点（需求口径） | Canonical path（设计口径） | OpenAPI 文件建议 |
 | --- | --- | --- |
@@ -1364,8 +1399,10 @@ T7 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 | `/devboxes/{devbox_id}/publishes` | `{scope}/devboxes/{devbox_id}/publishes` | `paths/devbox_publishes.yaml` |
 | `/publishes/{publish_id}` | `{scope}/publishes/{publish_id}` | `paths/devbox_publishes.yaml` |
 | `/tasks/{task_id}/result` | `{scope}/tasks/{task_id}/result` | `paths/tasks.yaml` |
+| `applications relations` | `{scope}/applications/{application_id}/relations` | `paths/application_relations.yaml` |
 | `/applications/{application_id}/charts` | 见 7.3「发布包列表」接口 | `paths/highcode_charts.yaml` |
 | `/charts/{chart_id}/package` | `{scope}/charts/{chart_id}/package` | `paths/highcode_charts.yaml` |
+| `embedded` 运维（super_admin） | `{scope}/embeddeddataservices/{id}` | `paths/embedded_ds_admin.yaml` |
 
 OpenAPI 统一约束：
 
@@ -1386,12 +1423,47 @@ OpenAPI 统一约束：
 
 | 接口 | 方法 | 语义 |
 | --- | --- | --- |
+| `/internal/v1/workspace-cluster-bindings` | `POST` | 新建工作空间-集群绑定（自动创建/复用 namespace） |
+| `/internal/v1/workspace-cluster-bindings/{binding_id}` | `PUT` | 更新工作空间-集群绑定元数据（含 `resource_version`） |
 | `/internal/v1/workspace-cluster-bindings/{binding_id}:freeze` | `POST` | 发起解绑冻结（含二次确认） |
 | `/internal/v1/workspace-cluster-bindings/{binding_id}:validate` | `POST` | 校验冻结后任务与资源状态 |
 | `/internal/v1/workspace-cluster-bindings/{binding_id}:recover` | `POST` | 24h 窗口内撤销解绑 |
 | `/internal/v1/workspace-cluster-bindings/{binding_id}:reclaim` | `POST` | 执行 namespace 回收 |
+| `/internal/v1/workspace-registry-bindings` | `POST` | 新建工作空间-仓库绑定并触发首轮凭证下发 |
+| `/internal/v1/workspace-registry-bindings/{binding_id}` | `PUT` | 更新仓库绑定（凭证引用/策略）并触发重下发 |
 | `/internal/v1/workspace-registry-bindings/{binding_id}:rotate-credential` | `POST` | 轮转仓库凭证并触发下发 |
 | `/internal/v1/workspace-registry-bindings/{binding_id}:rollback` | `POST` | 回滚仓库绑定到指定历史版本并触发全量重下发 |
+
+绑定新增/更新内部契约（T12）：
+
+- `POST /internal/v1/workspace-cluster-bindings`：
+  请求体最小字段
+  `workspace_id`、`cluster_id`、`reason`；成功返回 `202 + task_id`，任务结果包含
+  `namespace_name` 与 `binding_id`。
+- `PUT /internal/v1/workspace-cluster-bindings/{binding_id}`：
+  请求体最小字段
+  `resource_version`、`reason`、`labels_override`（可选）；禁止变更
+  `workspace_id/cluster_id`，否则返回 `422 SCHEMA_VALIDATION_FAILED`。
+- `POST /internal/v1/workspace-registry-bindings`：
+  请求体最小字段
+  `workspace_id`、`registry_id`、`credential_ref`、`reason`；成功后生成
+  `binding_version=1` 并触发 Active clusters 凭证下发。
+- `PUT /internal/v1/workspace-registry-bindings/{binding_id}`：
+  请求体最小字段
+  `resource_version`、`credential_ref`、`reason`；成功后 `binding_version+1` 并写
+  `workspace_registry_binding_history` 快照。
+
+绑定新增/更新错误码（最小集合）：
+
+| HTTP | 业务码 | 触发条件 |
+| --- | --- | --- |
+| `403` | `FORBIDDEN` | 非超级管理员调用 |
+| `404` | `RESOURCE_NOT_FOUND` | 目标 `workspace/cluster/registry/binding` 不存在 |
+| `409` | `RESOURCE_VERSION_CONFLICT` | `resource_version` 不匹配 |
+| `409` | `RESOURCE_BUSY` | 同 `binding_id` 存在 `Pending/Running` 绑定任务 |
+| `409` | `BINDING_STATE_CONFLICT` | 绑定处于 `Frozen/Validating/RecoveryWindow/Reclaiming` 且不允许更新 |
+| `422` | `SCHEMA_VALIDATION_FAILED` | 违反不可变字段约束或参数非法 |
+| `503` | `DEPENDENCY_UNAVAILABLE` | namespace 创建或凭证下发依赖暂不可用 |
 
 仓库绑定回滚内部契约（T11）：
 
@@ -1427,6 +1499,8 @@ OpenAPI 统一约束：
 事件主题与载荷（Outbox -> EventBus）：
 
 - `workspace.binding.state.changed.v1`
+- `workspace.cluster.binding.changed.v1`
+- `workspace.registry.binding.changed.v1`
 - `workspace.registry.credential.rotated.v1`
 - `workspace.registry.binding.rolledback.v1`
 - `task.lifecycle.changed.v1`
@@ -1694,6 +1768,36 @@ sequenceDiagram
   end
 ```
 
+### 8.8 绑定新增/变更任务编排（T12）
+
+绑定新增/变更统一任务类型：
+
+- `workspace_cluster_binding_create`
+- `workspace_cluster_binding_update`
+- `workspace_registry_binding_create`
+- `workspace_registry_binding_update`
+
+执行步骤（`R-ENV-002`、`R-ENV-006`）：
+
+1. 准入校验：校验 super_admin 身份、`resource_version`（更新场景）与绑定状态。
+2. 幂等判定：按 `idempotency_scope + request_fingerprint` 判重。
+3. 绑定落库：
+   - cluster 绑定：写入/更新 `workspace_cluster_bindings`，并创建或校验 namespace。
+   - registry 绑定：写入历史快照并切换 `binding_version`。
+4. 副作用执行：
+   - cluster 绑定新增：补齐 namespace 标签与最小准入资源配额（平台默认）。
+   - registry 绑定新增/更新：对 Active clusters 触发凭证下发。
+5. 结果回写：写任务 `result`、绑定 `last_synced_at/last_sync_status`。
+6. 审计与事件：写审计并发送 `workspace.cluster.binding.changed.v1` 或
+   `workspace.registry.binding.changed.v1`。
+
+失败分支与补偿：
+
+- namespace 创建失败：任务 `Failed`，创建 `cluster_namespace_reconcile` 补偿任务。
+- registry 凭证下发部分失败：任务 `Failed`，创建
+  `registry_credential_redispatch` 补偿任务。
+- 补偿超出重试上限：标记 `manual_intervention_required=true` 并触发 `P2` 告警。
+
 ## 9. 资源编排与 K8s 交互设计
 
 ### 9.1 模板与制品技术路线（内置 Helm/导入 Helm/镜像转 Chart）
@@ -1890,7 +1994,8 @@ type RequestContext struct {
 动作分层：
 
 - 平台管理动作：`workspace.*`、`cluster.*`、`registry.*`、`template.import`、
-  `gateway.manage`、`lowcode.manage`（默认仅超管）。
+  `gateway.manage`、`lowcode.manage`、`embedded_dataservice.manage`
+  （默认仅超管）。
 - 租户内业务动作：`dataservice.*`、`devbox.*`、`agent.*`、`application.*`、
   `task.read`（用户在已关联工作空间可执行）。
 - 受限动作：`secret.read_plaintext` 永久拒绝，保留平台服务账号内部能力。
@@ -1899,7 +2004,8 @@ type RequestContext struct {
 
 | 场景 | super_admin | user | 说明 |
 | --- | --- | --- | --- |
-| 通过 `dataservices` 独立接口读取/更新/删除 `embedded` | 拒绝（`404`） | 拒绝（`404`） | API 可见性对齐：`embedded` 不作为独立资源暴露 |
+| 通过 `dataservices` 独立接口读取/更新/删除 `embedded` | 拒绝（`404`） | 拒绝（`404`） | shared-only 接口，embedded 不可见 |
+| 通过 `embeddeddataservices` 独立接口读取/更新/删除 `embedded` | 允许 | 拒绝（`403 FORBIDDEN_ACTION`） | 超管专用路径，满足需求权限矩阵“嵌入式组件独立运维” |
 | 通过高代码应用宿主执行 `embedded` 运维（升级/重启/回收） | 允许 | 允许（需有该应用权限） | 以宿主动作鉴权，不单独下发 `embedded` 权限 |
 | 通过低代码平台宿主执行 `embedded` 运维 | 允许 | 拒绝（`403 FORBIDDEN_ACTION`） | 低代码平台管理动作仅超管 |
 | 宿主删除触发 `embedded` 回收补偿 | 允许 | 允许触发宿主删除；补偿由系统执行 | 审计记录操作者与系统补偿任务 |
@@ -2093,15 +2199,23 @@ Secret 专项最小字段（`S-SEC-007`）：
   `GET /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/relations`、
   `GET /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`
   的详情读模型返回嵌入式关系。
-- 对 `embedded` 资源 ID 的独立接口访问（`GET/PUT/DELETE /dataservices/{id}`）统一返回 `404 RESOURCE_NOT_FOUND`，避免形成“超管可见、用户不可见”双口径。
+- 对 `embedded` 资源 ID 的独立接口访问（`GET/PUT/DELETE /dataservices/{id}`）统一返回
+  `404 RESOURCE_NOT_FOUND`。
+- 超管独立运维仅走
+  `GET/PUT/DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/embeddeddataservices/{embedded_dataservice_id}`；
+  普通用户访问该路径返回 `403 FORBIDDEN_ACTION`。
 
 操作权限与审计动作：
 
 - 权限判定：
-  - `embedded` 运维权限由宿主权限派生，不单独存在 `embedded.*` 动作。
+  - `embedded` 运维权限分两条路径：
+    `embedded_dataservice.manage`（仅 super_admin 独立接口）和宿主派生权限（应用/低代码平台）。
   - 高代码宿主：`application.update/delete` 通过后允许执行对应 `embedded` 运维。
   - 低代码宿主：仅 `lowcode.manage`（超管）可触发 `embedded` 运维。
 - 审计动作：
+  - `embedded_dataservice.admin_read`
+  - `embedded_dataservice.admin_update`
+  - `embedded_dataservice.admin_delete`
   - `embedded_dataservice.operate_via_owner`
   - `embedded_dataservice.recycle_via_owner_delete`
   - `embedded_dataservice.compensation_retry`
@@ -2432,12 +2546,12 @@ T9 运维补充约束：
 | --- | --- | --- | --- |
 | R-ENV-001~003 | namespace 映射校验（`TC-ENV-01`） | 绑定成功；namespace 存在；binding 为 `Active` | API 响应、DB 快照、`kubectl get ns` |
 | R-ENV-004~005、008 | 跨 workspace/cluster 请求拦截（`TC-ENV-02`） | 返回 `403/422`；无任务入队；审计有拒绝记录 | 错误响应、任务表查询、审计日志 |
-| R-ENV-006~007 | 仓库回滚与凭证重下发（`TC-ENV-04`） | 仅超管；版本切换成功并完成凭证重下发；重复请求复用 `task_id` | 接口响应、任务结果、Secret 清单、审计事件 |
+| R-ENV-006~007 | 绑定变更/回滚（`TC-ENV-04/05`） | 仅超管；回滚成功；重复请求复用 `task_id` | 接口响应、任务结果、binding 快照、审计 |
 | R-ENV-009~010 | 解绑冻结与恢复窗口（`TC-ENV-03`） | 状态流转正确；仅超管执行且二次确认 | 状态机日志、审计日志、操作录屏 |
 | R-ABS-001~004 | 新资源类型接入不改主流程（`TC-ABS-01`） | 仅新增 schema+adapter 即可跑通 CUD；任务、鉴权、审计代码路径无分叉 | PR diff、单测、集成测试报告 |
 | R-ABS-005~008 | 标签与 L1 统计口径（`TC-ABS-02`） | K8s 对象带完整标签；控制面不以 Pod 为主资源；报表按 5 类 L1 聚合 | K8s 清单、API 契约测试、配额报表 |
 | R-DSP-001~007 | 共享组件创建、扩缩容、升级回滚（`TC-DSP-01`） | 组件 CRUD 与运维动作均走异步任务；Service 命名规则符合策略 | 任务记录、状态快照、Service 清单 |
-| R-DSP-008~012 | embedded 隔离与宿主回收（`TC-DSP-02`） | `embedded` 不进共享池；独立接口不可运维；宿主删除后回收 | 列表响应、关系表、删除日志、权限审计 |
+| R-DSP-008~012 | embedded 隔离与宿主回收（`TC-DSP-02/04`） | `embedded` 不进共享池；`dataservices` 返回 `404`；宿主删除自动回收 | 列表响应、关系表、权限审计 |
 | R-LCP-001~004 | 低代码平台内置/导入 Helm 与生命周期（`TC-LCP-01`） | 仅 Helm 导入；实例 CRUD、升级回滚成功；角色权限正确 | API 响应、任务日志、权限测试报告 |
 | R-LCP-005~010 | 低代码依赖归属与多实例（`TC-LCP-02`） | 依赖组件标记 `embedded`；多实例默认关闭；普通用户仅查看 | 拓扑详情、列表响应、RBAC、策略审计 |
 | R-DBX-001~005 | DevBox 创建与发布流程（`TC-DBX-01`） | DevBox 实例可创建/更新/停止/删除；发布流程产出记录完整 | DevBox 实例详情、发布记录 |
@@ -2447,7 +2561,7 @@ T9 运维补充约束：
 | R-HCA-007~010 | Chart 版本、values 覆盖、运行编排（`TC-HCA-02`） | Chart 版本可选；values 覆盖优先级正确；Secret 明文不可读 | 渲染产物、部署清单、权限测试 |
 | R-HCA-011~014 | 级联冲突（`TC-HCA-03`） | `cascade=false` 保留共享组件；`cascade=true` 冲突返回 `409`；embedded 随宿主回收 | 删除响应、关系校验、补偿 |
 | R-PKG-001~006 | 发布打包与导入（`TC-PKG-01`、`TC-PKG-02`） | 每次发布产出版本化 Chart；OCI 推送成功可下载；外部导入通过验证 | Release 记录、OCI 清单、下载与导入验证 |
-| R-DATA-001~008 | 关系持久化与可见性查询（`TC-DATA-01`） | 应用详情完整输出 agent/shared/embedded/release；关系变更均可审计追溯 | 详情响应、关系表、审计检索结果 |
+| R-DATA-001~008 | 关系查询（`TC-DATA-01/02`） | 详情与 `relations` 返回 4 类关系；变更可审计 | 详情响应、relations 响应、审计检索 |
 | R-OPS-001~010 | 异步任务、幂等与补偿（`TC-OPS-01`） | CUD 返回 `202+task_id`；idem_scope 命中同任务；异指纹返回 `409` | 任务流水、幂等记录、补偿、错误样本 |
 | S-SEC-001~007 | Secret 边界、版本与审计（`TC-SEC-01`） | Secret 在 workspace namespace；用户不可读明文；回滚采用新版本并审计 | Secret 版本记录、RBAC、审计 |
 | NFR-001~004 | 接口延迟、排队时延、任务执行时长（`TC-NFR-01`） | 满足 13.1 阈值：提交 `P95<=300ms`、Query `P95<=800ms`、排队 `P95<=5s` | 压测报告、监控截图 |
@@ -2473,8 +2587,10 @@ flowchart LR
 | 模板查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/templates?kind=dataservice` |
 | DevBox 发布记录创建 | `POST /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes` |
 | 发布记录详情 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/publishes/{publish_id}` |
+| 高代码应用关系查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/relations` |
 | 高代码应用发布包列表 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts` |
 | 发布包下载 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package` |
+| 超管 embedded 独立运维 | `GET {scope}/embeddeddataservices/{embedded_dataservice_id}` |
 | 任务结果查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result` |
 
 #### 14.1.2 T9 语义补齐验收样例
@@ -2504,6 +2620,14 @@ flowchart LR
 | 越权调用 | `TC-ENV-04-C` | 非超管调用返回 `403 FORBIDDEN`，且无绑定版本变更 | 鉴权日志、错误响应、绑定版本快照 |
 | 重复请求幂等复用 | `TC-ENV-04-D` | 同 key 同体复用同 `task_id`；同 key 异体返回 `409`（`IDEMPOTENCY_PAYLOAD_MISMATCH`） | 请求重放日志、任务记录、错误响应 |
 
+#### 14.1.5 T12 语义缺口补齐验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| embedded 权限对齐 | `TC-DSP-04` | `dataservices/{id}=404`；admin 独立接口 `200`，user `403` | API 记录、权限测试、审计事件 |
+| relations 端点补齐 | `TC-DATA-02` | `GET /applications/{id}/relations` 返回关系与 owner 字段；可生成契约测试 | 接口响应、OpenAPI 路径、契约测试 |
+| 绑定可变更契约补齐 | `TC-ENV-05` | 绑定新增/更新返回 `202 + task_id`；状态与版本回写正确；失败分支进入补偿并审计 | 接口响应、任务结果、binding 快照、补偿任务与审计日志 |
+
 ### 14.2 测试分层与关键场景
 
 #### 14.2.1 测试分层
@@ -2531,7 +2655,7 @@ flowchart LR
 | KS-09 | 漂移修复与业务任务串行 | R-ABS-002、ADR-077 | 漂移修复与变更任务不并发执行，状态不互相覆盖 |
 | KS-10 | 状态投影延迟阈值验证 | NFR-019 | `aether_status_projection_lag_ms` 满足 `<=30s` |
 | KS-11 | 发布包外部环境导入闭环验证 | R-PKG-004、R-PKG-006 | 下载校验、外部导入、运行态验证三步均成功并可追溯到发布版本 |
-| KS-12 | embedded 独立接口封闭与宿主派生运维 | R-DSP-010、R-DSP-011 | 独立接口返回 `404`；宿主运维路径按角色规则执行且审计完整 |
+| KS-12 | embedded 独立接口与宿主派生运维 | R-DSP-010、R-DSP-011 | `dataservices=404`；`embeddeddataservices` 仅超管；宿主路径保留审计 |
 
 #### 14.2.3 缺陷分级与退出标准
 
@@ -2602,15 +2726,15 @@ flowchart LR
 
 | 需求簇 | 主要章节映射 |
 | --- | --- |
-| `R-ENV` | 4.1、5.7、6.5、7.6、8.7、11.1、11.2 |
+| `R-ENV` | 4.1、5.7、6.5、7.6、8.7~8.8、11.1、11.2 |
 | `R-ABS` | 3.3、4.2、5.1、8.1~8.6 |
-| `R-DSP` | 4.3、5.2、5.3、9.1~9.5、11.3 |
+| `R-DSP` | 4.3、5.2、5.3、9.1~9.5、10.2、11.3 |
 | `R-LCP` | 4.4、5.2、9.1~9.5、11.3 |
 | `R-DBX` | 4.5、5.2、5.6、9.1~9.5 |
 | `R-GTW` | 4.6、5.2、9.1~9.5、11.2 |
 | `R-HCA` | 4.7、5.2、5.3、9.1~9.5、11.4 |
 | `R-PKG` | 4.8、5.6、8.2~8.6、9.1~9.5 |
-| `R-DATA` | 4.9、5.3、5.5、11.3、12.6 |
+| `R-DATA` | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 |
 | `R-OPS` | 4.10、7.1~7.6、8.1~8.6、12.6 |
 | `S-SEC` | 10.3、10.4、10.5、12.6、13.4 |
 | `NFR` | 10、11、12、13、14.1、14.2 |
@@ -2620,12 +2744,12 @@ flowchart LR
 | 需求 ID | 映射章节 | 当前状态 | 备注 |
 | --- | --- | --- | --- |
 | R-ENV-001 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
-| R-ENV-002 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
+| R-ENV-002 | 4.1、5.7、6.5、7.6、8.8、11.1、11.2 | 已覆盖 | 已在 4.1、7.6、8.8 固化绑定新增/更新内部契约与任务化执行。 |
 | R-ENV-003 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-004 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-005 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
-| R-ENV-006 | 4.1、5.7、6.5、7.6、8.7、11.1、11.2 | 已覆盖 | 已在 4.1、7.6、8.7 定义 rollback 契约与补偿，并在 14.1.4（`TC-ENV-04`）给出验收证据。 |
-| R-ENV-007 | 4.1、5.7、6.5、7.6、8.7、11.1、11.2 | 已覆盖 | 已在 4.1、8.7 固化回滚后按 Active clusters 执行 namespace 凭证重下发与结果回写。 |
+| R-ENV-006 | 4.1、5.7、6.5、7.6、8.7~8.8、11.1、11.2 | 已覆盖 | 已在 4.1、7.6、8.7~8.8 定义绑定新增/更新/回滚契约与补偿，见 `TC-ENV-04/05`。 |
+| R-ENV-007 | 4.1、5.7、6.5、7.6、8.7~8.8、11.1、11.2 | 已覆盖 | 已在 4.1、8.7~8.8 固化绑定更新/回滚后的凭证重下发与结果回写。 |
 | R-ENV-008 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-009 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-010 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
@@ -2646,8 +2770,8 @@ flowchart LR
 | R-DSP-007 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
 | R-DSP-008 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
 | R-DSP-009 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
-| R-DSP-010 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 10.2、11.3 补齐 embedded 仅通过宿主运维的权限与审计规则。 |
-| R-DSP-011 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 10.2、11.3 固化 API 可见性隔离（独立接口统一 `404`）与操作权限一致性。 |
+| R-DSP-010 | 4.3、5.2、5.3、9.1~9.5、10.2、11.3 | 已覆盖 | 已在 10.2、11.3 固化两条运维路径：超管独立运维 + 宿主派生权限。 |
+| R-DSP-011 | 4.3、5.2、5.3、9.1~9.5、10.2、11.3 | 已覆盖 | 已在 10.2、11.3 固化隔离：`dataservices` 对 embedded 统一 `404`。 |
 | R-DSP-012 | 4.3、5.2、5.3、9.1~9.5、11.3 | 已覆盖 | 已在 4.3 与 9.1~9.5 补齐 shared/embedded 隔离与生命周期。 |
 | R-LCP-001 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
 | R-LCP-002 | 4.4、5.2、9.1~9.5、11.3 | 已覆盖 | 已在 4.4 与 9.1~9.5 补齐内置/导入 Helm 与依赖归属。 |
@@ -2694,14 +2818,14 @@ flowchart LR
 | R-PKG-004 | 4.8、5.6、8.2~8.6、9.1~9.5 | 已覆盖 | 已在 4.8、14.1.2 补齐“下载 -> 外部导入 -> 运行验证”闭环与证据要求。 |
 | R-PKG-005 | 4.8、5.6、8.2~8.6、9.1~9.5 | 已覆盖 | 已在 4.8 与 9.1~9.5 补齐打包、入库、下载导出链路。 |
 | R-PKG-006 | 4.8、5.6、8.2~8.6、9.1~9.5 | 已覆盖 | 已在 4.8 与 9.1~9.5 补齐打包、入库、下载导出链路。 |
-| R-DATA-001 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义关系持久化。 |
-| R-DATA-002 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义宿主与 embedded 归属。 |
-| R-DATA-003 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.2/5.3 定义 visibility 与 owner。 |
-| R-DATA-004 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.3 固化 Query 非聚合规则。 |
-| R-DATA-005 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.5 固化软删与删除任务追踪。 |
-| R-DATA-006 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义 embedded 组件不进入共享关联模型。 |
-| R-DATA-007 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义应用详情读模型字段集合。 |
-| R-DATA-008 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.5 定义关系变更审计事件最小字段。 |
+| R-DATA-001 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.3 与 7.3 定义关系持久化与 relations 查询端点。 |
+| R-DATA-002 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义宿主与 embedded 归属。 |
+| R-DATA-003 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.2/5.3 定义 visibility 与 owner。 |
+| R-DATA-004 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.3 固化 Query 非聚合规则。 |
+| R-DATA-005 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.5 固化软删与删除任务追踪。 |
+| R-DATA-006 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义 embedded 组件不进入共享关联模型。 |
+| R-DATA-007 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.3、7.3、14.1.5 定义应用详情与 relations 读模型字段集合。 |
+| R-DATA-008 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.5 定义关系变更审计事件最小字段。 |
 | R-OPS-001 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
 | R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.6、5.2.3、8.1、8.4 统一幂等口径并与 `requirements.md` 对齐。 |
 | R-OPS-003 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
@@ -2765,7 +2889,7 @@ flowchart LR
 | 幂等唯一性表达统一为“`idempotency_scope` 唯一 + `idempotency_key` 审计” | R-OPS-002 | 待补充 | 已覆盖 | 2.6、5.2.3、8.1、8.4、14.1.2 |
 | 配额统计与审计报表仅按 5 类一级资源聚合 | R-ABS-007 | 待补充 | 已覆盖 | 4.2、13.5、14.1.2 |
 | 下载导出到外部环境导入成功闭环与 E2E 证据定义 | R-PKG-004、R-PKG-006 | 待补充 | 已覆盖 | 4.8、14.1、14.1.2、14.2.2 |
-| embedded 组件独立运维权限与可见性统一 | R-DSP-010、R-DSP-011 | 待补充 | 已覆盖 | 10.2、11.3、14.1.2 |
+| embedded 组件独立运维权限与可见性统一 | R-DSP-010、R-DSP-011 | 待补充 | 已覆盖 | 10.2、11.3、14.1.2、14.1.5 |
 | `allow_multi_instance` 默认值与变更策略定稿，并收敛开放问题 | R-LCP-008 | 待补充 | 已覆盖 | 4.4、15.3.3 |
 
 #### 14.4.7 T10 幂等基线一致性回标记录（2026-02-23）
@@ -2783,6 +2907,15 @@ flowchart LR
 | 仓库绑定 rollback 内部接口与请求模型补齐（路径、字段、错误码） | R-ENV-006 | 待补充 | 已覆盖 | 7.6、7.2、14.1.4 |
 | 回滚执行链路补齐（版本切换 -> 凭证重下发 -> 结果回写 -> 审计/事件） | R-ENV-006、R-ENV-007 | 待补充 | 已覆盖 | 4.1、8.7、10.5 |
 | 验收闭环补齐（成功回滚、版本不存在、越权、重复请求幂等复用） | R-ENV-006 | 待补充 | 已覆盖 | 14.1（`TC-ENV-04`）、14.1.4、15.2.2 |
+
+#### 14.4.9 T12 语义缺口补齐回标记录（2026-02-23）
+
+| 回标项 | 关联需求 | T12 前状态 | T12 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| embedded 独立运维权限口径对齐（超管独立接口 + 宿主派生运维） | R-DSP-010、R-DSP-011 | 待补充 | 已覆盖 | 10.2、11.3、14.1.5 |
+| `applications relations` canonical path 与 OpenAPI 落盘补齐 | R-DATA-001~008（接口契约要求） | 待补充 | 已覆盖 | 7.3、7.5、14.1.1、14.1.5 |
+| `workspace-cluster/registry` 绑定可变更契约补齐（新增/更新/解绑/回滚） | R-ENV-002、R-ENV-006 | 待补充 | 已覆盖 | 4.1、7.6、8.8、14.1.5 |
+| 覆盖回标与变更复核链路补齐 | R-DSP-010、R-DSP-011、R-ENV-002、R-ENV-006 | 待补充 | 已覆盖 | 14.4.3、14.4.9、15.2.2 |
 
 ## 15. 交付物与需求管理
 
@@ -2828,10 +2961,12 @@ flowchart LR
    （含 `IDEMPOTENCY_PAYLOAD_MISMATCH`）一致。
 6. 绑定回滚契约复核：凡涉及 `R-ENV-006/R-ENV-007` 的变更，必须同步核对
    回滚接口契约（7.6）、执行链路（8.7）与验收用例（14.1.4），确保“可回滚”可调用、可审计、可验收。
-7. 设计追踪更新：更新本文件 `14.4` 覆盖表，调整受影响需求 ID 的章节映射与状态。
-8. 设计正文更新：更新受影响章节（如 4/5/6/7/8/9/10/11/12/13/14）。
-9. 任务同步：更新 `docs/task/task_design.md` 的任务状态、DoD 与依赖关系。
-10. 评审与发布：完成评审后再进入实现任务拆分，禁止“需求已改、设计未改”直接开发。
+7. T12 缺口类型复核：凡涉及权限口径冲突、接口缺项、绑定可变更契约缺项，
+   必须同步核对 `10.2/11.3`、`7.3/7.5`、`4.1/7.6/8.8` 与 `14.1/14.4` 证据闭环。
+8. 设计追踪更新：更新本文件 `14.4` 覆盖表，调整受影响需求 ID 的章节映射与状态。
+9. 设计正文更新：更新受影响章节（如 4/5/6/7/8/9/10/11/12/13/14）。
+10. 任务同步：更新 `docs/task/task_design.md` 的任务状态、DoD 与依赖关系。
+11. 评审与发布：完成评审后再进入实现任务拆分，禁止“需求已改、设计未改”直接开发。
 
 #### 15.2.3 版本规则
 
@@ -2861,7 +2996,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T11）
+#### 15.3.1 设计自检记录（T12）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -2872,6 +3007,7 @@ flowchart LR
 | T9 语义补齐 | 通过 | 已补齐 5 个缺口并在 14.4.6 回标，未触发需求基线偏离 |
 | T10 幂等基线一致性修订 | 通过 | 已完成 requirements/design/decision/task 四文档联动，14.1.3 与 14.4.7 证据闭环 |
 | T11 仓库绑定回滚契约补齐 | 通过 | 已补齐 7.2/7.6/8.7/10.5 契约与执行链路，14.1.4 与 14.4.8 证据闭环 |
+| T12 语义缺口补齐（权限/接口/绑定变更） | 通过 | 已补齐 4.1、7.3、7.5、7.6、8.8、10.2、11.3、14.1.5、14.4.9 与 15.2 复核链路 |
 | 遗漏检查 | 有残余风险 | 以下开放问题不阻断编码，但会影响上线效率或运维成本 |
 
 #### 15.3.2 开放问题（需闭环）

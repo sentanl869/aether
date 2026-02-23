@@ -670,3 +670,28 @@
   - 验收矩阵新增 `TC-ENV-04` 及四个子场景（成功回滚、版本不存在、越权调用、重复请求幂等复用）。
   - `task_design.md` 的 T11 与 T11-01~T11-03 可标记完成，并关闭 GAP-13。
 - 替代关系：对 ADR-036（解绑恢复窗口）与 ADR-085（契约冲突修订）的“回滚可执行性”补充内部接口与任务编排层实现口径，以本 ADR 为当前生效口径。
+
+### ADR-089: T12 语义缺口补齐定稿为“权限单口径 + relations 落盘 + 绑定可变更契约完整化”
+
+- 决策：
+  - `embedded` 独立运维权限按需求矩阵定稿为“双路径”：
+    `dataservices` 路径对 embedded 一律 `404`（保持共享视图隔离）；
+    新增超管专用路径
+    `/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/embeddeddataservices/{embedded_dataservice_id}`
+    支持独立运维；普通用户访问返回 `403 FORBIDDEN_ACTION`。
+  - 高代码关系查询端点固定纳入 canonical path 与 OpenAPI：
+    `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/relations`。
+  - `workspace-cluster/registry` 绑定“可变更”契约补齐为
+    “新增 + 更新 + 解绑 + 回滚”全链路：
+    `POST/PUT /internal/v1/workspace-cluster-bindings`、
+    `POST/PUT /internal/v1/workspace-registry-bindings`、
+    `:freeze/:validate/:recover/:reclaim/:rollback`，并统一任务化、幂等、审计与补偿语义。
+- 原因：
+  - T11 后仍存在 3 类剩余缺口：权限矩阵与正文冲突、relations 端点缺失、绑定“可变更”仅有描述无完整契约。
+  - 若不在设计层统一，会出现“需求已覆盖但接口不可调用/不可验收”的落地风险。
+- 影响：
+  - `design.md` 已同步修订 `4.1`、`7.3`、`7.5`、`7.6`、`8.8`、
+    `10.2`、`11.3`、`14.1.5`、`14.4.9`、`15.2`。
+  - 验收补齐 `TC-DSP-04`、`TC-DATA-02`、`TC-ENV-05`，并将 `KS-12` 更新为权限分流口径。
+  - `task_design.md` 的 T12 与 T12-01~T12-04 可标记完成并关闭 GAP-14~GAP-16。
+- 替代关系：对 ADR-086（embedded 权限旧口径）与 ADR-088（仅回滚契约）做实现级补全，以本 ADR 为当前生效口径。
