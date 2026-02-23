@@ -489,3 +489,28 @@
 - 决策：为 `WorkspaceClusterBinding` 显式持久化解绑生命周期状态：`Active/Frozen/Validating/RecoveryWindow/Reclaiming/ReclaimFailed/Unbound`。
 - 原因：解绑流程跨越异步任务与 24h 恢复窗口，仅靠任务日志无法稳定表达当前阶段和恢复入口。
 - 影响：解绑、恢复、回收接口均以绑定状态机驱动；审计与告警可按状态直接检索与追踪。
+
+## 2026-02-23
+
+### ADR-073: 外部资源 API 路径统一为 workspace+cluster 分层
+
+- 决策：对外资源接口统一采用
+  `/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/...`
+  路径模式；CUD 统一异步，Query 保持同步。
+- 原因：在接口层显式固定租户与部署边界，减少跨边界误用；同时与需求中的异步变更模型保持一致。
+- 影响：OpenAPI 分组、鉴权中间件和 handler 参数绑定均按该路径结构落地；禁止从请求体覆盖 `workspace_id/cluster_id`。
+
+### ADR-074: 幂等键采用“作用域哈希 + 请求指纹”双重校验
+
+- 决策：`Idempotency-Key` 去重不做全局唯一，改为
+  `actor_id + workspace_id + cluster_id + method + route_template + idempotency_key`
+  组成作用域；同作用域若请求指纹不一致返回
+  `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
+- 原因：避免不同接口或不同资源误命中同一幂等记录，同时阻断同键改参导致的语义歧义。
+- 影响：任务生产者需维护幂等作用域与请求指纹；API 错误模型新增 `IDEMPOTENCY_PAYLOAD_MISMATCH`。
+
+### ADR-075: 任务取消采用协作式中断，不强制终止执行进程
+
+- 决策：任务取消语义定义为：`Pending` 可直接取消，`Running` 仅设置 `cancel_requested` 标记，由执行器在阶段边界检查并协作中断。
+- 原因：K8S/OCI 操作多为外部副作用，强杀执行进程会放大中间态与资源漂移风险。
+- 影响：任务模型新增取消标记字段；适配器需在关键步骤间插入取消检查点，并记录取消审计轨迹。

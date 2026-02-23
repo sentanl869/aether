@@ -737,29 +737,422 @@ flowchart LR
 
 ### 7.1 通用契约（前缀、幂等、并发控制、响应结构）
 
+- 协议与前缀：
+  - Base URL：`/api/v1`
+  - 媒体类型：`application/json`
+  - 认证：`Authorization: Bearer <token>`
+- 租户上下文：
+  - 外部资源接口统一采用工作空间/集群分层路径：
+    `/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/...`
+  - 服务端以路径参数为准注入租户上下文，禁止请求体覆盖 `workspace_id/cluster_id/namespace`。
+- 同步与异步语义：
+  - Query（GET）：同步返回领域读模型。
+  - CUD（POST/PATCH/DELETE）：统一返回 `202 Accepted + task_id`，由任务系统异步执行。
+- 幂等控制：
+  - 所有 CUD 必须携带 `Idempotency-Key`（长度 8~128）。
+  - 24h 内同作用域重复提交返回首次 `task_id`（见 8.4）。
+- 并发控制：
+  - 更新与删除必须提交 `resource_version`。
+  - 版本不一致返回 `409 RESOURCE_VERSION_CONFLICT`。
+- 请求追踪：
+  - 可选 `X-Request-Id`；未传时服务端生成并回传。
+  - 所有响应均回传 `request_id`。
+
+统一响应结构：
+
+```json
+{
+  "code": "OK",
+  "message": "success",
+  "request_id": "req_01J...",
+  "data": {}
+}
+```
+
+异步提交响应（`202`）：
+
+```json
+{
+  "code": "ACCEPTED",
+  "message": "task accepted",
+  "request_id": "req_01J...",
+  "data": {
+    "task_id": "2de65c58-9e35-4f63-8cc4-3fb1beebf18c",
+    "status": "Pending",
+    "deduplicated": false
+  }
+}
+```
+
+错误响应结构：
+
+```json
+{
+  "code": "RESOURCE_VERSION_CONFLICT",
+  "message": "resource_version mismatch",
+  "request_id": "req_01J...",
+  "error": {
+    "retryable": false,
+    "details": [
+      {
+        "field": "resource_version",
+        "reason": "expected 17, got 16"
+      }
+    ]
+  }
+}
+```
+
+分页与过滤约定（列表 Query 通用）：
+
+- `page`（默认 1）、`page_size`（默认 20，最大 100）
+- `sort`（如 `created_at.desc`）
+- `status`、`keyword`、`visibility`（按资源域可选）
+
 ### 7.2 错误码与异常模型
+
+错误码分层：
+
+- HTTP 状态码：表达传输层语义（认证失败、未找到、冲突等）。
+- 业务错误码：表达稳定可编程语义，供前端和自动化重试策略消费。
+
+最小错误码集合（T3）：
+
+| HTTP | 业务码 | 场景 | 是否可重试 |
+| --- | --- | --- | --- |
+| 400 | `INVALID_ARGUMENT` | 参数缺失、格式非法 | 否 |
+| 401 | `UNAUTHORIZED` | Token 无效或过期 | 否 |
+| 403 | `FORBIDDEN` | 非法工作空间、角色越权 | 否 |
+| 404 | `RESOURCE_NOT_FOUND` | 资源不存在或已软删 | 否 |
+| 409 | `RESOURCE_VERSION_CONFLICT` | `resource_version` 冲突 | 否 |
+| 409 | `REFERENCE_CONFLICT` | `cascade=true` 时共享组件仍被引用（R-HCA-012） | 否 |
+| 409 | `RESOURCE_BUSY` | 同资源已有 Running/Pending 任务 | 是 |
+| 409 | `IDEMPOTENCY_PAYLOAD_MISMATCH` | 同幂等键但请求指纹不一致 | 否 |
+| 422 | `SCHEMA_VALIDATION_FAILED` | 模板/制品参数校验失败 | 否 |
+| 429 | `TOO_MANY_REQUESTS` | 请求超限/队列限流 | 是 |
+| 500 | `INTERNAL_ERROR` | 未分类服务端错误 | 视情况 |
+| 503 | `DEPENDENCY_UNAVAILABLE` | K8S/OCI/DB 短暂不可用 | 是 |
+
+异常字段约定：
+
+- `code`：稳定业务码（机器可读）。
+- `message`：可读摘要（人读）。
+- `error.retryable`：调用方是否可自动重试。
+- `error.details[]`：字段级错误（`field/reason`）。
 
 ### 7.3 资源接口分组与路径规范
 
+资源分组：
+
+<!-- markdownlint-disable MD013 -->
+| 分组 | Tag | 路径前缀 |
+| --- | --- | --- |
+| 数据服务组件 | `DataService` | `/workspaces/{workspace_id}/clusters/{cluster_id}/data-services` |
+| 低代码平台 | `LowCodePlatform` | `/workspaces/{workspace_id}/clusters/{cluster_id}/lowcode-platforms` |
+| DevBox | `DevBox` | `/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes` |
+| 网关 | `Gateway` | `/workspaces/{workspace_id}/clusters/{cluster_id}/gateways` |
+| 高代码应用 | `HighCodeApplication` | `/workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications` |
+| Agent 实例 | `AgentInstance` | `/workspaces/{workspace_id}/clusters/{cluster_id}/agent-instances` |
+| 异步任务 | `AsyncTask` | `/workspaces/{workspace_id}/clusters/{cluster_id}/tasks` |
+<!-- markdownlint-enable MD013 -->
+
+标准 CRUD 模板（示例）：
+
+- Create：`POST /.../{resources}`
+- List：`GET /.../{resources}`
+- Get：`GET /.../{resources}/{resource_id}`
+- Update：`PATCH /.../{resources}/{resource_id}`
+- Delete：`DELETE /.../{resources}/{resource_id}?resource_version=<n>&cascade=<bool>`
+
+高代码发布与制品接口：
+
+- 发布：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/releases`
+- 发布记录：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/releases`
+- 下载 Chart：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/highcode-applications/{application_id}/releases/{release_version}/download`
+
+任务接口：
+
+- 查询任务：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}`
+- 任务列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks?resource_kind=&resource_id=&status=`
+- 取消任务：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}:cancel`
+
+关键请求 Schema（OpenAPI 组件）：
+
+```yaml
+AsyncAccepted:
+  type: object
+  required: [task_id, status, deduplicated]
+  properties:
+    task_id: { type: string, format: uuid }
+    status:
+      type: string
+      enum: [Pending, Running, Succeeded, Failed, Canceled]
+    deduplicated: { type: boolean }
+
+UpdateRequest:
+  type: object
+  required: [resource_version, spec]
+  properties:
+    resource_version: { type: integer, format: int64, minimum: 1 }
+    spec: { type: object, additionalProperties: true }
+
+ReleaseCreateRequest:
+  type: object
+  required: [resource_version]
+  properties:
+    resource_version: { type: integer, format: int64, minimum: 1 }
+    release_version: { type: string, minLength: 1, maxLength: 64 }
+    values_override: { type: object, additionalProperties: true }
+```
+
 ### 7.4 Query 读路径与非聚合语义
+
+读路径规则（落实 `R-DATA-004` 与 `ADR-056`）：
+
+- Query 仅读取控制面读模型（PostgreSQL 快照 + 最近任务信息）。
+- 不在 Query 阶段触发跨资源实时聚合计算。
+- 详情接口展示成员列表及各自状态，不重算“应用聚合状态”。
+
+应用详情固定返回结构（示例字段）：
+
+- `application`：应用主信息与 `status/resource_version/last_task`
+- `agent_instances[]`：成员 Agent 的独立状态
+- `dataservice_instances[]`：区分 `shared/embedded` 与 `owner`
+- `release_charts[]`：发布版本与 `chart_ref/digest/status`
+
+读一致性策略：
+
+- 默认 `read_committed`；
+- 若请求带 `?consistent=true`，在单次事务中读取主资源与关系表，保证详情页同读一致。
 
 ### 7.5 OpenAPI 3.0 组织方式
 
+规范组织：
+
+- 根文件：`openapi/aether-deploy.yaml`
+- 分文件：按 tag 拆分 `paths/*.yaml`，共用模型放 `components/schemas/*.yaml`
+- 复用对象：`components/parameters`（分页、路径参数、`resource_version`）
+- 安全定义：`components/securitySchemes/BearerAuth`
+
+OpenAPI 统一约束：
+
+- 每个 CUD 接口声明请求头参数 `Idempotency-Key`（`required: true`）。
+- 每个 Update/Delete 请求显式声明 `resource_version`。
+- 每个异步接口响应必须包含 `202` 与 `AsyncAccepted`。
+- 每个接口统一定义错误响应：`400/401/403/404/409/422/429/500/503`（按适用裁剪）。
+
+落地建议：
+
+- 使用 `oapi-codegen` 生成 Gin handler 接口与模型；
+- handler 层只做鉴权与参数绑定，业务语义下沉 service；
+- service 统一调用任务生产器，禁止绕过任务框架直接写 K8S。
+
 ### 7.6 内部接口与事件契约（workspace/cluster/registry 绑定与解绑）
+
+内部接口（平台内调用，不对租户开放）：
+
+<!-- markdownlint-disable MD013 -->
+| 接口 | 方法 | 语义 |
+| --- | --- | --- |
+| `/internal/v1/workspace-cluster-bindings/{binding_id}:freeze` | `POST` | 发起解绑冻结（含二次确认） |
+| `/internal/v1/workspace-cluster-bindings/{binding_id}:validate` | `POST` | 校验冻结后任务与资源状态 |
+| `/internal/v1/workspace-cluster-bindings/{binding_id}:recover` | `POST` | 24h 窗口内撤销解绑 |
+| `/internal/v1/workspace-cluster-bindings/{binding_id}:reclaim` | `POST` | 执行 namespace 回收 |
+| `/internal/v1/workspace-registry-bindings/{binding_id}:rotate-credential` | `POST` | 轮转仓库凭证并触发下发 |
+<!-- markdownlint-enable MD013 -->
+
+事件主题与载荷（Outbox -> EventBus）：
+
+- `workspace.binding.state.changed.v1`
+- `workspace.registry.credential.rotated.v1`
+- `task.lifecycle.changed.v1`
+
+`workspace.binding.state.changed.v1` 载荷示例：
+
+```json
+{
+  "event_id": "evt_01J...",
+  "binding_id": "a6f4dcae-88dc-4315-8f6f-d8f489fb0a00",
+  "workspace_id": "ws_...",
+  "cluster_id": "cl_...",
+  "from_status": "Validating",
+  "to_status": "RecoveryWindow",
+  "occurred_at": "2026-02-23T10:00:00Z"
+}
+```
 
 ## 8. 异步任务与执行编排设计
 
 ### 8.1 任务模型与串行化键
 
+- 任务实体：`async_tasks`（见 5.2.3），关键字段如下。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `task_id` | `uuid` | 主键 |
+| `task_type` | `text` | `create/update/delete/release/export/...` |
+| `resource_kind` | `text` | 一级资源或支撑资源类型 |
+| `resource_id` | `uuid/null` | 目标资源 ID（创建前可空） |
+| `workspace_id/cluster_id` | `uuid` | 租户与部署边界 |
+| `serialized_key` | `text` | 串行化执行键 |
+| `idempotency_scope` | `text` | 幂等作用域哈希（见 8.4） |
+| `status` | `text` | `Pending/Running/Succeeded/Failed/Canceled` |
+| `retry_count/max_retry` | `int` | 重试计数与上限 |
+| `timeout_seconds` | `int` | 任务超时阈值 |
+| `cancel_requested` | `bool` | 协作式取消标记 |
+| `payload/result` | `jsonb` | 输入上下文与输出结果 |
+
+串行化键规则（对应 `R-OPS-005`）：
+
+- 有 `resource_id`：`ws:{ws}:cl:{cl}:rk:{kind}:id:{id}`
+- 创建前无 `resource_id`：`ws:{ws}:cl:{cl}:rk:{kind}:name:{normalized_name}`
+- 发布任务：`ws:{ws}:cl:{cl}:rk:highcode_application:id:{app_id}:release`
+- 解绑链路：`ws:{ws}:cl:{cl}:rk:workspace_cluster_binding:id:{binding_id}`
+
 ### 8.2 生产者流程
+
+生产者位于 API Service（Handler -> Service -> TaskProducer）：
+
+1. 校验认证、工作空间边界、参数 schema、`resource_version`。
+2. 计算幂等作用域并查重（24h）。
+3. 命中幂等记录：直接返回历史 `task_id`。
+4. 未命中：在单事务内写入 `async_tasks`、审计草稿、Outbox 事件。
+5. 提交事务后投递队列（至少一次）。
+6. 返回 `202 + task_id`。
+
+```mermaid
+sequenceDiagram
+  participant H as Handler
+  participant S as Service
+  participant DB as PostgreSQL
+  participant Q as Queue
+
+  H->>S: CUD 请求 + Idempotency-Key
+  S->>DB: 参数/权限/resource_version 校验
+  S->>DB: 幂等作用域查重
+  alt 命中
+    S-->>H: 返回历史 task_id
+  else 未命中
+    S->>DB: 事务写 async_tasks + outbox + audit_draft
+    S->>Q: publish(task_id)
+    S-->>H: 202 Accepted
+  end
+```
 
 ### 8.3 消费者流程
 
+消费者位于 Worker（QueueConsumer -> Executor -> Adapter）：
+
+1. 通过 `FOR UPDATE SKIP LOCKED` 抢占可执行任务。
+2. 对 `serialized_key` 加分布式互斥锁。
+3. 状态置 `Running` 并写 `started_at`。
+4. 构造统一执行上下文（模板/制品、凭证、cluster client）。
+5. 调用 `DeployAdapter` 执行 `apply/upgrade/delete/package/push`。
+6. 成功：回写资源状态、任务结果、审计完成事件。
+7. 失败：按 8.5 判定重试或终态失败，必要时进入 8.6 补偿。
+
+```mermaid
+flowchart TD
+  A[Poll Pending Task] --> B{Claim Success?}
+  B -- No --> A
+  B -- Yes --> C[Acquire serialized_key lock]
+  C --> D[Mark Running + started_at]
+  D --> E[Build Execution Context]
+  E --> F[Invoke DeployAdapter]
+  F --> G{Success?}
+  G -- Yes --> H[Write resource snapshot + task Succeeded + audit]
+  G -- No --> I{Retryable and retry_count < max_retry?}
+  I -- Yes --> J[Schedule retry with backoff]
+  I -- No --> K[Mark Failed and enqueue compensation]
+```
+
 ### 8.4 幂等与去重策略
+
+幂等作用域（避免全局键冲突）：
+
+- `idempotency_scope = hash(`
+  `actor_id + workspace_id + cluster_id + method + route_template + idempotency_key)`
+- 去重窗口：24 小时（从首次接收时间起算）。
+
+判定规则：
+
+- 作用域存在且请求指纹（规范化 body + query）一致：返回原 `task_id`。
+- 作用域存在但请求指纹不一致：返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
+- 作用域不存在：创建新任务并写入作用域记录。
+
+实现要点：
+
+- 幂等记录与任务写入同事务提交，避免“查重命中但任务不存在”。
+- 过期记录按 TTL 定时清理，不影响历史审计表。
 
 ### 8.5 重试、超时与取消策略
 
+重试策略（对应 `R-OPS-007`）：
+
+- 默认最大重试 `5` 次。
+- 退避：`5s -> 15s -> 45s -> 135s -> 300s`。
+- 可重试错误：`DEPENDENCY_UNAVAILABLE`、网络抖动、临时锁冲突。
+- 不可重试错误：参数错误、权限错误、引用冲突、版本冲突。
+
+超时策略：
+
+| 任务类型 | 默认超时 |
+| --- | --- |
+| `create/update` | 30 分钟 |
+| `delete` | 15 分钟 |
+| `release/export` | 20 分钟 |
+| `freeze/validate/recover/reclaim` | 10 分钟 |
+
+取消策略：
+
+- API：`POST /.../tasks/{task_id}:cancel`
+- `Pending`：直接转 `Canceled`。
+- `Running`：置 `cancel_requested=true`，适配器在阶段边界检查并协作中断。
+- 取消成功后写入审计 `action=cancel_task` 与 `canceled_by/canceled_at`。
+
 ### 8.6 补偿与一致性策略
+
+补偿触发场景（对应 `R-OPS-009`）：
+
+- 删除宿主资源后嵌入式组件回收失败。
+- 创建/升级过程中部分 K8S 对象成功、部分失败。
+- 发布流程中“打包成功但推送失败”。
+
+一致性策略：
+
+- 任务状态与资源快照回写采用单事务，避免“任务成功但资源状态未更新”。
+- 跨系统副作用（K8S/OCI）采用 Outbox 记录步骤，失败后按步骤反向补偿。
+- 补偿任务独立 `task_type=compensation`，继承原 `serialized_key` 串行执行。
+
+补偿时序（删除宿主 + 嵌入式回收失败）：
+
+```mermaid
+sequenceDiagram
+  participant W as Worker
+  participant K as K8S
+  participant DB as PostgreSQL
+  participant CQ as Compensation Queue
+
+  W->>K: 删除宿主资源
+  W->>K: 删除 embedded 组件
+  K-->>W: embedded 删除失败
+  W->>DB: 主任务标记 Failed + failure_reason
+  W->>DB: 写 compensation task(Pending)
+  W->>CQ: 投递 compensation task
+  CQ->>W: 重试回收
+  W->>K: 幂等删除 embedded
+  W->>DB: 回写 Succeeded/Failed
+```
+
+结果字段最小集合（对应 `R-OPS-008`）：
+
+- `resource_kind`
+- `resource_id`
+- `started_at`
+- `ended_at`
+- `failure_reason`
+- `retry_count`
+- `serialized_key`
 
 ## 9. 资源编排与 K8s 交互设计
 
@@ -949,15 +1342,15 @@ flowchart LR
 | R-DATA-007 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义应用详情读模型字段集合。 |
 | R-DATA-008 | 4.9、5.3、5.5、11.3、12.6 | 已覆盖 | 已在 5.5 定义关系变更审计事件最小字段。 |
 | R-OPS-001 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
-| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 待补充 | T3 细化幂等、并发控制、串行化、补偿与审计。 |
+| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、8.4 固化 24h 幂等去重。 |
 | R-OPS-003 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
-| R-OPS-004 | 4.10、7.1~7.6、8.1~8.6、12.6 | 待补充 | T3 细化幂等、并发控制、串行化、补偿与审计。 |
-| R-OPS-005 | 4.10、7.1~7.6、8.1~8.6、12.6 | 待补充 | T3 细化幂等、并发控制、串行化、补偿与审计。 |
-| R-OPS-006 | 4.10、7.1~7.6、8.1~8.6、12.6 | 待补充 | T3 细化幂等、并发控制、串行化、补偿与审计。 |
-| R-OPS-007 | 4.10、7.1~7.6、8.1~8.6、12.6 | 待补充 | T3 细化幂等、并发控制、串行化、补偿与审计。 |
-| R-OPS-008 | 4.10、7.1~7.6、8.1~8.6、12.6 | 待补充 | T3 细化幂等、并发控制、串行化、补偿与审计。 |
-| R-OPS-009 | 4.10、7.1~7.6、8.1~8.6、12.6 | 待补充 | T3 细化幂等、并发控制、串行化、补偿与审计。 |
-| R-OPS-010 | 4.10、7.1~7.6、8.1~8.6、12.6 | 待补充 | T3 细化幂等、并发控制、串行化、补偿与审计。 |
+| R-OPS-004 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、7.3 固化工作空间/集群边界与错误模型。 |
+| R-OPS-005 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.1 固化串行化键模型与同资源串行执行。 |
+| R-OPS-006 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、7.3 固化版本并发控制契约。 |
+| R-OPS-007 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.5 固化重试、超时、取消语义。 |
+| R-OPS-008 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 明确任务结果最小字段集合。 |
+| R-OPS-009 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 固化补偿触发与一致性策略。 |
+| R-OPS-010 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、8.2、8.3 纳入关键动作审计点。 |
 | NFR-001 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
 | NFR-002 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
 | NFR-003 | 10、11、12、13、14.1、14.2 | 待补充 | T5/T6 细化量化指标、监控口径与验收方案。 |
