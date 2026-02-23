@@ -821,3 +821,24 @@
   - `task_design.md` 的 T18 与 T18-01~T18-04 可标记完成，并关闭 GAP-24。
   - 后续涉及幂等字段的改动必须执行“命名一致性复核”，否则不得回标 `已覆盖`。
 - 替代关系：对 ADR-085/ADR-087 中幂等口径结论补充“字段命名治理”实现约束，以本 ADR 作为 T18 生效口径。
+
+### ADR-095: T19 执行基础设施与主数据边界定稿为“PG 队列与锁 + Outbox Relay + JetStream + 表级写入责任矩阵”
+
+- 决策：
+  - 任务队列定稿为 PostgreSQL `async_tasks` + lane 分层（`lane_reclaim_high/lane_cud/lane_projection`），消费采用 `FOR UPDATE SKIP LOCKED`。
+  - 分布式锁定稿为 PostgreSQL advisory lock，并引入 `fencing_token` 防止过期持锁写入覆盖新执行。
+  - 事件链路定稿为 PostgreSQL Outbox + 轮询 Relay + NATS JetStream（至少一次投递，`event_id` 去重，DLQ 重放）。
+  - 主数据读写边界定稿：
+    - `workspaces/managed_clusters` 由平台管理面独占写入，Aether 只读；
+    - `workspace_*_bindings` 由 Aether internal API 作为唯一写入入口；
+    - 禁止跨服务直连写入对方 owner 表。
+  - 越界写入定稿为“DB 权限拒绝 + 触发器审计 + P1 告警”三层防护。
+- 原因：
+  - T18 完成后仍存在 GAP-25/GAP-26：执行底座虽有流程描述但缺技术定稿，主数据边界缺实现级约束，存在落地歧义与越界风险。
+  - 当前吞吐目标（峰值 `>=2.4 task/s`）下，PG 队列方案可满足性能且能保证任务与状态同事务一致性。
+  - 绑定变更链路需要可靠事件分发与可重放能力，Outbox + JetStream 组合可在复杂度与可靠性间取得平衡。
+- 影响：
+  - `design.md` 已同步修订 `3.2`、`4.1`、`5.7`、`7.6`、`8.1~8.9`、`11.2`、`12.2`、`13.1`、`14.1.11`、`14.4.16`、`15.2`、`15.3`。
+  - `task_design.md` 的 T19 与 T19-01~T19-05 可标记完成，并关闭 GAP-25/GAP-26。
+  - OQ-04（任务优先级策略）关闭，后续如调整 lane 配额需走 `15.2` 变更流程并回标。
+- 替代关系：补充并收敛 ADR-088（绑定回滚编排）与 ADR-092（执行链路补遗）中的执行底座未定项，以本 ADR 作为 T19 生效口径。
