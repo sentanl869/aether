@@ -4,9 +4,59 @@
 
 ### 1.1 版本记录
 
+| 版本 | 日期 | 变更摘要 | 关联任务/决策 |
+| --- | --- | --- | --- |
+| `v0.1.0` | `2026-01-28` | 建立文档骨架与追踪/变更基线。 | `T1`、`ADR-001~ADR-015` |
+| `v0.2.0` | `2026-02-11` | 补齐架构、模型、状态机与接口主链路。 | `T2~T4`、`ADR-016~ADR-031` |
+| `v0.3.0` | `2026-02-19` | 补齐安全、观测、NFR 与回滚方案。 | `T5~T6`、`ADR-032~ADR-038` |
+| `v1.0.0` | `2026-02-23` | 完成第 1 章文档元信息收口（版本、术语、参考），形成可评审基线版本。 | 文档收口 |
+
+文档状态：
+
+- 当前状态：`Baseline Frozen`（可用于评审、任务拆分与编码实现）。
+- 适用阶段：Aether 部署模块设计阶段（实现前）。
+- 变更入口：统一遵循 `15.2 需求变更管理流程`。
+
 ### 1.2 术语与缩写
 
+| 术语/缩写 | 定义 |
+| --- | --- |
+| `Aether` | 部署模块控制面，负责统一资源管理、任务编排、状态回写与审计。 |
+| `Workspace` | 租户与权限边界；每个关联集群映射同名 namespace。 |
+| `Managed Cluster` | 通过 kubeconfig 纳管并可被部署模块调度的 K8S 集群。 |
+| `L1 Resource` | 一级资源，固定 5 类：数据服务组件、低代码平台、DevBox、网关、高代码应用。 |
+| `Supporting Resource` | 支撑资源，如 Agent 实例、制品、发布记录、关系引用、任务与密钥版本等。 |
+| `Template` | 可部署标准单元，当前统一为 Helm Chart + 参数 schema。 |
+| `Artifact` | 高代码来源制品，类型包括 DevBox 发布镜像、用户上传镜像、用户上传 Helm Chart。 |
+| `Instance` | 模板或制品在 `workspace+cluster+namespace` 的运行实例。 |
+| `shared` | 可复用资源可见性，进入共享列表与选择器，可被多个宿主引用。 |
+| `embedded` | 宿主内嵌资源可见性，仅随宿主创建/运维/回收，不进入共享列表。 |
+| `CUD` | Create/Update/Delete 变更操作；本文统一走异步任务模型。 |
+| `Query` | 查询操作；本文统一走同步返回。 |
+| `AsyncTask` | 异步任务实体，承载任务状态、重试、结果与补偿语义。 |
+| `Idempotency-Key` | 变更请求幂等键；24h 去重窗口内重复请求返回同一 `task_id`。 |
+| `resource_version` | 乐观并发控制字段；更新/删除必须携带。 |
+| `ADR` | Architecture Decision Record，记录架构决策、原因、影响与替代关系。 |
+| `NFR` | 非功能需求集合，覆盖性能、可用性、容量、安全、可扩展与可运维约束。 |
+| `OCI` | Open Container Initiative Artifact 规范，本文用于镜像与 Chart 制品存储。 |
+| `DoD` | Definition of Done，任务完成判定标准。 |
+
 ### 1.3 参考文档
+
+| 编号 | 文档/规范 | 路径或来源 | 用途 |
+| --- | --- | --- | --- |
+| `REF-01` | 需求基线文档 | `docs/requirements.md` | 唯一需求源，定义需求 ID 集合。 |
+| `REF-02` | 决策记录文档 | `docs/decision.md` | 提供 ADR 决策依据，约束设计取舍与替代关系。 |
+| `REF-03` | 设计任务跟踪 | `docs/task/task_design.md` | 约束章节任务拆分、DoD 与完成状态。 |
+| `REF-04` | OpenAPI 3.0 规范 | <https://spec.openapis.org/oas/v3.0.3> | 约束 API 契约结构、错误模型与组件复用方式。 |
+| `REF-05` | Kubernetes 文档 | <https://kubernetes.io/docs/home/> | 约束运行时对象语义、namespace/Secret/Workload 行为。 |
+| `REF-06` | Helm 文档（v3） | <https://helm.sh/docs/> | 约束模板打包、渲染、升级回滚与 OCI 分发行为。 |
+
+引用规则：
+
+- 需求与口径冲突时，以 `REF-01` 为准，并通过 `REF-02` 记录决策修订。
+- 设计执行与任务状态冲突时，以 `REF-03` DoD 与状态为准进行修正。
+- API 与部署行为实现需同时满足 `REF-04~REF-06` 的兼容性要求。
 
 ## 2. 需求对齐与设计原则
 
