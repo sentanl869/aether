@@ -842,3 +842,31 @@
   - `task_design.md` 的 T19 与 T19-01~T19-05 可标记完成，并关闭 GAP-25/GAP-26。
   - OQ-04（任务优先级策略）关闭，后续如调整 lane 配额需走 `15.2` 变更流程并回标。
 - 替代关系：补充并收敛 ADR-088（绑定回滚编排）与 ADR-092（执行链路补遗）中的执行底座未定项，以本 ADR 作为 T19 生效口径。
+
+## 2026-02-24
+
+### ADR-096: T20 事件总线替代定稿为“PG Outbox + RabbitMQ Streams（Super Stream）+ 位点与 DLQ 重放双闭环”
+
+- 决策：
+  - EventBus 从 `NATS JetStream` 替代为 `RabbitMQ Streams`，并固定拓扑为
+    `aether.domain.events.v1` Super Stream（`16` 分区）。
+  - `event_outbox.ordering_key` 作为唯一分区输入，分区规则固定
+    `partition = xxhash32(ordering_key) % 16`，同 `ordering_key` 必须同分区有序消费。
+  - Outbox Relay 投递语义保持“至少一次”，消费者继续以
+    `processed_event_id` 幂等表做去重，保留重复投递容忍能力。
+  - 位点管理固定为“Broker offset 提交 + 本地幂等表校验”双保险，
+    提交策略为“每 `1s` 或每 `100` 条消息提交一次”。
+  - 失败闭环固定为“双 DLQ”：
+    Relay 失败进入 `event_outbox_dlq`；
+    Consumer 连续失败进入 `event_consumer_dlq`；
+    super_admin 可通过 `POST /internal/v1/event-dlq/{event_id}:replay` 发起重放。
+- 原因：
+  - T19 后 `design.md` 仍保留 JetStream 专属语义，且未完整定义 RabbitMQ Streams
+    下的分区映射、消费者位点恢复、DLQ/重放规程，存在“选型替代但执行口径未落盘”的实现风险。
+  - 绑定变更事件链路要求可靠分发、可重放、可观测；需要将替代后的语义落实到契约、指标、验收与变更流程四个层面。
+- 影响：
+  - `design.md` 已同步修订 `3.2`、`7.6`、`8.1.1`、`8.6`、`8.9`、`12.2`、`13.1`、
+    `14.1.11`、`14.1.12`、`14.4.17`、`15.2`、`15.3`。
+  - `task_design.md` 的 T20 与 T20-01~T20-05 可标记完成，并关闭 GAP-27~GAP-31。
+  - 新增 OQ-05 关闭记录，确认“消息总线替代”不再存在阻断项。
+- 替代关系：替代 ADR-095 中关于“JetStream 事件总线”的实现口径；其余 PG 队列、advisory lock、主数据写入边界结论继续沿用 ADR-095。
