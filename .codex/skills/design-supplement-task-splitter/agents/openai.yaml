@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Supplement Task Splitter"
+  short_description: "Split supplemental design tasks with coverage checks"
+  default_prompt: "Use $design-supplement-task-splitter to split analysis results into supplemental tasks in docs/task/task_design.md and ensure no missing gaps."

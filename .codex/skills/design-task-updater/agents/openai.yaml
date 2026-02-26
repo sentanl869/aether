@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Task Updater"
+  short_description: "Update design.md by task ID with ADR logging"
+  default_prompt: "Use $design-task-updater to complete T21 from docs/task/task_design.md and update docs/design.md and docs/decision.md."
