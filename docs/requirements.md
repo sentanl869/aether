@@ -86,6 +86,8 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
   不作为控制面领域主实体。
 - 资源模板（Template）：平台内置或管理员导入的 Helm Chart 模板与参数 schema。
 - 资源实例（Instance）：模板或制品在指定工作空间/集群/namespace 的运行实体。
+- `instance_id`：实例 ID，指任意一级资源实例主标识（用于 `/instances/{instance_id}` 路径参数）。
+- `application_id`：应用 ID，指应用聚合对象主标识（用于 `/applications/{application_id}` 路径参数）；与 `instance_id` 语义不同。
 - 高代码制品（HighCode Artifact）：用于高代码应用部署的镜像或 Helm Chart 来源。
 - 嵌入式数据服务（Embedded Data Service）：
   - 随低代码平台部署自动创建的数据服务实例。
@@ -215,22 +217,35 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 - R-DATA-006：嵌入式资源不得出现在共享资源选择器中。
 - R-DATA-007：应用查看页必须展示 Agent 集合、组件集合、入口地址、发布 Chart 版本信息。
 - R-DATA-008：关系变更（绑定/解绑/级联删除）必须记录审计轨迹。
+- R-DATA-009：应用信息查询采用统一 `applications` 接口视图，覆盖至少
+  `HIGH_CODE_APP` 与 `LOW_CODE_PLATFORM` 两类；低代码平台部署后信息查询必须通过应用接口获取。
+- R-DATA-010：需提供“应用下实例信息查询”能力；`GET /api/v1/applications/{application_id}/instances?workspace_id={workspace_id}`。
+  对 `HIGH_CODE_APP` 返回 Agent 实例与组件实例详情，对 `LOW_CODE_PLATFORM` 返回平台子组件与依赖组件实例详情。
 
 ### 10. CRUD、权限与异步任务
 
 - R-OPS-001：数据服务组件、低代码平台、DevBox、网关、高代码应用 5 类资源的 CUD 统一走异步任务模型；Query 同步返回。
-- R-OPS-002：所有 CUD 请求必须支持 `Idempotency-Key`；
-  控制面以 `idempotency_scope` 作为 24h 去重唯一键，
-  同 scope+同请求指纹返回同一 `task_id`，
-  同 scope+异指纹返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
+- R-OPS-002：当前阶段 CUD 接口不强制暴露 `Idempotency-Key` 契约；
+  控制面幂等去重作为内部实现能力保留，后续参数版本可升级为对外必填头。
 - R-OPS-003：权限模型固定为“超级管理员 + 空间管理员 + 用户”，并按工作空间做资源边界控制。
 - R-OPS-004：用户只能操作其已关联工作空间内的高代码应用资源；不得开通/关闭低代码平台、不得创建/删除网关实例、不得变更工作空间与集群/镜像仓库绑定；跨工作空间、跨集群、跨 namespace 请求必须拒绝并审计。
 - R-OPS-005：同资源串行化执行，防止并发更新破坏状态一致性。
-- R-OPS-006：更新/删除必须使用 `resource_version` 并发控制。
+- R-OPS-006：更新/删除当前阶段通过“资源状态前置条件 + 同资源串行化”做并发控制；
+  `resource_version` 作为可选增强能力保留。
 - R-OPS-007：任务需支持重试、超时、取消与失败可诊断信息输出。
-- R-OPS-008：任务执行结果需包含最小字段：`resource_kind`、`resource_id`、`started_at`、`ended_at`、`failure_reason`。
+- R-OPS-008：任务执行结果需包含最小字段：`resource_kind`、`resource_id`、`started_at`、`ended_at`、`failure_reason`；
+  对外查询以资源 `status/progress/error_message` 为主，不单独暴露任务结果接口。
 - R-OPS-009：删除宿主资源时需同时回收其嵌入式资源；回收失败需进入补偿流程并可重试。
 - R-OPS-010：所有关键操作（创建、更新、删除、发布、导出）必须记录审计日志。
+- R-OPS-011：异步 CUD 执行链路需支持前置/后置自定义埋点扩展点，供其他模块在动作前后执行业务逻辑；
+  埋点能力需支持代码级可配置（注册/开关/顺序/阻断策略），不依赖配置文件、控制台配置或持久化配置。
+- R-OPS-012：实例接口需提供完整 OpenAPI 契约：
+  `POST/GET /api/v1/instances`、`GET/PUT/DELETE /api/v1/instances/{instance_id}`、
+  `POST /api/v1/instances/{instance_id}/actions/start|stop|restart`。
+- R-OPS-013：应用接口需提供与实例接口同构的一套 OpenAPI 契约，但不包含 `restart`：
+  `POST/GET /api/v1/applications`、`GET/PUT/DELETE /api/v1/applications/{application_id}`、
+  `POST /api/v1/applications/{application_id}/actions/start|stop`、
+  `GET /api/v1/applications/{application_id}/instances`。
 
 ## 领域模型与唯一性约束（设计输入）
 
@@ -363,10 +378,13 @@ DevBox 补充状态：
 
 任务执行规则：
 
-- CUD 请求必须携带 `Idempotency-Key`；服务端计算
-  `idempotency_scope = sha256(actor_id + workspace_id + cluster_id + method + route_template + idempotency_key)`。
-- `idempotency_scope` 命中且 `request_fingerprint` 一致：返回同一 `task_id`。
-- `idempotency_scope` 命中但 `request_fingerprint` 不一致：返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
+- CUD 请求进入统一任务队列；任务实体作为控制面内部对象，不单独对外提供 Task API。
+- 客户端通过资源详情轮询任务执行进展（`status/progress/error_message`）。
+- 幂等去重、请求指纹冲突判定作为内部能力保留，待参数契约冻结后再对外显式化。
+- 异步 CUD 支持 `before_hook`/`after_hook` 代码扩展点；
+  `before_hook` 用于执行前置校验或上下文改写，`after_hook` 用于执行后置通知或数据同步。
+- 埋点扩展点按资源类型与动作类型（Create/Update/Delete）可配置；
+  配置形态限定为代码注册，不要求配置文件、配置中心或数据库持久化。
 - 去重窗口 24 小时，自首次写入起算；窗口到期后允许生成新任务。
 - 串行化键：`workspace_id:cluster_id:resource_kind:resource_id_or_name`。
 - 重试策略：最多 5 次，指数退避（5s、15s、45s、135s、300s）。
@@ -378,22 +396,20 @@ DevBox 补充状态：
 ### 通用契约
 
 - API 前缀统一为 `/api/v1`。
-- 资源作用域前缀统一为
-  `{scope}=/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}`。
-- CUD 接口必须支持 `Idempotency-Key`。
-- 更新/删除必须使用 `resource_version` 并发控制。
+- 当前阶段资源主路径包含 `/api/v1/instances` 与 `/api/v1/applications` 两套：
+  `/instances` 表示资源实例视图，`/applications` 表示应用聚合视图。
+- `workspace_id` 作为查询与鉴权作用域参数（query）；
+  创建请求体必须包含 `workspace_id` 与 `cluster_id`。
+- CUD 接口统一返回 `202 Accepted`，并通过 `Location` + 资源详情轮询获取异步执行结果。
 - Query 同步返回，支持分页、过滤、排序。
-- 返回统一结构：`request_id`、`code`、`message`、`data`。
+- 返回结构采用“资源对象/列表 + 分页 + 标准错误对象”模式。
 
 ### 错误码最小集合
 
 - `400`：参数非法或 schema 校验失败。
 - `401`：未认证。
-- `403`：无权限。
 - `404`：资源不存在。
-- `409`：并发冲突、引用冲突或 `IDEMPOTENCY_PAYLOAD_MISMATCH`（同作用域幂等键但请求载荷不一致）。
-- `422`：业务规则校验失败（跨边界、单例冲突、发布前置条件不满足等）。
-- `429`：请求限流。
+- `409`：冲突（如同名实例冲突、删除级联冲突等）。
 - `500`：系统内部错误。
 
 ### 资源接口分组
@@ -403,69 +419,30 @@ DevBox 补充状态：
   - 同一路径通过不同 HTTP Method 区分语义，不使用 `POST/GET/LIST` 混写。
   - Path 段尽量使用单一单词的复数名词，避免连字符拼接命名。
 
-- 数据服务组件实例（shared）：
-  - `POST {scope}/dataservices`
-  - `GET {scope}/dataservices`
-  - `GET {scope}/dataservices/{dataservice_id}`
-  - `PUT {scope}/dataservices/{dataservice_id}`
-  - `DELETE {scope}/dataservices/{dataservice_id}`
+- 实例视角接口（当前阶段必选，路径参数统一为 `instance_id`）：
+  - `GET /api/v1/instances`（支持按 `resource_type/status/cluster_id` 等过滤）
+  - `POST /api/v1/instances`
+  - `GET /api/v1/instances/{instance_id}`
+  - `PUT /api/v1/instances/{instance_id}`
+  - `DELETE /api/v1/instances/{instance_id}`
+  - `POST /api/v1/instances/{instance_id}/actions/start`
+  - `POST /api/v1/instances/{instance_id}/actions/stop`
+  - `POST /api/v1/instances/{instance_id}/actions/restart`
 
-- 低代码平台实例：
-  - `POST {scope}/lowcodes`
-  - `GET {scope}/lowcodes`
-  - `GET {scope}/lowcodes/{lowcode_id}`
-  - `PUT {scope}/lowcodes/{lowcode_id}`
-  - `DELETE {scope}/lowcodes/{lowcode_id}`
+- 应用视角接口（当前阶段必选，路径参数统一为 `application_id`）：
+  - `POST /api/v1/applications`（请求体包含 `workspace_id`、`cluster_id`、`resource_type`）
+  - `GET /api/v1/applications?workspace_id={workspace_id}&resource_type={HIGH_CODE_APP|LOW_CODE_PLATFORM}`
+  - `GET /api/v1/applications/{application_id}?workspace_id={workspace_id}`
+  - `PUT /api/v1/applications/{application_id}?workspace_id={workspace_id}`
+  - `DELETE /api/v1/applications/{application_id}?workspace_id={workspace_id}`
+  - `POST /api/v1/applications/{application_id}/actions/start?workspace_id={workspace_id}`
+  - `POST /api/v1/applications/{application_id}/actions/stop?workspace_id={workspace_id}`
+  - `GET /api/v1/applications/{application_id}/instances?workspace_id={workspace_id}`（应用下 Agent/运行实例信息查询）
 
-- DevBox 实例与发布记录：
-  - `POST {scope}/devboxes`
-  - `GET {scope}/devboxes`
-  - `GET {scope}/devboxes/{devbox_id}`
-  - `PUT {scope}/devboxes/{devbox_id}`
-  - `DELETE {scope}/devboxes/{devbox_id}`
-  - `POST {scope}/devboxes/{devbox_id}/publishes`
-  - `GET {scope}/devboxes/{devbox_id}/publishes`
-  - `GET {scope}/publishes/{publish_id}`
-
-- 网关实例：
-  - `POST {scope}/gateways`
-  - `GET {scope}/gateways`
-  - `GET {scope}/gateways/{gateway_id}`
-  - `PUT {scope}/gateways/{gateway_id}`
-  - `DELETE {scope}/gateways/{gateway_id}`
-
-- 资源模板（按类型过滤）：
-  - `GET {scope}/templates?kind=dataservice`
-  - `GET {scope}/templates?kind=lowcode`
-  - `GET {scope}/templates?kind=devbox`
-  - `GET {scope}/templates?kind=gateway`
-  - `GET {scope}/templates/{template_id}`
-
-- 高代码制品：
-  - `GET {scope}/artifacts`
-  - `GET {scope}/artifacts/{artifact_id}`
-
-- Agent 实例：
-  - `POST {scope}/agents`
-  - `GET {scope}/agents`
-  - `GET {scope}/agents/{agent_id}`
-  - `PUT {scope}/agents/{agent_id}`
-  - `DELETE {scope}/agents/{agent_id}`
-
-- 高代码应用与发布产物：
-  - `POST {scope}/applications`
-  - `GET {scope}/applications`
-  - `GET {scope}/applications/{application_id}`
-  - `PUT {scope}/applications/{application_id}`
-  - `DELETE {scope}/applications/{application_id}`
-  - `GET {scope}/applications/{application_id}/relations`
-  - `POST {scope}/applications/{application_id}/releases`
-  - `GET {scope}/applications/{application_id}/charts`
-  - `GET {scope}/charts/{chart_id}/package`
-
-- 异步任务：
-  - `GET {scope}/tasks/{task_id}`
-  - `GET {scope}/tasks/{task_id}/result`
+- 说明：
+  - 现有 OpenAPI 中 `/applications/{application_id}/...` 若实际承载实例语义，应重命名为 `/instances/{instance_id}/...`。
+  - 发布产物（Release/Chart 下载）与模板/制品独立查询接口在后续版本补齐，不作为当前 API 基线阻断项。
+  - 异步任务查询通过资源详情轮询实现，不单独开放 `/tasks/*`。
 
 ## 权限动作矩阵（设计输入）
 
@@ -488,7 +465,7 @@ DevBox 补充状态：
 | 低代码平台内应用 CRUD（平台内鉴权） | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
 | 嵌入式组件独立运维 | 允许（超管专用独立接口） | 拒绝（默认） | 拒绝（仅随宿主管理） | 拒绝 |
 | Secret 明文读取 | 拒绝（仅平台控制面服务账号可读） | 拒绝 | 拒绝 | 拒绝 |
-| 任务状态与结果查询 | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
+| 资源异步执行状态查询（通过资源详情轮询） | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
 
 ## Secret 生命周期与审计（设计输入）
 
@@ -546,18 +523,24 @@ DevBox 补充状态：
 | R-GTW-003 | 每 workspace+cluster 仅允许一个网关实例 | 单元测试 + 集成测试 | 后端 |
 | R-HCA-003 | Chart 渠道可部署多 Agent 并处理 Chart 自带组件 | 集成测试 + E2E | 后端 |
 | R-HCA-012 | `cascade=true` 且共享组件被复用时返回 `409` | 集成测试 | 后端 |
+| R-DATA-009 | 应用信息查询统一走 `applications` 接口并覆盖高代码+低代码平台 | 集成测试 + E2E | 后端 + 前端 |
+| R-DATA-010 | 应用实例查询接口可按应用类型返回对应实例明细 | 集成测试 + E2E | 后端 + 前端 |
 | R-PKG-001 | 发布高代码应用后自动生成可用 Helm Chart 包 | 集成测试 + E2E | 后端 |
 | R-PKG-003 | 发布 Chart 成功推送到工作空间关联仓库并可追溯版本 | 集成测试 | 后端 |
 | R-PKG-004 | 用户可下载发布 Chart 并在外部环境导入成功 | E2E | 前端 + 后端 |
 | R-OPS-001 | 5 类资源 CUD 异步、Query 同步符合契约 | E2E | 前端 + 后端 |
+| R-OPS-011 | 异步 CUD 支持代码级可配置的前后置埋点扩展点，其他模块可注册并生效 | 单元测试 + 集成测试 | 后端 |
+| R-OPS-012 | 实例视角 CURD+start/stop/restart 在 OpenAPI 中完整定义并可用 | 集成测试 + E2E | 后端 + 前端 |
+| R-OPS-013 | 应用视角 CURD+start/stop（无 restart）在 OpenAPI 中完整定义并可用 | 集成测试 + E2E | 后端 + 前端 |
 | NFR-001~005 | 性能与可用性满足量化指标 | 压测 + 运行验收 | SRE + 后端 |
 
 ## 交付物与接口（面向设计）
 
-- OpenAPI 3.0 草案（含 5 类资源、发布制品接口、错误码、幂等与并发控制）。
+- OpenAPI 3.0 草案（基于 `instances` + `applications` 双资源模型，含 5 类资源、状态轮询契约与错误码）。
 - 统一资源抽象模型与 ERD（含 owner/visibility 语义、唯一性约束）。
 - 统一状态机定义（资源状态机、任务状态机、发布包状态机、解绑状态机）。
-- 异步任务与补偿设计说明（串行化键、重试、超时、取消、回收补偿）。
+- 异步任务与补偿设计说明（串行化键、重试、超时、取消、回收补偿；任务为内部模型）。
+- 异步 CUD 埋点扩展机制设计说明（before/after hook、代码注册与执行策略）。
 - 模板与制品适配设计（内置 Helm、导入 Helm、镜像转发布 Chart）。
 - 权限矩阵与鉴权流程说明（角色、workspace 边界、嵌入式资源边界）。
 - NFR 验收报告模板与需求追踪矩阵。
