@@ -914,3 +914,25 @@
   - `task_design.md` 的 T22 与 T22-01~T22-05 可标记完成，并关闭 GAP-37~GAP-41。
   - OQ-06 关闭，后续若调整 Redis 分片数、reclaim 阈值或锁 TTL，必须走 `15.2` 变更流程并更新回标。
 - 替代关系：替代 ADR-095 中“PG 队列/PG advisory lock”执行口径与 ADR-096 中“非 Redis EventBus”执行口径；其余主数据写入边界与 Outbox 事务性结论继续沿用。
+
+### ADR-099: T23 网关配置口径收敛定稿为“配置变更 + 回滚 + 审计（去策略算法化）”
+
+- 决策：
+  - `R-GTW-006` 在设计正文固定为“网关配置支持变更与回滚，并记录变更审计”，不再在 `design.md` 承载流量策略算法（步长、阈值、放量参数）实现细节。
+  - 网关配置契约固定为“任务化变更 + 任务化回滚”双入口：
+    `POST .../gateways/{gateway_id}:apply-config` 与
+    `POST .../gateways/{gateway_id}:rollback-config`；并发约束固定为“同网关单运行任务”。
+  - 配置变更审计字段最小集合固定为：
+    `gateway_change_id`、`gateway_instance_id`、`from_revision`、`to_revision`、
+    `change_reason`、`change_ticket_id`、`rollback_to_revision`、`rollback_reason`、
+    `operator_id`、`task_id`、`started_at`、`completed_at`。
+  - 术语治理固定执行“全文术语扫描 + 验收/回标同步 + 变更流程门禁”，防止历史术语回流。
+- 原因：
+  - `requirements.md` 已将 `R-GTW-006` 收敛为“变更与回滚审计”，但 `design.md` 在 `4.6/14.1/14.4/15.3` 等章节仍保留旧策略模板语义，形成双口径（GAP-42~GAP-45）。
+  - 策略算法属于网关流量治理实现域，不应作为 Aether 控制面强约束；继续保留会导致职责越界与可演进性下降。
+  - 验收与回标链路若不改写，将无法证明新需求口径已闭环。
+- 影响：
+  - `design.md` 已同步修订 `1.1`、`2.3`、`4.6`、`5.8`、`7.3`、`7.6`、`14.1`、`14.3`、`14.4`、`15.1`、`15.2`、`15.3`。
+  - `task_design.md` 的 T23 与 T23-01~T23-04 可标记完成，并关闭 GAP-42~GAP-45。
+  - OQ-07 关闭；后续若恢复旧术语或重新引入策略算法描述，必须走 `15.2` 变更流程并新增 ADR。
+- 替代关系：替代 ADR-090 中“网关策略参数模板”相关口径；ADR-090 中“下载鉴权缓存策略”结论继续有效。
