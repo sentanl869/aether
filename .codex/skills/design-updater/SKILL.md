@@ -1,9 +1,9 @@
 ---
-name: design-task-updater
+name: design-updater
 description: Update docs/design.md for specific task IDs (for example T21) defined in docs/task/task_design.md, using docs/requirements.md as the requirement baseline, and record design decisions in docs/decision.md. Use when users ask to complete task-based design writing or revisions by task number and require decision logging.
 ---
 
-# Design Task Updater
+# Design Updater
 
 ## Overview
 

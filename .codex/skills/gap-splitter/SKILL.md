@@ -1,9 +1,9 @@
 ---
-name: design-supplement-task-splitter
+name: gap-splitter
 description: Split analysis findings into supplemental design tasks in docs/task/task_design.md, with strict no-gap checks against docs/requirements.md and current docs/design.md coverage. Use when users ask to decompose missing design content into executable task/subtask entries, ensure no omission, or request task_design.md补充任务拆分.
 ---
 
-# Design Supplement Task Splitter
+# Gap Splitter
 
 Decompose analysis results into implementable supplemental tasks in
 `docs/task/task_design.md`. Keep structure consistent with existing task entries
