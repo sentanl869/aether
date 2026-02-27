@@ -28,6 +28,7 @@
 | `v1.16.0` | `2026-02-27` | 完成 T22：执行底座收敛为 `Postgres + Redis`，定稿 Redis 队列/分布式锁/EventBus 语义并联动验收回标。 | `T22`、`ADR-098` |
 | `v1.17.0` | `2026-02-27` | 完成 T23：网关配置口径收敛为“变更与回滚审计”，清理历史术语并联动验收/回标/治理。 | `T23`、`ADR-099` |
 | `v1.18.0` | `2026-02-27` | 完成 T24：双视图 API 与 ID 语义收敛历史基线追溯，补齐实例/应用双视图契约、验收与回标治理链路。 | `T24`、`ADR-100` |
+| `v1.19.0` | `2026-02-27` | 完成 T25：异步契约外显收敛，定稿“任务实体内化 + 资源轮询外显 + before/after hook 代码级扩展”并联动验收回标与治理复核。 | `T25`、`ADR-101` |
 
 文档状态：
 
@@ -54,8 +55,8 @@
 | `CUD` | Create/Update/Delete 变更操作；本文统一走异步任务模型。 |
 | `Query` | 查询操作；本文统一走同步返回。 |
 | `AsyncTask` | 异步任务实体，承载任务状态、重试、结果与补偿语义。 |
-| `Idempotency-Key` | 变更请求幂等键；24h 去重窗口内重复请求返回同一 `task_id`。 |
-| `resource_version` | 乐观并发控制字段；更新/删除必须携带。 |
+| `Idempotency-Key` | 变更请求幂等增强参数；当前阶段外部可选，控制面内部始终执行 `idempotency_scope + request_fingerprint` 去重。 |
+| `resource_version` | 并发增强参数；当前阶段外部可选，默认并发控制基线为“资源状态前置条件 + 同资源串行化”。 |
 | `ADR` | Architecture Decision Record，记录架构决策、原因、影响与替代关系。 |
 | `NFR` | 非功能需求集合，覆盖性能、可用性、容量、安全、可扩展与可运维约束。 |
 | `OCI` | Open Container Initiative Artifact 规范，本文用于镜像与 Chart 制品存储。 |
@@ -132,7 +133,7 @@ T1 阶段输出定位为“设计基线”而非“功能详设”：
 - API 规范：OpenAPI 3.0 + RESTful，统一响应结构与错误码。
 - 变更类操作：统一异步任务模型（CUD 异步）。
 - 查询类操作：同步返回（Query 同步）。
-- 并发与幂等：`Idempotency-Key` + `resource_version`。
+- 并发与幂等：当前阶段外部参数可选，控制面内部固定执行幂等去重与同资源串行化。
 - 图示表达：统一使用 Mermaid。
 
 ### 2.5 角色与租户边界
@@ -345,7 +346,7 @@ flowchart TB
 
 统一 CUD 执行主链路（对应 `R-ABS-002`）：
 
-1. 请求校验：鉴权、工作空间边界、参数 schema、`resource_version` 并发检查。
+1. 请求校验：鉴权、工作空间边界、参数 schema、资源状态前置条件校验（若提供 `resource_version` 则执行增强并发检查）。
 2. 任务入队：生成 `AsyncTask`，写入串行化键，返回 `task_id`。
 3. 渲染与部署：适配器执行 `render -> apply/upgrade/delete`。
 4. 状态回写：更新资源状态、最近任务、失败原因、运行快照。
@@ -423,15 +424,15 @@ sequenceDiagram
   participant K8S as Managed Cluster
   participant AUD as Audit
 
-  Client->>API: CUD Request + Idempotency-Key
-  API->>DB: 校验 workspace/cluster/resource_version
+  Client->>API: CUD Request (+ Idempotency-Key/resource_version 可选)
+  API->>DB: 校验 workspace/cluster + 资源状态前置条件
   API->>DB: 幂等去重查询(24h)
   alt 命中幂等键
     API-->>Client: 已有 task_id
   else 新请求
     API->>DB: 创建 AsyncTask(Pending)
     API->>Q: 投递 task_id
-    API-->>Client: 202 + task_id
+    API-->>Client: 202 + Location(/applications/{application_id}?workspace_id=...)
     Q->>W: 拉取任务(串行键加锁)
     W->>DB: 置 Running + started_at
     W->>AD: render/apply/delete
@@ -456,7 +457,7 @@ sequenceDiagram
   User->>API: POST /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/releases
   API->>DB: 校验应用归属/网关可用性/镜像依赖
   API->>DB: 创建发布任务 + ReleaseChart(Packaging)
-  API-->>User: 202 + task_id
+  API-->>User: 202 + Location
   W->>DB: 锁定 application_id + release_version
   W->>W: 生成标准 Helm Chart + 锁定依赖
   W->>OCI: Push Chart OCI Artifact
@@ -483,7 +484,7 @@ sequenceDiagram
     API-->>User: 409 Conflict(阻断组件删除)
   else 无冲突
     API->>DB: 创建删除任务
-    API-->>User: 202 + task_id
+    API-->>User: 202 + Location
     W->>K8S: 删除应用关联 Agent 与派生资源
     W->>K8S: 删除嵌入式组件
     alt 回收失败
@@ -715,7 +716,7 @@ Service 命名策略（`R-DSP-007`）：
   - `chart_version` 必须显式指定，禁止 `latest`；
   - `platform_type` 仅允许 `coze/n8n/dify/fastgpt`；
   - `admin_account_ref` 必须为 `secret://` 引用。
-- 异步语义：导入请求统一返回 `202 + task_id`，执行链路见 `8.2.1`。
+- 异步语义：导入请求统一返回 `202 + Location`（响应体可带 `task_id` 供诊断），执行链路见 `8.2.1`。
 - 错误码最小集合：
   - `400 INVALID_ARGUMENT`（参数缺失/格式错误）；
   - `422 SCHEMA_VALIDATION_FAILED`（`import_chart_not_helm`、`import_values_invalid`）；
@@ -744,12 +745,12 @@ Service 命名策略（`R-DSP-007`）：
 删除契约（`R-LCP-004`，T16）：
 
 - 删除端点：`DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`。
-- 请求约束：必须携带 `Idempotency-Key`，并显式提交
+- 请求约束：支持可选增强参数 `Idempotency-Key` 与
   `resource_version=<n>`（`cascade` 可选，默认 `true`，仅作用于宿主派生的
   `embedded` 依赖回收）。
 - 并发与幂等：同 `idempotency_scope + request_fingerprint` 复用同一 `task_id`；
   同 scope 异指纹返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
-- 异步语义：返回 `202 + task_id`，删除成功后实例软删并回写 `delete_task_id`；
+- 异步语义：返回 `202 + Location`（响应体可带 `task_id` 供诊断），删除成功后实例软删并回写 `delete_task_id`；
   若 `embedded` 回收失败，进入 `8.6` 补偿链路。
 
 `R-LCP-007` 字段语义与约束（T15 定稿）：
@@ -847,13 +848,13 @@ Service 命名策略（`R-DSP-007`）：
 | `config_revision` | string | 必填，版本唯一 | 目标配置版本标识。 |
 | `change_reason` | string | 必填，`1..256` | 变更原因，写入审计与任务上下文。 |
 | `change_ticket_id` | string | 必填 | 外部变更单号，用于追溯。 |
-| `resource_version` | int64 | 必填，`>=1` | 网关资源并发控制版本。 |
-| `idempotency_key` | string | 必填，24h 去重 | 变更请求幂等键。 |
+| `resource_version` | int64 | 可选增强，`>=1` | 网关资源并发控制版本（不传时走状态前置条件 + 串行化）。 |
+| `idempotency_key` | string | 可选增强，24h 去重 | 变更请求幂等键（不传时由控制面内部幂等能力兜底）。 |
 
 执行约束（`R-GTW-006`）：
 
 - 同一 `gateway_instance_id` 在任一时刻仅允许一个 `Pending/Running` 的配置变更任务，冲突返回 `409 RESOURCE_BUSY`。
-- 任务执行前必须校验 `resource_version`；冲突返回 `409 RESOURCE_VERSION_CONFLICT`。
+- 若请求提供 `resource_version`，任务执行前执行版本校验；冲突返回 `409 RESOURCE_VERSION_CONFLICT`。
 - 配置校验失败（语法/引用/不可达依赖）返回 `422 SCHEMA_VALIDATION_FAILED`，禁止进入生效阶段。
 - 生效超时、探针失败或控制面下发失败时，必须自动回滚到 `last_stable_config_revision` 并输出回滚审计。
 - 自动回滚失败必须将任务标记为 `Failed` 并触发 `P1` 告警，禁止静默失败。
@@ -1011,12 +1012,13 @@ T24 历史双视图查询契约（追溯，`R-DATA-010/011`）：
   - `404 RESOURCE_NOT_FOUND`：`application_id` 不存在或不属于 `workspace_id`；
   - `403 FORBIDDEN_WORKSPACE`：调用方无工作空间权限。
 
-### 4.10 CRUD、权限与异步任务（R-OPS-001~010）
+### 4.10 CRUD、权限与异步任务（R-OPS-001~011）
 
 统一读写语义：
 
 - 5 类一级资源 CUD 全异步，Query 全同步（`R-OPS-001`）。
-- CUD 强制 `Idempotency-Key`，24h 内重复返回同 `task_id`（`R-OPS-002`）。
+- CUD 外部不强制 `Idempotency-Key`；控制面内部始终执行
+  `idempotency_scope + request_fingerprint` 去重（`R-OPS-002`）。
 
 权限边界：
 
@@ -1027,12 +1029,15 @@ T24 历史双视图查询契约（追溯，`R-DATA-010/011`）：
 并发与串行：
 
 - 同资源串行键执行（`R-OPS-005`）。
-- 更新/删除必须带 `resource_version`（`R-OPS-006`）。
+- 更新/删除默认执行“资源状态前置条件 + 同资源串行化”（`R-OPS-006`）；
+  `resource_version` 仅作为可选增强能力。
 
 任务可靠性：
 
 - 支持重试、超时、取消与失败诊断（`R-OPS-007`）。
 - 结果最小字段必须包含：`resource_kind`、`resource_id`、`started_at`、`ended_at`、`failure_reason`（`R-OPS-008`）。
+- 对外进度统一由资源详情字段 `status/progress/error_message` 外显，不单独开放 Task Result 查询接口（`R-OPS-008`）。
+- 异步链路支持 `before_hook/after_hook` 代码级扩展（注册/开关/顺序/阻断策略），不依赖配置文件或持久化配置（`R-OPS-011`）。
 - 宿主删除触发嵌入式资源回收，失败转补偿任务并可重试（`R-OPS-009`）。
 
 审计闭环：
@@ -1133,7 +1138,7 @@ erDiagram
 字段写入策略：
 
 - 创建：四字段均允许写入；若调用方未传 `dependency_topology`，写入 `{}`。
-- 更新：`PUT /lowcodes/{lowcode_id}` 必须携带 `resource_version`；四字段按“全量替换”语义写入。
+- 更新：`PUT /lowcodes/{lowcode_id}` 支持可选增强参数 `resource_version`；四字段按“全量替换”语义写入。
 - 回滚：低代码平台版本回滚通过更新 `version` + `spec` 完成，并记录 `from_version/to_version` 审计。
 
 ### 5.3 关系模型（Application-Agent-DataService）
@@ -1395,6 +1400,8 @@ stateDiagram-v2
 - 串行化键：`workspace_id:cluster_id:resource_kind:resource_id_or_name`。
 - 重试上限：5 次；退避：`5s/15s/45s/135s/300s`。
 - 默认超时：创建/更新 30 分钟，删除 15 分钟，发布导出 20 分钟。
+- `AsyncTask` 为控制面内部对象；客户端不直接查询任务实体，外部进度以资源详情字段外显。
+- 资源详情最小进度字段：`status`、`progress`、`error_message`。
 - 结果字段：`resource_kind`、`resource_id`、`started_at`、`ended_at`、`failure_reason`、`retry_count`、`serialized_key`。
 
 ### 6.5 工作空间与集群解绑状态机（冻结->校验->24h 可恢复窗口->回收）
@@ -1452,16 +1459,19 @@ flowchart LR
   - 服务端以路径参数为准注入租户上下文，禁止请求体覆盖 `workspace_id/cluster_id/namespace`。
 - 同步与异步语义：
   - Query（GET）：同步返回领域读模型。
-  - CUD（POST/PUT/DELETE）：统一返回 `202 Accepted + task_id`，由任务系统异步执行。
+  - CUD（POST/PUT/DELETE）：统一返回 `202 Accepted`，响应头携带 `Location` 指向资源详情查询路径，由任务系统异步执行。
 - 幂等控制：
-  - 所有 CUD 必须携带 `Idempotency-Key`（长度 8~128）。
-  - 24h 内同作用域重复提交返回首次 `task_id`（见 8.4）。
+  - 当前阶段不强制外部携带 `Idempotency-Key`；若携带，长度建议 `8~128`。
+  - 控制面内部统一使用 `idempotency_scope + request_fingerprint` 做 24h 去重（见 8.4）。
 - 并发控制：
-  - 更新与删除必须提交 `resource_version`。
-  - 版本不一致返回 `409 RESOURCE_VERSION_CONFLICT`。
+  - 当前阶段主路径为“资源状态前置条件 + 同资源串行化”。
+  - `resource_version` 为可选增强参数；若提供且不匹配，返回 `409 RESOURCE_VERSION_CONFLICT`。
 - 请求追踪：
   - 可选 `X-Request-Id`；未传时服务端生成并回传。
   - 所有响应均回传 `request_id`。
+- 异步进度外显：
+  - 对外进度统一通过资源详情字段 `status/progress/error_message` 轮询。
+  - 不单独开放 `/tasks/*` 作为外部进度主路径。
 
 统一响应结构：
 
@@ -1484,24 +1494,30 @@ flowchart LR
   "data": {
     "task_id": "2de65c58-9e35-4f63-8cc4-3fb1beebf18c",
     "status": "Pending",
-    "deduplicated": false
+    "deduplicated": false,
+    "resource_id": "app_01J..."
   }
 }
 ```
+
+`202` 响应头约束（外部契约）：
+
+- `Location: /api/v1/applications/{application_id}?workspace_id={workspace_id}`
+- `Retry-After: 2`（建议轮询间隔，单位秒）
 
 错误响应结构：
 
 ```json
 {
-  "code": "RESOURCE_VERSION_CONFLICT",
-  "message": "resource_version mismatch",
+  "code": "RESOURCE_BUSY",
+  "message": "resource has running task",
   "request_id": "req_01J...",
   "error": {
-    "retryable": false,
+    "retryable": true,
     "details": [
       {
-        "field": "resource_version",
-        "reason": "expected 17, got 16"
+        "field": "resource_status",
+        "reason": "resource is Updating"
       }
     ]
   }
@@ -1531,7 +1547,7 @@ T24 历史双视图通用契约补充（追溯）：
 - HTTP 状态码：表达传输层语义（认证失败、未找到、冲突等）。
 - 业务错误码：表达稳定可编程语义，供前端和自动化重试策略消费。
 
-错误码词典（T17 冻结）：
+错误码词典（T17 + T25 收敛）：
 
 | HTTP | Canonical 业务码 | 场景 | 是否可重试 | 兼容别名策略 |
 | --- | --- | --- | --- | --- |
@@ -1540,7 +1556,7 @@ T24 历史双视图通用契约补充（追溯）：
 | 403 | `FORBIDDEN_WORKSPACE` | 无工作空间权限，或跨 workspace/cluster/namespace 边界调用 | 否 | 无 |
 | 403 | `FORBIDDEN_ACTION` | 动作越权（含非 `super_admin/workspace_admin` 调用治理动作、`workspace_admin` 越界、租户调用 internal 接口） | 否 | 兼容 `FORBIDDEN`：`v1.11~v1.12` 仅做响应解析兼容；`v1.13` 下线 |
 | 404 | `RESOURCE_NOT_FOUND` | 资源不存在或已软删 | 否 | 无 |
-| 409 | `RESOURCE_VERSION_CONFLICT` | `resource_version` 冲突 | 否 | 无 |
+| 409 | `RESOURCE_VERSION_CONFLICT` | 提供了 `resource_version` 且版本不匹配（可选增强路径） | 否 | 无 |
 | 409 | `REFERENCE_CONFLICT` | `cascade=true` 时 shared 组件仍被外部引用 | 否 | `SHARED_RESOURCE_IN_USE` 兼容至 `v1.12`，`v1.13` 下线 |
 | 409 | `RESOURCE_BUSY` | 同资源已有 Running/Pending 任务 | 是 | 无 |
 | 409 | `IDEMPOTENCY_PAYLOAD_MISMATCH` | 同幂等作用域但请求指纹不一致 | 否 | 无 |
@@ -1551,6 +1567,11 @@ T24 历史双视图通用契约补充（追溯）：
 | 429 | `TOO_MANY_REQUESTS` | 请求超限/队列限流 | 是 | 无 |
 | 500 | `INTERNAL_ERROR` | 未分类服务端错误 | 视情况 | 无 |
 | 503 | `DEPENDENCY_UNAVAILABLE` | K8S/OCI/DB 短暂不可用 | 是 | 无 |
+
+最小集合与扩展约束（T25）：
+
+- 最小错误码集合固定为 `400/401/404/409/500`。
+- `403/422/429/503` 作为扩展错误码，仅在权限边界、schema 校验、限流和依赖不可用场景启用，必须在 OpenAPI operation 级声明触发条件。
 
 T17 口径约束（403/409）：
 
@@ -1584,7 +1605,6 @@ T17 口径约束（403/409）：
 | 高代码制品 | `HighCodeArtifact` | `{scope}/artifacts` |
 | DevBox 发布记录 | `DevBoxPublishRecord` | `{scope}/devboxes/{devbox_id}/publishes` |
 | 发布 Chart 包 | `ReleaseChart` | `{scope}/charts` |
-| 异步任务 | `AsyncTask` | `{scope}/tasks` |
 
 标准 CRUD 模板（示例）：
 
@@ -1592,7 +1612,7 @@ T17 口径约束（403/409）：
 - List：`GET /.../{resources}`
 - Get：`GET /.../{resources}/{resource_id}`
 - Update：`PUT /.../{resources}/{resource_id}`
-- Delete：`DELETE /.../{resources}/{resource_id}?resource_version=<n>&cascade=<bool>`
+- Delete：`DELETE /.../{resources}/{resource_id}?cascade=<bool>&resource_version=<n 可选>`
 
 以下端点为文档 canonical path（T7 统一口径）：
 
@@ -1620,7 +1640,7 @@ DevBox 发布记录接口：
 
 低代码 Helm 导入接口补充（T16）：
 
-- `POST /.../lowcodes/imports` 仅允许 `super_admin` 调用，返回 `202 + task_id`。
+- `POST /.../lowcodes/imports` 仅允许 `super_admin` 调用，返回 `202 + Location`（响应体可带 `task_id` 供诊断）。
 - `workspace_admin` 与 `user` 调用该端点统一返回 `403 FORBIDDEN_ACTION`；
   `workspace_admin` 开通内置低代码平台走 `POST /lowcodes`（非 imports）。
 - 请求体最小字段：
@@ -1746,12 +1766,11 @@ T21 关键动作鉴权矩阵（API 入口口径）：
 - `PUT /workspaces/{workspace_id}/clusters/{cluster_id}/embeddeddataservices/{embedded_dataservice_id}`
 - `DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/embeddeddataservices/{embedded_dataservice_id}`
 
-任务接口：
+任务接口（T25 收敛）：
 
-- 查询任务：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}`
-- 查询任务结果：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result`
-- 任务列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks?resource_kind=&resource_id=&status=`
-- 取消任务：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}:cancel`
+- `AsyncTask` 仅作为控制面内部实体，不对租户侧暴露 `/tasks/*` 查询接口。
+- 外部进度查询统一通过资源详情轮询字段 `status/progress/error_message`。
+- 若需任务级运维动作（取消、重放、诊断），仅允许 internal API 调用。
 
 关键请求 Schema（OpenAPI 组件）：
 
@@ -1768,14 +1787,13 @@ AsyncAccepted:
 
 UpdateRequest:
   type: object
-  required: [resource_version, spec]
+  required: [spec]
   properties:
     resource_version: { type: integer, format: int64, minimum: 1 }
     spec: { type: object, additionalProperties: true }
 
 ReleaseCreateRequest:
   type: object
-  required: [resource_version]
   properties:
     resource_version: { type: integer, format: int64, minimum: 1 }
     release_version: { type: string, minLength: 1, maxLength: 64 }
@@ -1783,7 +1801,7 @@ ReleaseCreateRequest:
 
 LowCodeCreateRequest:
   type: object
-  required: [instance_name, platform_type, template_id, resource_version, entry_url, admin_account_ref, version]
+  required: [instance_name, platform_type, template_id, entry_url, admin_account_ref, version]
   properties:
     instance_name: { type: string, minLength: 1, maxLength: 64 }
     platform_type: { type: string, enum: [dify, fastgpt, coze, n8n] }
@@ -1869,7 +1887,7 @@ T24 历史应用下实例查询读路径（追溯）：
 
 - 根文件：`openapi/aether-deploy.yaml`
 - 分文件：按 tag 拆分 `paths/*.yaml`，共用模型放 `components/schemas/*.yaml`
-- 复用对象：`components/parameters`（分页、路径参数、`resource_version`）
+- 复用对象：`components/parameters`（分页、路径参数、`resource_version` 可选增强）
 - 安全定义：`components/securitySchemes/BearerAuth`
 
 T7+T12 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
@@ -1880,7 +1898,6 @@ T7+T12 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 | `/artifacts` | `{scope}/artifacts` | `paths/artifacts.yaml` |
 | `/devboxes/{devbox_id}/publishes` | `{scope}/devboxes/{devbox_id}/publishes` | `paths/devbox_publishes.yaml` |
 | `/publishes/{publish_id}` | `{scope}/publishes/{publish_id}` | `paths/devbox_publishes.yaml` |
-| `/tasks/{task_id}/result` | `{scope}/tasks/{task_id}/result` | `paths/tasks.yaml` |
 | `/lowcodes` | `{scope}/lowcodes` | `paths/lowcodes.yaml` |
 | `/lowcodes/imports` | `{scope}/lowcodes/imports` | `paths/lowcode_imports.yaml` |
 | `/lowcodes/{lowcode_id}` | `{scope}/lowcodes/{lowcode_id}` | `paths/lowcodes.yaml` |
@@ -1893,12 +1910,14 @@ T7+T12 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 
 OpenAPI 统一约束：
 
-- 每个 CUD 接口声明请求头参数 `Idempotency-Key`（`required: true`）。
-- 每个 Update/Delete 请求显式声明 `resource_version`。
+- 每个 CUD 接口可声明请求头参数 `Idempotency-Key`（`required: false`，仅增强能力）。
+- Update/Delete 可声明 `resource_version`（`required: false`，仅增强并发控制）。
 - 每个异步接口响应必须包含 `202` 与 `AsyncAccepted`。
+- 每个异步接口 `202` 响应必须声明 `Location` 与建议轮询间隔（`Retry-After`）。
 - 每个接口统一定义错误响应：`400/401/403/404/409/422/429/500/503`（按适用裁剪）。
 - `403` 仅声明 `FORBIDDEN_WORKSPACE`、`FORBIDDEN_ACTION`；`FORBIDDEN` 仅用于历史兼容解析，不得新增到新接口。
 - shared 引用冲突统一声明 `409 REFERENCE_CONFLICT`；`SHARED_RESOURCE_IN_USE` 仅保留为兼容别名。
+- 外部契约禁止将 `/tasks/*` 定义为进度查询主路径；进度查询统一在资源详情响应模型表达。
 
 T13 下载接口落盘约束（`paths/highcode_charts.yaml`）：
 
@@ -1933,8 +1952,8 @@ T16 低代码导入与删除落盘约束（`paths/lowcode_imports.yaml` + `paths
   - `202 AsyncAccepted` 与最小错误集
     `400/403/409/422/503`。
 - `DELETE {scope}/lowcodes/{lowcode_id}` 必须声明：
-  - 请求头 `Idempotency-Key`（必填）；
-  - 查询参数 `resource_version`（必填）与 `cascade`（可选）；
+  - 请求头 `Idempotency-Key`（可选增强）；
+  - 查询参数 `resource_version`（可选增强）与 `cascade`（可选）；
   - `202 AsyncAccepted`；
   - operation 扩展审计动作
     `x-audit-action: lowcode_instance_delete`.
@@ -2169,13 +2188,13 @@ EventBus 语义（Redis Streams）：
 
 生产者位于 API Service（Handler -> Service -> TaskProducer）：
 
-1. 校验认证、工作空间边界、参数 schema、`resource_version`。
+1. 校验认证、工作空间边界、参数 schema、资源状态前置条件（若请求携带 `resource_version` 则执行增强校验）。
 2. 计算 `idempotency_scope + request_fingerprint` 并查重（24h）。
 3. 命中幂等记录且指纹一致：直接返回历史 `task_id`。
 4. 命中幂等记录但指纹不一致：返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
 5. 未命中：在单事务内写入 `async_tasks`、审计草稿、Outbox 事件。
 6. 提交事务后投递队列（至少一次）。
-7. 返回 `202 + task_id`。
+7. 返回 `202 + Location + AsyncAccepted`（`task_id` 仅用于追踪，不作为外部查询入口）。
 
 ```mermaid
 sequenceDiagram
@@ -2184,8 +2203,8 @@ sequenceDiagram
   participant DB as PostgreSQL
   participant Q as Queue
 
-  H->>S: CUD 请求 + Idempotency-Key
-  S->>DB: 参数/权限/resource_version 校验
+  H->>S: CUD 请求 (+ Idempotency-Key/resource_version 可选)
+  S->>DB: 参数/权限/资源状态前置条件校验
   S->>DB: 幂等作用域 + 请求指纹查重
   alt 命中且指纹一致
     S-->>H: 返回历史 task_id
@@ -2194,7 +2213,7 @@ sequenceDiagram
   else 未命中
     S->>DB: 事务写 async_tasks + outbox + audit_draft
     S->>Q: publish(task_id)
-    S-->>H: 202 Accepted
+    S-->>H: 202 Accepted + Location
   end
 ```
 
@@ -2219,6 +2238,47 @@ sequenceDiagram
 - 版本冲突（同实例版本重复或回退非法）：`409 RESOURCE_VERSION_CONFLICT`。
 - 仓库/集群依赖异常：`503 DEPENDENCY_UNAVAILABLE`（可重试）。
 
+#### 8.2.2 `before_hook/after_hook` 代码扩展点（T25）
+
+扩展点目标：
+
+- 允许其他模块在异步 CUD 执行动作前后注入业务逻辑（`R-OPS-011`）。
+- 配置形态限定为代码注册，不依赖配置文件、配置中心或数据库持久化。
+
+注册契约（Go 接口示意）：
+
+```go
+type HookMode string
+
+const (
+    HookFailFast HookMode = "fail_fast"
+    HookContinue HookMode = "continue"
+)
+
+type HookContext struct {
+    RequestID     string
+    TaskID        string
+    Action        string // create|update|delete|release|...
+    ResourceKind  string
+    ResourceID    string
+    WorkspaceID   string
+    ClusterID     string
+}
+
+type BeforeHook func(ctx context.Context, hc HookContext) error
+type AfterHook  func(ctx context.Context, hc HookContext, result TaskResult) error
+```
+
+执行规则：
+
+- 按注册顺序执行，同一阶段（before/after）顺序稳定且可预测。
+- `before_hook` 返回错误时：
+  - `fail_fast`：立即终止主任务并返回该错误；
+  - `continue`：记录告警并继续执行主链路。
+- `after_hook` 默认不影响主任务终态；若为 `fail_fast` 且返回错误，任务标记 `Failed(after_hook_failed)`。
+- Hook 执行结果必须写审计与指标，最小字段：
+  `hook_name/hook_phase/hook_mode/hook_order/result/error_code/duration_ms/task_id/request_id`。
+
 ### 8.3 消费者流程
 
 消费者位于 Worker（QueueConsumer -> Executor -> Adapter）：
@@ -2227,9 +2287,11 @@ sequenceDiagram
 2. 对 `serialized_key` 加分布式互斥锁（Redis `SET NX PX`）并生成 `fencing_token`。
 3. 状态置 `Running` 并写 `started_at`。
 4. 构造统一执行上下文（模板/制品、凭证、cluster client）。
-5. 调用 `DeployAdapter` 执行 `apply/upgrade/delete/package/push`。
-6. 成功：回写资源状态、任务结果、审计完成事件。
-7. 失败：按 8.5 判定重试或终态失败，必要时进入 8.6 补偿。
+5. 执行 `before_hook` 链（按注册顺序，遵循 fail-fast/continue 策略）。
+6. 调用 `DeployAdapter` 执行 `apply/upgrade/delete/package/push`。
+7. 执行 `after_hook` 链（按注册顺序，落审计与指标）。
+8. 成功：回写资源状态、任务结果、审计完成事件。
+9. 失败：按 8.5 判定重试或终态失败，必要时进入 8.6 补偿。
 
 ```mermaid
 flowchart TD
@@ -2302,7 +2364,7 @@ DevBox 镜像 push 补充策略（`R-ENV-007`、`R-DBX-005/007`，T16）：
 
 取消策略：
 
-- API：`POST /.../tasks/{task_id}:cancel`
+- API：`POST /internal/v1/tasks/{task_id}:cancel`（internal 运维接口）
 - `Pending`：直接转 `Canceled`。
 - `Running`：置 `cancel_requested=true`，适配器在阶段边界检查并协作中断。
 - 取消成功后写入审计 `action=cancel_task` 与 `canceled_by/canceled_at`。
@@ -2356,11 +2418,14 @@ sequenceDiagram
 - `retry_count`
 - `serialized_key`
 
-任务结果查询契约（T7 补齐）：
+资源轮询契约（T25）：
 
-- 端点：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result`
-- 语义：返回任务结果快照（若任务仍在 `Pending/Running`，`result` 可为空对象）。
-- 最小返回字段：`resource_kind/resource_id/started_at/ended_at/failure_reason/retry_count/serialized_key`。
+- 外部轮询端点：资源详情接口（如 `GET /api/v1/applications/{application_id}?workspace_id={workspace_id}`）。
+- 最小进度字段：`status/progress/error_message/last_task`。
+- `last_task` 最小字段：
+  `task_id`、`started_at`、`ended_at`、`failure_reason`、`retry_count`（仅用于展示与诊断）。
+- 轮询建议：`Running/Updating/Deleting` 态使用 `2~5s` 间隔；
+  终态（`Running/Failed/Deleted/DeleteFailed`）停止轮询。
 
 ### 8.7 仓库绑定回滚任务编排（T11）
 
@@ -2688,7 +2753,7 @@ type RequestContext struct {
 - 平台管理动作：`workspace.*`、`cluster.*`、`registry.*`、`template.import`、
   `gateway.manage`、`lowcode.manage`、`embedded_dataservice.manage`
   （`super_admin` 全局可执行，`workspace_admin` 仅限 `managed_workspace`）。
-- 租户内业务动作：`application.*`、`memory.*`、`task.read`
+- 租户内业务动作：`application.*`、`memory.*`、`resource.progress.read`
   （`user` 仅在已关联 workspace 可执行）。
 - 空间管理员运维动作：`dataservice.*`、`devbox.*`、`agent.*`（仅限 `managed_workspace`）。
 - 受限动作：`secret.read_plaintext` 永久拒绝，保留平台服务账号内部能力。
@@ -3082,6 +3147,12 @@ stateDiagram-v2
 - `aether_task_duration_ms`（`Histogram`）：
   `labels=task_type/result`；`create/update<=10m`、`delete<=5m`、
   `release<=8m`。
+- `aether_resource_poll_latency_ms`（`Histogram`）：
+  `labels=resource_kind/status`；资源详情轮询读路径目标 `P95<=800ms`。
+- `aether_task_hook_duration_ms`（`Histogram`）：
+  `labels=hook_phase/hook_name/result`；单次 Hook 执行目标 `P95<=200ms`。
+- `aether_task_hook_fail_total`（`Counter`）：
+  `labels=hook_phase/hook_name/hook_mode/error_code`；用于评估 fail-fast/continue 策略稳定性。
 - `aether_outbox_relay_lag_ms`（`Gauge`）：
   `labels=topic/partition`；目标 `<=1000ms`。
 - `aether_eventbus_consumer_lag_messages`（`Gauge`）：
@@ -3340,7 +3411,7 @@ T9 运维补充约束：
 | R-PKG-001~006 | 发布打包与导入（`TC-PKG-01`、`TC-PKG-02`） | 每次发布产出版本化 Chart；OCI 推送成功可下载；外部导入通过验证 | Release 记录、OCI 清单、下载与导入验证 |
 | R-DATA-001~008 | 关系查询（`TC-DATA-01/02`） | 详情与 `relations` 返回 4 类关系；变更可审计 | 详情响应、relations 响应、审计检索 |
 | R-DATA-010~011 | 历史双视图查询契约（`TC-DATA-04`） | `applications` 视图覆盖 `HIGH_CODE_APP/LOW_CODE_PLATFORM`，且 `GET /applications/{application_id}/instances` 返回分支化结构 | 契约测试、接口响应样本、鉴权日志 |
-| R-OPS-001~010 | 异步任务、幂等与补偿（`TC-OPS-01`） | CUD 返回 `202+task_id`；同 scope 命中同任务；异指纹返回 `409` | 任务流水、幂等记录、补偿、错误样本 |
+| R-OPS-001~011 | 异步任务、幂等、轮询外显与 Hook 扩展（`TC-OPS-01`、`TC-OPS-13`） | CUD 返回 `202+Location`；同 scope 命中同任务；异指纹返回 `409`；资源详情轮询可观测；Hook 策略生效 | 任务流水、幂等记录、资源详情响应、Hook 指标与审计 |
 | R-OPS-012~013 | 历史双视图 OpenAPI 与动作矩阵（`TC-OPS-12`） | `instances/applications` 路径、动作能力矩阵与运行时错误码一致 | OpenAPI diff、动作探测测试、错误响应样本 |
 | S-SEC-001~007 | Secret 边界、版本与审计（`TC-SEC-01`） | Secret 在 workspace namespace；用户不可读明文；回滚采用新版本并审计 | Secret 版本记录、RBAC、审计 |
 | NFR-001~004 | 接口延迟、排队时延、任务执行时长（`TC-NFR-01`） | 满足 13.1 阈值：提交 `P95<=300ms`、Query `P95<=800ms`、排队 `P95<=5s` | 压测报告、监控截图 |
@@ -3370,7 +3441,7 @@ flowchart LR
 | 高代码应用发布包列表 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts` |
 | 发布包下载 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package` |
 | 超管 embedded 独立运维 | `GET {scope}/embeddeddataservices/{embedded_dataservice_id}` |
-| 任务结果查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/tasks/{task_id}/result` |
+| 资源详情轮询（异步进度外显） | `GET /api/v1/applications/{application_id}?workspace_id={workspace_id}` |
 
 #### 14.1.2 T9 语义补齐验收样例
 
@@ -3436,11 +3507,11 @@ flowchart LR
 
 - `T16-A`：
   `POST /lowcodes/imports` 仅 `super_admin` 可调用；
-  返回 `202 + task_id`；
+  返回 `202 + Location`（响应体可带 `task_id`）；
   错误码覆盖 `400/403/409/422/503`。
 - `T16-B`：
   `DELETE /lowcodes/{lowcode_id}` 支持
-  `resource_version + Idempotency-Key`；
+  `resource_version + Idempotency-Key` 可选增强；
   成功写 `delete_task_id`；
   `embedded` 回收失败进入补偿任务。
 - `T16-C`：
@@ -3516,6 +3587,15 @@ flowchart LR
 | 实例视图契约收敛 | `TC-OPS-12-A` | `POST/GET /instances`、`GET/PUT/DELETE /instances/{instance_id}` 与 `start/stop/restart` 均可执行 | 契约测试、接口回放、错误样本 |
 | 应用视图与应用下实例查询契约收敛 | `TC-DATA-04-B` | `GET /applications/{application_id}/instances` 按应用类型返回分支结构；空集返回 `200` | 查询响应样本、分支断言报告 |
 | OpenAPI 与治理联动 | `TC-OPS-12-B` | `R-DATA-010/011`、`R-OPS-012/013` 在 `7.5/14.4/15.2` 形成闭环追踪 | 覆盖回标、评审记录、ADR 链路 |
+
+#### 14.1.17 T25 异步契约外显收敛验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| 外部幂等/并发参数降级 | `TC-OPS-13-A` | CUD 不携带 `Idempotency-Key/resource_version` 仍可受理并受串行化约束；携带时按增强能力生效 | 接口回放样本、任务流水、冲突响应 |
+| 任务内化与资源轮询外显 | `TC-OPS-13-B` | 外部无 `/tasks/*` 查询主路径；资源详情持续返回 `status/progress/error_message/last_task` | OpenAPI lint、接口响应样本、前端轮询日志 |
+| Hook 代码扩展可配置 | `TC-OPS-13-C` | `before_hook/after_hook` 支持注册/开关/顺序；`fail_fast/continue` 阻断策略按定义执行 | 单元测试报告、任务日志、审计事件 |
+| 错误码最小集合与扩展码声明一致 | `TC-OPS-13-D` | `400/401/404/409/500` 最小集合可用，扩展码在 OpenAPI operation 级声明 | 契约测试、错误响应样本、评审记录 |
 
 ### 14.2 测试分层与关键场景
 
@@ -3719,15 +3799,16 @@ flowchart LR
 | R-DATA-010 | 4.9、7.1、7.3、7.4、14.1.16、14.4.21 | 已覆盖 | T24 历史双视图基线已补齐 `applications` 视图覆盖规则与验收链路。 |
 | R-DATA-011 | 4.9、7.3、7.4、7.5、14.1.16、14.4.21 | 已覆盖 | 已定义 `GET /applications/{application_id}/instances` 分支化返回契约与错误语义。 |
 | R-OPS-001 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
-| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.6、5.2.3、8.1、8.4 统一幂等口径并与 `requirements.md` 对齐。 |
+| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 4.10、7.1、8.1、8.4 收敛为“外部 `Idempotency-Key` 可选 + 内部幂等去重强制执行”。 |
 | R-OPS-003 | 2.5、4.10、7.1~7.6、8.1~8.6、10.1、10.2、12.6 | 已覆盖 | 已在 2.5、10.1、10.2 固化三角色模型、`managed_workspace` 授权关系与动作矩阵。 |
 | R-OPS-004 | 4.10、7.1~7.6、8.1~8.6、10.2、11.3、12.6 | 已覆盖 | 已在 7.3、10.2、11.3 定稿用户禁用动作与同 workspace 非创建者隔离策略；越权统一 `403 FORBIDDEN_ACTION`。 |
 | R-OPS-005 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.1 固化串行化键模型与同资源串行执行。 |
-| R-OPS-006 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、7.3 固化版本并发控制契约。 |
+| R-OPS-006 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、8.2 固化“资源状态前置条件 + 同资源串行化”主路径，并保留 `resource_version` 可选增强。 |
 | R-OPS-007 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.5 固化重试、超时、取消语义。 |
-| R-OPS-008 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 明确任务结果最小字段集合。 |
+| R-OPS-008 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 6.4、7.1、8.6 定稿“任务内化 + 资源详情轮询外显（`status/progress/error_message`）”契约。 |
 | R-OPS-009 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 固化补偿触发与一致性策略。 |
 | R-OPS-010 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、8.2、8.3 纳入关键动作审计点。 |
+| R-OPS-011 | 4.10、7.1、7.5、8.2、8.3、8.6、12.2、14.1.17、14.4.22 | 已覆盖 | 已在 8.2.2/8.3 定义 `before_hook/after_hook` 代码注册、顺序、阻断策略与观测审计约束。 |
 | R-OPS-012 | 7.1、7.3、7.5、14.1.16、14.4.21 | 已覆盖 | T24 历史双视图 OpenAPI 路径与接口清单已补齐。 |
 | R-OPS-013 | 7.1、7.3、7.5、14.1.16、14.4.21 | 已覆盖 | 已补齐实例/应用动作能力矩阵与 `409` 冲突语义。 |
 | S-SEC-001 | 10.3、11.1、11.2 | 已覆盖 | 已在 10.3 固化 Secret 存放范围为工作空间 namespace。 |
@@ -3763,7 +3844,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | 模板/制品/发布记录端点补齐（见 7.3 端点清单） | R-DBX-007、R-DBX-009、R-ABS-001 | 待补充 | 已覆盖 | 7.3、7.5、14.1.1 |
 | 发布包与下载端点补齐（`applications/*/charts`、`charts/*/package`） | R-PKG-001~006 | 待补充 | 已覆盖 | 7.3、7.5、14.1.1 |
-| 任务结果端点补齐（`/tasks/{task_id}/result`） | R-OPS-008 | 待补充 | 已覆盖 | 7.3、8.6、14.1.1 |
+| 任务结果端点补齐（`/tasks/{task_id}/result`，历史口径，后续由 T25 任务内化替代） | R-OPS-008 | 待补充 | 已覆盖 | 7.3、8.6、14.1.1 |
 | 文档路径示例统一为 canonical path（去除旧路径示例） | R-ENV-005、R-OPS-004 | 待补充 | 已覆盖 | 3.5、11.3、14.1.1 |
 
 #### 14.4.5 T8 冲突修订回标记录（2026-02-23）
@@ -3915,16 +3996,25 @@ flowchart LR
 | 应用下实例查询分支语义补齐 | R-DATA-011 | 待补充 | 已覆盖 | 4.9、7.4、14.1.16 |
 | 验收/回标/治理联动闭环 | R-DATA-010/011、R-OPS-012/013 | 待补充 | 已覆盖 | 14.1.16、14.4.21、15.1、15.2 |
 
+#### 14.4.22 T25 异步契约外显收敛回标记录（2026-02-27）
+
+| 回标项 | 关联需求 | T25 前状态 | T25 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| 外部幂等与并发参数降级（`Idempotency-Key/resource_version` 由必填改为可选增强） | R-OPS-002、R-OPS-006 | 待补充 | 已覆盖 | 4.10、7.1、8.2、8.4、14.1.17 |
+| 任务实体内化与资源轮询外显（`status/progress/error_message`） | R-OPS-008 | 待补充 | 已覆盖 | 3.5、6.4、7.1、7.5、8.1、8.6、14.1.17 |
+| `before_hook/after_hook` 代码级扩展点定稿（注册/顺序/阻断/观测） | R-OPS-011 | 待补充 | 已覆盖 | 4.10、8.2.2、8.3、8.6、12.2、14.1.17 |
+| 响应与错误码最小集合收敛并完成治理联动 | R-OPS-002、R-OPS-008、R-OPS-011 | 待补充 | 已覆盖 | 7.1、7.2、7.5、10.2、15.1、15.2 |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
 
 | 交付物 ID | 交付物 | 内容范围 | 验收标准 | 责任角色 |
 | --- | --- | --- | --- | --- |
-| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T24 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
+| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T25 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
 | D-02 | 决策记录 | `docs/decision.md` ADR 闭环 | 关键决策均有“原因+影响+替代关系” | 架构负责人 |
 | D-03 | 需求基线 | `docs/requirements.md` | 需求 ID 稳定可追踪，可测试 | 产品负责人 |
-| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T24 状态与设计实际一致 | 项目负责人 |
+| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T25 状态与设计实际一致 | 项目负责人 |
 | D-05 | API 契约包 | OpenAPI 根文件与分组路径定义 | 可用于生成服务端桩代码与契约测试 | 后端负责人 |
 | D-06 | 数据模型包 | ERD、DDL 约束、迁移计划 | 可直接拆分 repository 层实现任务 | 后端负责人 |
 | D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景 | QA 负责人 |
@@ -3999,6 +4089,10 @@ flowchart LR
 21. 双视图历史基线复核：凡涉及 `R-DATA-010/011`、`R-OPS-012/013` 的回溯修订，必须同步核对
     `1.2/2.6`（ID 语义冻结）、`4.9`（应用下实例查询）、`7.1/7.3/7.4/7.5`（双视图契约与 OpenAPI）、
     `14.1.16/14.4.21`（验收与回标）；若当前需求主口径已切换，必须显式标注“历史基线追溯”避免误作为现行开发入口。
+22. 异步契约外显收敛复核：凡涉及 `R-OPS-002/006/008/011` 的变更，必须同步核对
+    `3.5`（异步时序外显）、`4.10`（外部参数可选基线）、`6.4`（任务内化约束）、
+    `7.1/7.2/7.5`（响应、错误码与 OpenAPI）、`8.1~8.6`（去重、Hook、补偿）、
+    `10.2/12.2`（权限与观测）、`14.1.17/14.4.22`（验收与回标），禁止恢复 `/tasks/*` 对外主口径或回退外部必填参数约束。
 
 #### 15.2.3 版本规则
 
@@ -4028,7 +4122,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T24）
+#### 15.3.1 设计自检记录（T25）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -4052,6 +4146,7 @@ flowchart LR
 | T22 Redis 执行底座收敛（队列/分布式锁/事件总线） | 通过 | 已完成 3.2、7.6、8.1.1、8.3、8.5、8.6、8.9、12.2、13.1、14.1.14、14.2、14.4.19、15.2 与 ADR 回写 |
 | T23 网关配置口径收敛（变更与回滚审计） | 通过 | 已完成 1.1、2.3、4.6、5.8、7.3、7.6、14.1.15、14.3、14.4.20、15.2、15.3 与 ADR 回写 |
 | T24 双视图 API 与 ID 语义收敛（历史基线） | 通过 | 已完成 1.2、2.6、4.9、7.1、7.3、7.4、7.5、14.1.16、14.4.21、15.1、15.2 与 ADR 回写 |
+| T25 异步契约外显收敛（任务内化/Hook 扩展） | 通过 | 已完成 3.5、4.10、6.4、7.1、7.2、7.5、8.1~8.6、10.2、12.2、14.1.17、14.4.22、15.1、15.2 与 ADR 回写 |
 | 遗漏检查 | 通过 | 当前无阻断编码的开放问题 |
 
 #### 15.3.2 开放问题（需闭环）
