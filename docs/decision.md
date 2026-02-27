@@ -1088,3 +1088,26 @@
   - `task_design.md` 的 T30 已标记完成，并补齐完成证据与收尾检查项。
   - 后续若再次将 scoped 路径写入主资源 CUD 时序或示例，必须重新走 ADR 评审并同步更新 `14.1/14.4`。
 - 替代关系：补充 ADR-102（单接口主路径基线）与 ADR-105（路径前缀一致性）在“时序示例层”的执行约束；无。
+
+### ADR-107: T31 `DATA_SERVICE` 接口口径统一定稿为“applications 单口径 + embeddeddataservices 超管特例”
+
+- 日期：2026-02-27
+- 决策：
+  - `DATA_SERVICE` 现行外部契约固定为 `/api/v1/applications`（`resource_type=DATA_SERVICE`）；
+    shared 实例的创建、查询、更新、删除与动作调用统一走该单接口。
+  - embedded 数据服务实例不进入 `applications` 的 shared 视图与详情；
+    使用 `applications` 单接口访问 embedded 时统一返回 `404 RESOURCE_NOT_FOUND`。
+  - embedded 独立运维仅保留
+    `{scope}/embeddeddataservices/{embedded_dataservice_id}`，且仅 `super_admin` 可调用。
+  - `/dataservices*` 不再作为现行外部 canonical path；
+    默认 OpenAPI 与验收主链路不得把该路径作为当前入口。
+- 原因：
+  - `task_design.md` 的 GAP-83 指出 `DATA_SERVICE` 在 `applications` 与 `dataservices`
+    间并存双口径，导致 `7.3` 与 `10.2/11.3` 的接口边界和验收断言不一致。
+  - `R-DSP-011/012`、`R-DATA-010`、`R-OPS-012` 需要同一执行口径，
+    否则会出现“正文已覆盖但契约可实现路径不唯一”的回归风险。
+- 影响：
+  - `design.md` 已同步修订 `4.3`、`7.3`、`7.5`、`10.2`、`11.3`、`14.1.23`、`14.4.28`、`15.1`、`15.2`。
+  - `task_design.md` 的 T31 已标记完成，并补齐完成证据与 DoD 回写。
+  - 后续若恢复 `applications` 与 `dataservices` 双主口径，必须重新走 ADR 评审并同步更新验收/回标章节。
+- 替代关系：补充 ADR-102（单接口 API 基线）与 ADR-105（一致性治理）在 `DATA_SERVICE` 子域的执行约束；替代 ADR-085 中将 `dataservices` 作为现行外部路径示例的历史口径。

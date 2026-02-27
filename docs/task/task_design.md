@@ -45,7 +45,7 @@
 | T28 | R-DSP/R-DATA 编号迁移与追踪治理收敛 | 14.1、14.4、15.1、15.2 | T27（并联动 requirements） | DONE |
 | T29 | design 全文一致性冲突与歧义收敛（T26/T28 后续补强） | 1.2、2.6、4.1、7.1、7.3、7.4、7.5、10.3、14.1、14.4、15.3 | T26、T28 | DONE |
 | T30 | 单接口主路径时序与示例路径冲突收敛 | 3.5、7.1、7.3、14.1、14.4 | T29、T26 | DONE |
-| T31 | `DATA_SERVICE` 接口口径统一（`applications` 与 `dataservices` 边界） | 4.3、7.3、10.2、11.3、14.1、14.4 | T29、T26 | TODO |
+| T31 | `DATA_SERVICE` 接口口径统一（`applications` 与 `dataservices` 边界） | 4.3、7.3、10.2、11.3、14.1、14.4 | T29、T26 | DONE |
 | T32 | 跨边界错误码词典补齐（`CROSS_SCOPE_REFERENCE`） | 7.2、11.2、13.4、14.1、14.4 | T29、T17 | TODO |
 | T33 | 幂等键术语清退（完全移除 `Idempotency-Key`） | 2.6、5.2.3、7.1、7.5、8.1、8.4、10.3、14.1、14.4、15.2 | T29、T25 | TODO |
 | T34 | 执行底座部署视图一致性修复（补齐 Redis） | 3.2、3.4、8.1.1、14.1、14.4 | T29、T22 | TODO |
@@ -79,7 +79,7 @@
 - 若执行 `T28`，需先冻结旧新编号映射表（`R-DSP`、`R-DATA`）并完成全文引用清点，避免出现“正文按新编号、验收/回标按旧编号”的双口径。
 - 若执行 `T29`，需先冻结“现行 canonical path 与历史基线”边界：`applications-only` 为现行口径、`instances` 仅历史兼容；并按“4 项硬冲突优先、3 项潜在歧义后清理”顺序推进。
 - 若执行 `T30`，需先冻结“单接口主路径 canonical 示例”基线：`/api/v1/applications` 为唯一外部主路径，`/workspaces/{workspace_id}/clusters/{cluster_id}` 仅用于补充能力接口 `{scope}`。
-- 若执行 `T31`，需先冻结 `DATA_SERVICE` 外部接口口径：若保留 `dataservices`，必须在 `7.3/7.5` 显式标注其角色与边界；若不保留，需统一替换为 `applications?resource_type=DATA_SERVICE`。
+- 若执行 `T31`，需先冻结 `DATA_SERVICE` 外部接口口径：现行统一为 `applications?resource_type=DATA_SERVICE`，`embeddeddataservices` 仅保留超管特例；`dataservices` 不得作为现行主路径。
 - 若执行 `T32`，需先冻结错误码词典完整集，保证 `11.2/13.4` 与 `7.2` 单口径一致，不允许正文使用未入词典业务码。
 - 若执行 `T33`，需先冻结“设计文档彻底移除 `Idempotency-Key`”硬约束，并同步清退 `idempotency_key` 相关契约/模型/审计语义，避免遗留双口径。
 - 若执行 `T34`，需先冻结执行底座视图一致性口径：逻辑架构、部署视图、执行编排对 `Postgres + Redis` 的组件表达必须一致。
@@ -1462,7 +1462,15 @@ T29 DoD 细则（防遗漏检查清单）：
 - `dataservices` 若作为特例保留，必须在 `7.3/7.5` 明确其非主路径属性与适用边界。
 - `14.1/14.4` 的验收与回标证据指向同一口径，无“已覆盖但双口径”条目。
 - 进度：
-- [ ] 未开始（TODO）
+- [x] 完成（2026-02-27）
+
+#### T31 完成证据（2026-02-27）
+
+| 子任务 | 完成证据（design.md） | 决策留痕 |
+| --- | --- | --- |
+| T31-01 `DATA_SERVICE` canonical path 收敛（applications-only） | 4.3、7.3、7.5 | `ADR-107` |
+| T31-02 `shared/embedded` 可见性与权限边界收敛 | 10.2、11.3 | `ADR-107` |
+| T31-03 验收与覆盖回标去双口径 | 14.1.23、14.4.3、14.4.28、15.2.2（第 27 条） | `ADR-107` |
 
 ### T32 跨边界错误码词典补齐（`CROSS_SCOPE_REFERENCE`）
 
@@ -1739,7 +1747,7 @@ T29 DoD 细则（防遗漏检查清单）：
 - [x] T28 补充任务（R-DSP/R-DATA 编号迁移与追踪治理收敛）完成并关闭。
 - [x] T29 补充任务（design 全文一致性冲突与歧义收敛）完成并关闭。
 - [x] T30 补充任务（单接口主路径时序与示例路径冲突收敛）完成并关闭。
-- [ ] T31 补充任务（`DATA_SERVICE` 接口口径统一：`applications` 与 `dataservices` 边界）完成并关闭。
+- [x] T31 补充任务（`DATA_SERVICE` 接口口径统一：`applications` 与 `dataservices` 边界）完成并关闭。
 - [ ] T32 补充任务（跨边界错误码词典补齐：`CROSS_SCOPE_REFERENCE`）完成并关闭。
 - [ ] T33 补充任务（幂等键术语清退：完全移除 `Idempotency-Key`）完成并关闭。
 - [ ] T34 补充任务（执行底座部署视图一致性修复：补齐 Redis）完成并关闭。
