@@ -23,8 +23,9 @@
 | `v1.11.0` | `2026-02-23` | 完成 T17：冻结 403/409 错误码词典并收敛权限/引用冲突口径，完成验收与回标联动。 | `T17`、`ADR-093` |
 | `v1.12.0` | `2026-02-23` | 完成 T18：统一幂等字段 canonical 命名（`idempotency_*`），补齐别名兼容与退场策略，并完成验收/回标联动。 | `T18`、`ADR-094` |
 | `v1.13.0` | `2026-02-23` | 完成 T19：定稿队列/分布式锁/Outbox 事件总线选型，补齐主数据读写责任矩阵与越界防护约束，并完成验收/回标/开放项收敛。 | `T19`、`ADR-095` |
-| `v1.14.0` | `2026-02-24` | 完成 T20：EventBus 改为 RabbitMQ Streams，补齐顺序键、位点、DLQ 重放与验收联动。 | `T20`、`ADR-096` |
+| `v1.14.0` | `2026-02-24` | 完成 T20：EventBus 第一阶段替代定稿，补齐顺序键、位点、DLQ 重放与验收联动。 | `T20`、`ADR-096` |
 | `v1.15.0` | `2026-02-27` | 完成 T21：三角色权限模型重构，定稿 `super_admin/workspace_admin/user` 授权边界与验收回标联动。 | `T21`、`ADR-097` |
+| `v1.16.0` | `2026-02-27` | 完成 T22：执行底座收敛为 `Postgres + Redis`，定稿 Redis 队列/分布式锁/EventBus 语义并联动验收回标。 | `T22`、`ADR-098` |
 
 文档状态：
 
@@ -252,6 +253,7 @@ flowchart TB
 
   subgraph Data["数据层"]
     PG[("PostgreSQL")]
+    RD[("Redis")]
     KCS["Cluster Secret Distributor"]
     EVT["Audit/Event Store"]
   end
@@ -271,7 +273,9 @@ flowchart TB
   RS --> TP
   SS --> TP
   TP --> Q
-  Q --> WK
+  Q --> RD
+  RD --> WK
+  WK --> RD
   WK --> ADP
   ADP --> MC
   ADP --> REG
@@ -294,23 +298,24 @@ flowchart TB
 - 执行层：统一 CUD 链路，按 `resource_kind` 分派适配器，确保新增资源不重写主流程。
 - 数据层：PostgreSQL 为唯一控制面事实源，运行态经 Projector 回写快照。
 
-执行基础设施选型定稿（T19/T20）：
+执行基础设施选型定稿（T22）：
 
 | 能力 | 候选方案 | 结论 | 取舍理由 |
 | --- | --- | --- | --- |
-| 任务队列 | PG `SKIP LOCKED`；Redis Streams；Kafka | 采用 PG 任务表（单一事实源） | 与 `async_tasks` 同事务，避免双写，峰值 `>=2.4 task/s` 满足目标。 |
-| 分布式锁 | PG advisory lock；Redis Redlock | 采用 PG advisory lock + fencing token | 无新增中间件；锁与任务同库；fencing 防过期持锁写入。 |
+| 任务队列 | Redis Streams；Kafka | 采用 Redis Streams + Consumer Group | 与 `Postgres + Redis` 部署基线一致；支持 lane 分层、ack/reclaim 与重放。 |
+| 分布式锁 | Redis 锁（`SET NX PX`）；ZooKeeper | 采用 Redis 锁 + fencing token | 与队列同底座，减少跨组件往返；通过 fencing 防过期持锁写入。 |
 | Outbox Relay | 轮询 Relay；CDC | 采用轮询 Relay（200ms 基线） | 实现复杂度低，可与事务一致提交；满足事件秒级可见性。 |
-| 事件总线 | RabbitMQ Streams；Kafka | 采用 RabbitMQ Streams（Super Stream） | 保持至少一次投递；支持按 `ordering_key` 分区有序消费、位点管理与 DLQ 重放。 |
+| 事件总线 | Redis Streams；Kafka | 采用 Redis Streams 分片事件总线 | 与队列/锁同底座，按 `ordering_key` 分片有序消费并支持位点恢复、DLQ 重放。 |
 
 定稿约束：
 
-- 队列、锁、Outbox 的事实源统一为 PostgreSQL；跨组件状态以 `task_id`/`event_id` 关联。
+- 控制面主状态与 Outbox 事实源为 PostgreSQL；队列、分布式锁、EventBus 运行态状态在 Redis。
 - EventBus 只承载“已提交事实”的分发，不承载控制面主状态。
 - 新增资源类型不得引入第二套任务队列或独立锁服务。
-- EventBus 拓扑固定为 `aether.domain.events.v1` Super Stream（`16` 分区流），分区数变更需走 `15.2` 变更流程。
+- Agent 平台部署组件清单固定为 `Postgres + Redis`，不得新增 RabbitMQ 等独立消息中间件。
+- EventBus 拓扑固定为 `aether:eventbus:v1:{00..15}`（`16` 分片 stream），分片数变更需走 `15.2` 变更流程。
 - `event_outbox.ordering_key` 为唯一分区输入；路由规则固定 `partition = xxhash32(ordering_key) % 16`。
-- 消费者位点采用“Broker offset 提交 + 本地 `processed_event_id` 去重表”双保险，避免回放与重复消费导致副作用重放。
+- 消费者位点采用“Redis stream_id 位点管理 + 本地 `processed_event_id` 去重表”双保险，避免回放与重复消费导致副作用重放。
 
 ### 3.3 统一资源抽象与扩展点
 
@@ -1936,14 +1941,14 @@ T16 低代码导入与删除落盘约束（`paths/lowcode_imports.yaml` + `paths
 - `workspace.registry.binding.rolledback.v1`
 - `task.lifecycle.changed.v1`
 
-事件总线与 Outbox 定稿（T20）：
+事件总线与 Outbox 定稿（T22）：
 
 - Outbox 表：`event_outbox(event_id, topic, ordering_key, payload, status, retry_count, next_retry_at, created_at)`。
-- Relay：`aether-outbox-relay` 每 `200ms` 轮询 `status=Pending` 事件，批量投递到 RabbitMQ Super Stream `aether.domain.events.v1`。
+- Relay：`aether-outbox-relay` 每 `200ms` 轮询 `status=Pending` 事件，批量投递到 Redis EventBus 分片流 `aether:eventbus:v1:{00..15}`。
 - 投递语义：至少一次；消费者按 `event_id` 去重（`processed_event_id` 本地表）。
-- 顺序语义：同 `ordering_key=workspace_id:binding_id` 固定路由到同一 partition stream（`partition=xxhash32(ordering_key)%16`）并串行消费。
-- 路由键语义：`routing_key=<topic>.p<partition>`，其中 `topic` 必须携带版本后缀（如 `.v1`），禁止与历史 subject 命名混用。
-- 位点语义：消费者组按 `offset_commit_interval=1s` 或每 `100` 条消息提交 offset；崩溃恢复从最近 commit offset 继续并依赖 `processed_event_id` 去重。
+- 顺序语义：同 `ordering_key=workspace_id:binding_id` 固定路由到同一分片流（`partition=xxhash32(ordering_key)%16`）并串行消费。
+- 分片键语义：`stream_key=aether:eventbus:v1:{partition}`，`topic` 必须携带版本后缀（如 `.v1`），禁止与历史命名混用。
+- 位点语义：消费者组使用 `XREADGROUP` 读取并按 `1s` 或每 `100` 条 `XACK`；崩溃恢复从组内最近位点继续并依赖 `processed_event_id` 去重。
 - 失败语义：Relay 重试上限 `20` 次后转 `event_outbox_dlq`；消费失败超过 `16` 次转 `event_consumer_dlq`，触发 `P2` 告警并支持人工重放。
 
 `workspace.binding.state.changed.v1` 载荷示例：
@@ -2008,37 +2013,40 @@ T16 低代码导入与删除落盘约束（`paths/lowcode_imports.yaml` + `paths
 - 解绑链路：`ws:{ws}:cl:{cl}:rk:workspace_cluster_binding:id:{binding_id}`
 - 仓库绑定回滚链路：`ws:{ws}:rk:workspace_registry_binding:id:{binding_id}`
 
-#### 8.1.1 执行基础设施语义定稿（T19/T20）
+#### 8.1.1 执行基础设施语义定稿（T22）
 
-队列分层（lane）：
+队列分层（lane）与 Redis stream key：
 
-- `lane_cud`：默认 CUD 任务。
-- `lane_reclaim_high`：解绑回收、级联删除、补偿重试（高优先级）。
-- `lane_projection`：统计投影与报表刷新（低优先级）。
+- `lane_cud`：默认 CUD 任务（`aether:task:lane_cud`）。
+- `lane_reclaim_high`：解绑回收、级联删除、补偿重试（`aether:task:lane_reclaim_high`）。
+- `lane_projection`：统计投影与报表刷新（`aether:task:lane_projection`）。
 
 投递与消费语义：
 
-- 生产者入队与任务落库同事务提交，投递采用至少一次语义。
+- 生产者在 PostgreSQL 事务内写 `async_tasks` 与 Outbox，事务提交后向对应 lane stream 执行 `XADD`。
 - 消费者必须实现幂等执行（依据 `task_id + serialized_key + step`）。
+- 消费者使用 `XREADGROUP` 消费，成功后 `XACK`；超过 `30s` 未 ack 的 pending 消息通过 `XPENDING + XCLAIM` 进行 reclaim。
 - 死信任务进入 `async_task_dlq`，保留原始 `payload/result/failure_reason` 供重放。
 
 锁与 fencing 语义：
 
-- 锁键：`serialized_key` 的 `xxhash64` 映射到 PostgreSQL advisory lock。
-- 每次获取锁分配单调递增 `fencing_token`；适配器写回状态前校验 token，旧 token 写入一律拒绝。
+- 锁键：`aether:lock:{xxhash64(serialized_key)}`。
+- 获取锁使用 `SET key token NX PX 30000`；持锁任务每 `10s` 续租一次，续租失败立即进入重试分支。
+- 每次获取锁分配单调递增 `fencing_token`（来自 PostgreSQL `task_fencing_seq`）；适配器写回状态前校验 token，旧 token 写入一律拒绝。
+- 释放锁采用 compare-and-del（仅 token 匹配时删除），避免误删他人锁。
 - 锁冲突不直接失败，按 `8.5` 重试退避；达到上限后返回 `409 RESOURCE_BUSY`。
 
-EventBus 语义（RabbitMQ Streams）：
+EventBus 语义（Redis Streams）：
 
-- 主题到流映射：`topic` 固定写入消息头；所有事件统一进入 Super Stream `aether.domain.events.v1`。
+- 主题到流映射：`topic` 固定写入事件字段；所有事件统一进入 `aether:eventbus:v1:{00..15}`。
 - 分区与路由：
   - `partition = xxhash32(ordering_key) % 16`。
-  - partition stream 命名：`aether.domain.events.v1-{00..15}`。
+  - 分片 stream 命名：`aether:eventbus:v1:{00..15}`。
   - 同 `ordering_key` 必须落同一分区，保证单键有序。
 - 消费位点：
-  - `consumer_name = <service>.<group>.<partition>`；
-  - offset 提交策略：每 `1s` 或每 `100` 条消息；
-  - 重启后从最近已提交 offset 恢复，结合 `processed_event_id` 幂等表抵御重复投递。
+  - `consumer_group = <service>.<topic>`；
+  - ack 提交策略：每 `1s` 或每 `100` 条消息；
+  - 重启后从 group 最近位点恢复，结合 `processed_event_id` 幂等表抵御重复投递。
 
 ### 8.2 生产者流程
 
@@ -2098,8 +2106,8 @@ sequenceDiagram
 
 消费者位于 Worker（QueueConsumer -> Executor -> Adapter）：
 
-1. 通过 `FOR UPDATE SKIP LOCKED` 抢占可执行任务。
-2. 对 `serialized_key` 加分布式互斥锁（PostgreSQL advisory lock）并生成 `fencing_token`。
+1. 通过 `XREADGROUP` 从 lane stream 抢占可执行任务；若 pending 超时则 `XPENDING + XCLAIM` 回收。
+2. 对 `serialized_key` 加分布式互斥锁（Redis `SET NX PX`）并生成 `fencing_token`。
 3. 状态置 `Running` 并写 `started_at`。
 4. 构造统一执行上下文（模板/制品、凭证、cluster client）。
 5. 调用 `DeployAdapter` 执行 `apply/upgrade/delete/package/push`。
@@ -2108,9 +2116,9 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-  A[Poll Pending Task] --> B{Claim Success?}
+  A[Poll lane stream by XREADGROUP] --> B{Claim Success?}
   B -- No --> A
-  B -- Yes --> C[Acquire serialized_key lock]
+  B -- Yes --> C[Acquire Redis serialized_key lock]
   C --> D[Mark Running + started_at]
   D --> E[Build Execution Context]
   E --> F[Invoke DeployAdapter]
@@ -2152,7 +2160,7 @@ flowchart TD
 - 退避：`5s -> 15s -> 45s -> 135s -> 300s`。
 - 可重试错误：`DEPENDENCY_UNAVAILABLE`、网络抖动、临时锁冲突。
 - 不可重试错误：参数错误、权限错误、引用冲突、版本冲突。
-- 锁冲突策略：`fencing_token` 校验失败或 advisory lock 获取失败归类为可重试；
+- 锁冲突策略：`fencing_token` 校验失败或 Redis 锁获取/续租失败归类为可重试；
   连续超过 `max_retry` 返回 `409 RESOURCE_BUSY`。
 
 DevBox 镜像 push 补充策略（`R-ENV-007`、`R-DBX-005/007`，T16）：
@@ -2196,7 +2204,7 @@ DevBox 镜像 push 补充策略（`R-ENV-007`、`R-DBX-005/007`，T16）：
 - 任务状态与资源快照回写采用单事务，避免“任务成功但资源状态未更新”。
 - 跨系统副作用（K8S/OCI）采用 Outbox 记录步骤，失败后按步骤反向补偿。
 - 补偿任务独立 `task_type=compensation`，继承原 `serialized_key` 串行执行。
-- Outbox 事件投递由 Relay 托管并写入 RabbitMQ Streams；业务事务不直接调用 EventBus，避免“主事务成功但消息发送失败”。
+- Outbox 事件投递由 Relay 托管并写入 Redis EventBus；业务事务不直接调用 EventBus，避免“主事务成功但消息发送失败”。
 - 事件消费补偿固定两级：
   - Relay 级失败进入 `event_outbox_dlq`；
   - Consumer 级失败进入 `event_consumer_dlq`，由 super_admin 执行重放。
@@ -2310,7 +2318,7 @@ sequenceDiagram
   `registry_credential_redispatch` 补偿任务。
 - 补偿超出重试上限：标记 `manual_intervention_required=true` 并触发 `P2` 告警。
 
-### 8.9 优先级队列与重放操作规程（T19/T20）
+### 8.9 优先级队列与重放操作规程（T22）
 
 优先级策略：
 
@@ -2332,23 +2340,23 @@ sequenceDiagram
 3. 重放任务生成新 `task_id`，继承原 `serialized_key`，并在结果中回挂
    `source_task_id`。
 
-事件死信与重放（RabbitMQ Streams）：
+事件死信与重放（Redis EventBus）：
 
 1. Relay 投递失败超过 `20` 次，事件进入 `event_outbox_dlq`（保留
    `event_id/topic/ordering_key/payload/retry_count/failure_reason`）。
 2. Consumer 处理失败超过 `16` 次，事件进入 `event_consumer_dlq`（附
-   `consumer_group/partition/offset/last_error_code`）。
+   `consumer_group/partition/stream_id/last_error_code`）。
 3. 事件重放仅允许 super_admin 执行
    `POST /internal/v1/event-dlq/{event_id}:replay`，并写审计
    `event_replay_requested`。
 4. 重放策略：
-   - 默认从 DLQ 事件原 offset 后重投；
-   - 若指定 `force_from_offset`，必须先暂停对应 consumer group；
+   - 默认从 DLQ 事件原 `stream_id` 后重投；
+   - 若指定 `force_from_stream_id`，必须先暂停对应 consumer group；
    - 重放始终保留原 `event_id`，由消费者幂等表去重。
 5. 位点异常恢复 Runbook（最小流程）：
    - 停止目标 `consumer_group`；
-   - 对账 `broker committed offset` 与本地 `processed_event_id` 最新点；
-   - 选择 `resume_offset = min(committed_offset, processed_max_offset)`；
+   - 对账 Redis group `last-delivered-id` 与本地 `processed_event_id` 最新点；
+   - 选择 `resume_stream_id = min(group_last_delivered_id, processed_max_stream_id)`；
    - 恢复消费并观察 `aether_eventbus_consumer_lag_messages` 在 10 分钟内回落到阈值内。
 
 ## 9. 资源编排与 K8s 交互设计
@@ -2958,9 +2966,9 @@ stateDiagram-v2
   `labels=task_type/result`；`create/update<=10m`、`delete<=5m`、
   `release<=8m`。
 - `aether_outbox_relay_lag_ms`（`Gauge`）：
-  `labels=stream`；目标 `<=1000ms`。
+  `labels=topic/partition`；目标 `<=1000ms`。
 - `aether_eventbus_consumer_lag_messages`（`Gauge`）：
-  `labels=consumer_group/partition_bucket`；目标 `P95<=5000`。
+  `labels=consumer_group/shard_bucket`；目标 `P95<=5000`。
 - `aether_eventbus_dlq_total`（`Counter`）：
   `labels=dlq_type/topic/reason`；目标日增量 `<=100`。
 - `aether_eventbus_replay_total`（`Counter`）：
@@ -3073,7 +3081,7 @@ Span 分层：
   `lane_projection P95<=30s`。
 - 事件链路时延：Outbox 写入到消费者完成处理 `P95<=2s`、`P99<=5s`；
   消费积压 `aether_eventbus_consumer_lag_messages P95<=5000`，
-  单分区积压持续 `10m` 超阈触发 `P2`。
+  单分片积压持续 `10m` 超阈触发 `P2`。
 - 任务执行时长：
   `create/update P95<=10m`；`delete P95<=5m`；`release P95<=8m`。
   预算来源为 Helm 操作、依赖可达性与补偿开销。
@@ -3344,15 +3352,15 @@ flowchart LR
 | --- | --- | --- | --- |
 | 队列选型与 lane 优先级生效 | `TC-OPS-08-A` | 三条 lane 按配额执行；拥塞时触发降级策略 | 指标曲线、Worker 配置、压测报告 |
 | 分布式锁与 fencing 生效 | `TC-OPS-08-B` | 并发写同 `serialized_key` 时旧 token 写入被拒绝；最终仅一条成功路径 | 并发测试日志、任务结果、冲突样本 |
-| Outbox 投递 | `TC-OPS-08-C` | Outbox->RMQ 至少一次；`ordering_key` 保序；`event_id` 去重；DLQ 可重放 | outbox 快照、去重表、重放 |
+| Outbox 投递 | `TC-OPS-08-C` | Outbox->Redis EventBus 至少一次；`ordering_key` 保序；`event_id` 去重；DLQ 可重放 | outbox 快照、去重表、重放 |
 | 主数据写入边界防越界 | `TC-ENV-06` | Aether 写主数据被拒；平台直写 bindings 被拒；越界触发审计告警 | DB 权限测试、错误响应、审计与告警记录 |
 
 #### 14.1.12 T20 事件总线替代验收样例
 
 | 缺口 | 用例 ID | 通过条件 | 证据 |
 | --- | --- | --- | --- |
-| EventBus 选型基线替换 | `TC-OPS-09-A` | `3.2/8.1.1` 仅保留 RabbitMQ Streams 单口径；无 JetStream 执行语义残留 | 文档 diff、架构评审记录 |
-| `ordering_key` 分区与位点恢复 | `TC-OPS-09-B` | 同 `ordering_key` 事件进入同分区且顺序一致；故障恢复后无重复副作用 | 分区路由日志、offset 提交记录、消费幂等表 |
+| EventBus 选型基线替换 | `TC-OPS-09-A` | `3.2/8.1.1` 保持单口径事件总线语义；无历史执行语义残留 | 文档 diff、架构评审记录 |
+| `ordering_key` 分区与位点恢复 | `TC-OPS-09-B` | 同 `ordering_key` 事件进入同分片且顺序一致；故障恢复后无重复副作用 | 分片路由日志、stream_id 提交记录、消费幂等表 |
 | DLQ 与人工重放闭环 | `TC-OPS-09-C` | `event_outbox_dlq/event_consumer_dlq` 可触发、可重放、可审计 | DLQ 样本、重放请求与结果、审计事件 |
 
 #### 14.1.13 T21 三角色权限模型重构验收样例
@@ -3364,6 +3372,15 @@ flowchart LR
 | 用户能力边界收敛 | `TC-OPS-10` | 用户仅可执行高代码应用/记忆体动作与低代码平台内应用入口；独立 CRUD `dataservices/gateways/lowcodes(import\|switch)` 被拒绝 | RBAC 测试、接口响应、审计事件 |
 | 同 workspace 非创建者隔离与审计 | `TC-DATA-03` | 同 workspace 不校验 `owner_user_id`；操作审计包含 `actor_role/actor_id/workspace_id/resource_kind/resource_id/action/result/request_id` | 操作日志、审计检索、回归测试报告 |
 
+#### 14.1.14 T22 Redis 执行底座收敛验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| `Postgres + Redis` 部署基线生效 | `TC-OPS-11-A` | 执行底座仅依赖 `Postgres + Redis`；无额外消息中间件依赖 | 部署清单、架构评审记录、环境变量快照 |
+| Redis 队列 ack/reclaim 与 lane 调度生效 | `TC-OPS-11-B` | `XREADGROUP/XACK/XPENDING+XCLAIM` 可执行；超时 pending 可回收；lane 降级策略生效 | Redis 命令采样、任务日志、指标曲线 |
+| Redis 锁与 fencing 生效 | `TC-OPS-11-C` | 同 `serialized_key` 并发仅一条成功路径；旧 `fencing_token` 写回被拒绝 | 并发测试日志、冲突样本、任务结果 |
+| Outbox -> Redis EventBus 与 DLQ 重放闭环 | `TC-OPS-11-D` | 事件按 `ordering_key` 分片有序；`event_outbox_dlq/event_consumer_dlq` 可重放且可审计 | Outbox 快照、事件重放记录、审计日志 |
+
 ### 14.2 测试分层与关键场景
 
 #### 14.2.1 测试分层
@@ -3372,7 +3389,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | L1 单元测试 | schema 校验、状态机迁移、幂等指纹计算 | 保证纯业务逻辑正确性 | 覆盖率 `>=80%`，关键包 `>=90%` |
 | L2 契约测试 | OpenAPI 契约、错误码、统一响应结构 | 保证接口向前兼容与错误可编程 | 核心接口 100% 覆盖，禁止未声明字段 |
-| L3 集成测试 | PostgreSQL + Queue + Helm Adapter（mock K8s） | 验证任务生产/消费与状态回写一致性 | P0 场景全部通过，失败可重放 |
+| L3 集成测试 | PostgreSQL + Redis + Helm Adapter（mock K8s） | 验证任务生产/消费与状态回写一致性 | P0 场景全部通过，失败可重放 |
 | L4 端到端测试 | 真集群（或等价环境）上的创建、升级、删除、发布 | 验证需求语义与部署副作用一致 | `14.1` 的 P0 用例全部通过 |
 | L5 稳定性与故障演练 | 依赖抖动、超时、回滚、补偿、解绑恢复窗口 | 验证可恢复性与运维可执行性 | 连续 72h 演练通过且无 P1 未关闭 |
 
@@ -3717,7 +3734,7 @@ flowchart LR
 
 | 回标项 | 关联需求 | T20 前状态 | T20 后状态 | 证据章节 |
 | --- | --- | --- | --- | --- |
-| EventBus 由 JetStream 替换为 RabbitMQ Streams 并固化分区规则 | R-OPS-005、R-OPS-009、NFR-003 | 待补充 | 已覆盖 | 3.2、7.6、8.1.1 |
+| EventBus 历史替代阶段完成并固化分区规则 | R-OPS-005、R-OPS-009、NFR-003 | 待补充 | 已覆盖 | 3.2、7.6、8.1.1 |
 | Outbox 投递、消费者位点、DLQ/重放语义补齐为可编码约束 | R-OPS-007、R-OPS-009 | 待补充 | 已覆盖 | 7.6、8.6、8.9、12.2 |
 | 验收与治理链路联动更新（`TC-OPS-08-C`、新增 `TC-OPS-09-*`） | R-OPS-010、NFR-003 | 待补充 | 已覆盖 | 14.1.11、14.1.12、15.2.2、ADR-096 |
 
@@ -3731,16 +3748,25 @@ flowchart LR
 | 同 workspace 非创建者隔离与审计字段补齐 | R-DATA-009、R-OPS-010 | 待补充 | 已覆盖 | 7.6、10.5、11.3、14.1.13 |
 | 验收与治理联动（新增 `TC-SEC-03-A/TC-ENV-07/TC-OPS-10/TC-DATA-03`） | R-OPS-010 | 待补充 | 已覆盖 | 14.1.13、15.2、`docs/decision.md`（ADR-097） |
 
+#### 14.4.19 T22 Redis 执行底座收敛回标记录（2026-02-27）
+
+| 回标项 | 关联需求 | T22 前状态 | T22 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| 执行底座收敛为 `Postgres + Redis`，并定稿队列/锁/EventBus 单口径 | R-ABS-004、R-OPS-005、R-OPS-009 | 待补充 | 已覆盖 | 3.2、7.6、8.1.1、8.3、8.6 |
+| Redis 队列 ack/reclaim、锁续租与 fencing 冲突语义补齐 | R-OPS-005、R-OPS-007 | 待补充 | 已覆盖 | 8.1.1、8.3、8.5、8.9 |
+| 指标、容量预算与验收样例联动更新 | NFR-003、NFR-010、NFR-011 | 待补充 | 已覆盖 | 12.2、13.1、14.1.14、14.2 |
+| 变更治理与开放问题联动闭环 | R-OPS-010 | 待补充 | 已覆盖 | 15.2、15.3.1、15.3.3、`docs/decision.md`（ADR-098） |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
 
 | 交付物 ID | 交付物 | 内容范围 | 验收标准 | 责任角色 |
 | --- | --- | --- | --- | --- |
-| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T21 DoD 全满足 | 架构负责人 |
+| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T22 DoD 全满足 | 架构负责人 |
 | D-02 | 决策记录 | `docs/decision.md` ADR 闭环 | 关键决策均有“原因+影响+替代关系” | 架构负责人 |
 | D-03 | 需求基线 | `docs/requirements.md` | 需求 ID 稳定可追踪，可测试 | 产品负责人 |
-| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T21 状态与设计实际一致 | 项目负责人 |
+| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T22 状态与设计实际一致 | 项目负责人 |
 | D-05 | API 契约包 | OpenAPI 根文件与分组路径定义 | 可用于生成服务端桩代码与契约测试 | 后端负责人 |
 | D-06 | 数据模型包 | ERD、DDL 约束、迁移计划 | 可直接拆分 repository 层实现任务 | 后端负责人 |
 | D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景 | QA 负责人 |
@@ -3795,16 +3821,20 @@ flowchart LR
     `8.1/8.4`（流程语义）、`14.1.10/14.4.15`（验收与回标），禁止在正文继续引入 `idem_*` 缩写命名。
 16. 执行底座与主数据边界复核：凡涉及队列/锁/Outbox/EventBus 或
     `workspaces/managed_clusters/bindings` 写入边界调整，必须同步核对
-    `3.2`、`4.1`、`5.7`、`7.6`、`8.1~8.9`、`11.2`、`14.1.11`、`14.4.16`，
+    `3.2`、`4.1`、`5.7`、`7.6`、`8.1~8.9`、`11.2`、`14.1.11/14.1.14`、`14.4.16/14.4.19`，
     并确认 `15.3` 开放项状态与正文一致。
-17. 消息总线替代专项复核：凡涉及 EventBus 技术替代（含 JetStream/Kafka/RabbitMQ Streams 互换），必须同步核对
+17. 消息总线替代专项复核：凡涉及 EventBus 技术替代（含 Kafka/Redis Streams 互换）或分片拓扑调整，必须同步核对
     `3.2`（选型）、`7.6`（Outbox 事件契约）、`8.1.1`（分区与位点）、
     `8.9`（DLQ/重放 runbook）、`12.2/13.1`（指标与预算）、
-    `14.1.12/14.4.17`（验收与回标），禁止只改架构结论不改运维与验收链路。
+    `14.1.12/14.1.14`、`14.4.17/14.4.19`（验收与回标），禁止只改架构结论不改运维与验收链路。
 18. 三角色权限模型复核：凡涉及 `R-OPS-003/R-OPS-004` 或治理动作权限变更，必须同步核对
     `2.5`（三角色与 `managed_workspace`）、`4.1/4.4/4.6/4.7`（动作边界）、
     `7.3/7.6`（接口鉴权）、`10.1/10.2/11.3`（授权与隔离）、`14.1.13/14.4.18`
     （验收与回标），禁止回退为“双角色模型”或引入 `owner_user_id` 创建者隔离门槛。
+19. Redis 执行底座收敛复核：凡涉及 `R-OPS-005/R-OPS-007/R-OPS-009` 的执行链路变更，必须同步核对
+    `3.2`（组件基线）、`7.6`（Outbox->EventBus）、`8.1.1/8.3/8.5/8.9`（队列/锁/重试/重放）、
+    `12.2/13.1`（lag/backlog 阈值与预算）、`14.1.14/14.4.19`（验收与回标），
+    并确认 `15.3` 无未闭环 OQ。
 
 #### 15.2.3 版本规则
 
@@ -3834,7 +3864,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T21）
+#### 15.3.1 设计自检记录（T22）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -3853,8 +3883,9 @@ flowchart LR
 | T17 错误码命名一致性收敛（403/409） | 通过 | 已完成 7.2、10.2、11.4、7.5、14.1.9、14.4.14、15.2 与 ADR 回写 |
 | T18 幂等字段命名统一（`idem_*` -> `idempotency_*`） | 通过 | 已完成 2.6、5.2.3、5.4、8.1、8.4、14.1.10、14.4.15、15.2 与 ADR 回写 |
 | T19 执行基础设施选型与主数据边界约束 | 通过 | 已完成 3.2、4.1、5.7、7.6、8.1~8.9、11.2、14.1.11、14.4.16、15.2 与 ADR 回写 |
-| T20 事件总线替代（JetStream -> RabbitMQ Streams） | 通过 | 已完成 3.2、7.6、8.1.1、8.6、8.9、12.2、13.1、14.1.12、14.4.17、15.2 与 ADR 回写 |
+| T20 事件总线替代（历史阶段） | 通过 | 已完成 3.2、7.6、8.1.1、8.6、8.9、12.2、13.1、14.1.12、14.4.17、15.2 与 ADR 回写 |
 | T21 三角色权限模型重构（超管/空间管理员/用户） | 通过 | 已完成 2.5、4.1、4.4、4.6、4.7、7.3、7.6、10.1~10.2、11.3、14.1.13、14.4.18、15.2 与 ADR 回写 |
+| T22 Redis 执行底座收敛（队列/分布式锁/事件总线） | 通过 | 已完成 3.2、7.6、8.1.1、8.3、8.5、8.6、8.9、12.2、13.1、14.1.14、14.2、14.4.19、15.2 与 ADR 回写 |
 | 遗漏检查 | 通过 | 当前无阻断编码的开放问题 |
 
 #### 15.3.2 开放问题（需闭环）
@@ -3868,7 +3899,7 @@ flowchart LR
 - 每周例会检查 OQ 状态；到期未关闭必须给出延期原因与新日期。
 - OQ 关闭后需同步更新 `decision.md`（若形成决策）与 `design.md` 对应章节。
 
-#### 15.3.3 已关闭问题（T9/T13/T19/T20）
+#### 15.3.3 已关闭问题（T9/T13/T19/T20/T22）
 
 | 问题 ID | 关闭日期 | 关闭结论 | 回写章节 |
 | --- | --- | --- | --- |
@@ -3876,4 +3907,5 @@ flowchart LR
 | OQ-02 | 2026-02-23 | 灰度参数模板定稿（步长、阈值、自动回切、审计字段），`TC-GTW-01-A` 可执行 | 4.6、14.1.6、14.4.10、`docs/decision.md`（ADR-090） |
 | OQ-03 | 2026-02-23 | 下载链路定稿（API 鉴权 + 签名 URL、TTL `300s`，含缓存策略），`TC-PKG-02-A` 可执行 | 7.3、7.5、14.1.6、14.4.10、ADR-090 |
 | OQ-04 | 2026-02-23 | 优先级队列定稿为三 lane，拥塞降级与重放规程完成，`TC-OPS-08-A` 可执行 | 8.9、12.2、13.1、14.1.11、14.4.16、ADR-095 |
-| OQ-05 | 2026-02-24 | EventBus 改为 RabbitMQ Streams，补齐分区/位点/DLQ 重放，TC-OPS-09-* 可执行 | 3.2、7.6、8.1.1、8.9、14.1.12、14.4.17 |
+| OQ-05 | 2026-02-24 | EventBus 历史替代阶段完成，补齐分区/位点/DLQ 重放，`TC-OPS-09-*` 可执行 | 3.2、7.6、8.1.1、8.9、14.1.12、14.4.17 |
+| OQ-06 | 2026-02-27 | Redis 执行底座拓扑定稿为 `Postgres + Redis`，队列/锁/EventBus 统一 Redis，`TC-OPS-11-*` 可执行 | 3.2、7.6、8.1.1、8.3、8.9、14.1.14、14.4.19 |

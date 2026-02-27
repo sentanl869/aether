@@ -896,3 +896,21 @@
     用于覆盖三角色授权、治理动作权限、用户禁用动作拦截与同 workspace 共享操作审计闭环。
   - 后续涉及角色或权限语义变更，必须执行 `15.2` 的“三角色权限模型复核”检查点。
 - 替代关系：替代 ADR-019（双角色定稿）与 ADR-040（工作空间内不引入角色分层）的历史口径；并对 ADR-089（权限补齐）补充三角色实现级约束。
+
+### ADR-098: T22 Redis 执行底座收敛定稿为“Postgres 事实源 + Redis 队列/锁/EventBus”
+
+- 决策：
+  - 执行底座统一收敛为 `Postgres + Redis`：Postgres 仅承载控制面事实源（资源、任务、Outbox），Redis 承载任务队列、分布式锁与事件总线运行态。
+  - 任务队列固定为 Redis Streams + Consumer Group；消费语义固定为 `XREADGROUP + XACK`，超时 pending 使用 `XPENDING + XCLAIM` reclaim。
+  - 分布式锁固定为 Redis `SET NX PX` + compare-and-del 释放；锁冲突与续租失败走可重试分支；fencing token 由 Postgres 单调序列生成并在写回前强校验。
+  - Outbox Relay 继续采用轮询（200ms 基线），但投递目标固定为 Redis EventBus 分片流 `aether:eventbus:v1:{00..15}`；分片规则固定 `partition = xxhash32(ordering_key) % 16`。
+  - 事件失败闭环固定为 `event_outbox_dlq + event_consumer_dlq` 双通道，重放入口保持 `POST /internal/v1/event-dlq/{event_id}:replay`。
+- 原因：
+  - T20 后执行链路仍存在“队列/锁/EventBus 分散底座”的语义残留，导致 `3.2/7.6/8.1.1/8.3/8.6/8.9` 与验收治理章节口径不一致（GAP-37~GAP-41）。
+  - 目标部署组件需固定为 `Postgres + Redis`，以降低运维复杂度并减少跨中间件一致性风险，同时保持主状态写入边界清晰。
+  - `R-OPS-005/007/009` 与 `NFR-003/010/011` 需要在同一底座下给出可编码、可观测、可重放的统一约束。
+- 影响：
+  - `design.md` 已同步修订 `3.2`、`7.6`、`8.1.1`、`8.3`、`8.5`、`8.6`、`8.9`、`12.2`、`13.1`、`14.1.11`、`14.1.14`、`14.2`、`14.4.19`、`15.2`、`15.3`。
+  - `task_design.md` 的 T22 与 T22-01~T22-05 可标记完成，并关闭 GAP-37~GAP-41。
+  - OQ-06 关闭，后续若调整 Redis 分片数、reclaim 阈值或锁 TTL，必须走 `15.2` 变更流程并更新回标。
+- 替代关系：替代 ADR-095 中“PG 队列/PG advisory lock”执行口径与 ADR-096 中“非 Redis EventBus”执行口径；其余主数据写入边界与 Outbox 事务性结论继续沿用。
