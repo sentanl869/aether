@@ -32,6 +32,7 @@
 | `v1.20.0` | `2026-02-27` | 完成 T26：单接口 API 基线收敛，定稿 `applications-only` 主路径、统一 `application_id`、`/components` 查询与动作能力矩阵。 | `T26`、`ADR-102` |
 | `v1.21.0` | `2026-02-27` | 完成 T27：记忆体（`MEMORY`）并入 6 类一级资源，定稿 `mem0` 迁移边界、Memory 模型/契约/权限/NFR 与验收回标闭环。 | `T27`、`ADR-103` |
 | `v1.22.0` | `2026-02-27` | 完成 T28：`R-DSP/R-DATA` 编号迁移与追踪治理收敛，冻结旧新编号迁移表并统一验收/回标/治理门禁。 | `T28`、`ADR-104` |
+| `v1.23.0` | `2026-02-27` | 完成 T29：收敛全文冲突与歧义，定稿 `R-ENV-005` 语义解耦、`/instances` 退场时态、幂等判重口径与路径前缀一致性。 | `T29`、`ADR-105` |
 
 文档状态：
 
@@ -51,7 +52,7 @@
 | `Template` | 可部署标准单元，当前统一为 Helm Chart + 参数 schema。 |
 | `Artifact` | 高代码来源制品，类型包括 DevBox 发布镜像、用户上传镜像、用户上传 Helm Chart。 |
 | `Instance` | 模板或制品在 `workspace+cluster+namespace` 的运行实例。 |
-| `instance_id` | 历史双视图（T24）兼容标识，仅用于兼容期 `deprecated` 路径 `/instances/{instance_id}`；不得用于现行主接口参数。 |
+| `instance_id` | 历史双视图（T24）兼容标识，仅用于历史兼容窗口（`v1.20.0~v1.21.x`）的 `deprecated` 路径 `/instances/{instance_id}`；`v1.22.0` 起已退出现行外部契约，不得用于现行主接口参数。 |
 | `application_id` | 统一资源主标识，用于 `/applications/{application_id}`；对内按 `resource_type` 映射到 6 类一级资源实体主键。 |
 | `shared` | 可复用资源可见性，进入共享列表与选择器，可被多个宿主引用。 |
 | `embedded` | 宿主内嵌资源可见性，仅随宿主创建/运维/回收，不进入共享列表。 |
@@ -196,8 +197,8 @@ T26 单接口 ID 语义冻结（现行）：
 兼容与退场约束：
 
 - 现行外部主路径仅允许 `/api/v1/applications`，`instance_id` 不得出现在现行主路径示例与参数对象中。
-- `/api/v1/instances/*` 仅允许短期兼容并必须标注 `deprecated: true`；
-  计划退场版本固定为 `v1.22.0`（见 7.5 OpenAPI 约束）。
+- `/api/v1/instances/*` 仅在历史兼容窗口（`v1.20.0~v1.21.x`）保留并标注 `deprecated: true`；
+  `v1.22.0` 起已从现行外部契约移除，仅允许作为历史回放样例保留（见 7.5 OpenAPI 约束）。
 
 历史别名兼容与退场策略（T18）：
 
@@ -554,7 +555,8 @@ sequenceDiagram
   `POST/PUT /internal/v1/workspace-registry-bindings`。
 - `R-ENV-003`：建立 `workspace + cluster` 绑定时自动创建/复用同名 namespace，写回 `namespace_name`。
 - `R-ENV-004`：所有业务请求先校验用户是否关联工作空间，不通过直接拒绝并审计。
-- `R-ENV-005`：业务 API 路径必须显式包含 `workspace_id/cluster_id`；`namespace` 由绑定表反查注入，不接受请求体覆写。
+- `R-ENV-005`：创建资源时必须先确定 `workspace_id/cluster_id` 作用域；
+  作用域参数可通过 query/body/path 承载，但不得改变 `applications-only` 主路径形态；`namespace` 由绑定表反查注入，不接受请求体覆写。
 - `R-ENV-006`：仓库绑定变更采用版本化绑定记录（`binding_version`），动作覆盖“新增、更新、轮转、回滚”。
   其中回滚通过内部接口
   `POST /internal/v1/workspace-registry-bindings/{binding_id}:rollback`
@@ -579,12 +581,12 @@ sequenceDiagram
 
 | 动作 | 接口索引 | 权限 | 并发与幂等 | 审计动作 |
 | --- | --- | --- | --- | --- |
-| 新增工作空间-集群绑定 | `I1` | `super_admin` 或 `workspace_admin(managed_workspace)` | `Idempotency-Key`；按 binding 串行 | `created` |
+| 新增工作空间-集群绑定 | `I1` | `super_admin` 或 `workspace_admin(managed_workspace)` | 内部按 `idempotency_scope + request_fingerprint` 判重（可选携带 `Idempotency-Key`）；按 binding 串行 | `created` |
 | 更新工作空间-集群绑定 | `I2` | `super_admin` 或 `workspace_admin(managed_workspace)` | `resource_version`；按 binding 串行 | `updated` |
 | 发起解绑（冻结） | `I3` | `super_admin` 或 `workspace_admin(managed_workspace)` | `confirmation_token`；按 binding 串行 | `freeze_requested` |
-| 新增工作空间-仓库绑定 | `I4` | `super_admin` 或 `workspace_admin(managed_workspace)` | `Idempotency-Key`；按 binding 串行 | `created` |
+| 新增工作空间-仓库绑定 | `I4` | `super_admin` 或 `workspace_admin(managed_workspace)` | 内部按 `idempotency_scope + request_fingerprint` 判重（可选携带 `Idempotency-Key`）；按 binding 串行 | `created` |
 | 更新工作空间-仓库绑定 | `I5` | `super_admin` 或 `workspace_admin(managed_workspace)` | `resource_version`；按 binding 串行 | `updated` |
-| 仓库绑定回滚 | `I6` | `super_admin` 或 `workspace_admin(managed_workspace)` | `Idempotency-Key`；按 binding 串行 | `rolledback` |
+| 仓库绑定回滚 | `I6` | `super_admin` 或 `workspace_admin(managed_workspace)` | 内部按 `idempotency_scope + request_fingerprint` 判重（可选携带 `Idempotency-Key`）；按 binding 串行 | `rolledback` |
 
 `workspace_admin` 授权关系与生效时机（T21）：
 
@@ -1510,6 +1512,8 @@ flowchart LR
   - Query 必须显式携带 `workspace_id` 作为鉴权与查询作用域参数；
     Create 请求体必须包含 `workspace_id`、`cluster_id`、`resource_type`。
   - 服务端以 `workspace_id + cluster_id` 注入租户上下文，禁止由请求体覆盖 `namespace`。
+  - `R-ENV-005` 约束的是“先选工作空间/集群”，而非“路径必须显式携带二者”；
+    当前现行主接口保持 `applications-only`，作用域参数通过 query/body 传递，补充能力接口按 `{scope}` 展开（见 7.3）。
 - 同步与异步语义：
   - Query（GET）：同步返回领域读模型。
   - CUD（POST/PUT/DELETE）：统一返回 `202 Accepted`，响应头携带 `Location` 指向资源详情查询路径，由任务系统异步执行。
@@ -1592,7 +1596,8 @@ T26 单接口主路径补充（现行）：
 - 动作接口统一为
   `POST /api/v1/applications/{application_id}/actions/start|stop|restart?workspace_id=...`，
   是否支持由 `resource_type` 能力矩阵判定（见 7.3、10.2）。
-- 兼容保留路径（若存在）必须标注 `deprecated: true` 与 `x-sunset-version: v1.22.0`。
+- `v1.22.0` 起 `/api/v1/instances/*` 已退出默认外部契约；
+  仅历史回放包允许保留 `deprecated + x-sunset-version: v1.22.0` 元数据。
 
 ### 7.2 错误码与异常模型
 
@@ -1683,33 +1688,35 @@ T26 单接口资源分组（现行 canonical path）：
 
 以下端点为补充能力接口（非主资源 canonical path）：
 
+- `{scope}` 统一展开为 `/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}`。
+
 模板与制品查询接口：
 
-- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/templates?kind={dataservice|lowcode|devbox|gateway}`
-- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/templates/{template_id}`
-- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/artifacts`
-- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/artifacts/{artifact_id}`
+- `GET {scope}/templates?kind={dataservice|lowcode|devbox|gateway}`
+- `GET {scope}/templates/{template_id}`
+- `GET {scope}/artifacts`
+- `GET {scope}/artifacts/{artifact_id}`
 
 DevBox 发布记录接口：
 
-- `POST /workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes`
-- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes`
-- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/publishes/{publish_id}`
+- `POST {scope}/devboxes/{devbox_id}/publishes`
+- `GET {scope}/devboxes/{devbox_id}/publishes`
+- `GET {scope}/publishes/{publish_id}`
 
 低代码平台接口（T15 字段闭环）：
 
-- 创建：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes`
-- 导入：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/imports`
-- 列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes`
-- 详情：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`
-- 更新：`PUT /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`
-- 删除：`DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`
+- 创建：`POST {scope}/lowcodes`
+- 导入：`POST {scope}/lowcodes/imports`
+- 列表：`GET {scope}/lowcodes`
+- 详情：`GET {scope}/lowcodes/{lowcode_id}`
+- 更新：`PUT {scope}/lowcodes/{lowcode_id}`
+- 删除：`DELETE {scope}/lowcodes/{lowcode_id}`
 
 低代码 Helm 导入接口补充（T16）：
 
-- `POST /.../lowcodes/imports` 仅允许 `super_admin` 调用，返回 `202 + Location`（响应体可带 `task_id` 供诊断）。
+- `POST {scope}/lowcodes/imports` 仅允许 `super_admin` 调用，返回 `202 + Location`（响应体可带 `task_id` 供诊断）。
 - `workspace_admin` 与 `user` 调用该端点统一返回 `403 FORBIDDEN_ACTION`；
-  `workspace_admin` 开通内置低代码平台走 `POST /lowcodes`（非 imports）。
+  `workspace_admin` 开通内置低代码平台走 `POST {scope}/lowcodes`（非 imports）。
 - 请求体最小字段：
   `instance_name/platform_type/chart_ref/chart_version/entry_url/admin_account_ref/version`。
 - 错误码最小集合：
@@ -1722,10 +1729,10 @@ DevBox 发布记录接口：
 
 | 接口 | `entry_url` | `admin_account_ref` | `dependency_topology` | `version` |
 | --- | --- | --- | --- | --- |
-| `POST /lowcodes` | 可写，必填 | 可写，必填，仅引用 | 可写，选填（默认 `{}`） | 可写，必填 |
-| `PUT /lowcodes/{id}` | 可写 | 可写（仅允许切换引用） | 可写（全量替换） | 可写（升级/回滚） |
-| `GET /lowcodes/{id}` | 返回明文 URL | 返回引用（按角色脱敏） | 返回完整拓扑 | 返回当前版本 |
-| `GET /lowcodes` | 默认返回 | 默认返回脱敏摘要 | 默认不返回；`expand=dependency_topology` 返回摘要 | 默认返回 |
+| `POST {scope}/lowcodes` | 可写，必填 | 可写，必填，仅引用 | 可写，选填（默认 `{}`） | 可写，必填 |
+| `PUT {scope}/lowcodes/{lowcode_id}` | 可写 | 可写（仅允许切换引用） | 可写（全量替换） | 可写（升级/回滚） |
+| `GET {scope}/lowcodes/{lowcode_id}` | 返回明文 URL | 返回引用（按角色脱敏） | 返回完整拓扑 | 返回当前版本 |
+| `GET {scope}/lowcodes` | 默认返回 | 默认返回脱敏摘要 | 默认不返回；`expand=dependency_topology` 返回摘要 | 默认返回 |
 
 低代码平台字段错误码（最小集合）：
 
@@ -1736,17 +1743,16 @@ DevBox 发布记录接口：
 
 高代码发布与发布包接口：
 
-- 关系查询：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/relations`
-- 发布：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/releases`
-- 发布包列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts`
-- 下载发布包：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package`
+- 关系查询：`GET {scope}/applications/{application_id}/relations`
+- 发布：`POST {scope}/applications/{application_id}/releases`
+- 发布包列表：`GET {scope}/applications/{application_id}/charts`
+- 下载发布包：`GET {scope}/charts/{chart_id}/package`
 
-历史兼容与退场说明（T26）：
+历史兼容与退场说明（T26/T29）：
 
-- `/api/v1/instances/*` 仅作为短期兼容路径，不得出现在默认示例与 SDK 生成入口；
-  `v1.20.0` 起必须标注 `deprecated: true`，`v1.22.0` 后移除。
-- 兼容期内若调用 `/instances/*`，服务端应返回与 `/applications` 一致的 `application_id`，
-  并在响应头附加 `Deprecation` 与 `Sunset` 提示。
+- `/api/v1/instances/*` 在 `v1.20.0~v1.21.x` 作为短期兼容路径保留，且必须标注 `deprecated: true`。
+- 自 `v1.22.0` 起，`/api/v1/instances/*` 已从现行外部契约移除，不得出现在默认示例、SDK 生成入口与验收主链路中；
+  历史回放场景若需引用，必须显式标注“历史基线追溯”。
 
 T26 单接口关键时序（应用下组件查询）：
 
@@ -1771,9 +1777,9 @@ sequenceDiagram
 
 网关配置变更与回滚接口（T23）：
 
-- 发起配置变更：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/gateways/{gateway_id}:apply-config`
-- 发起配置回滚：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/gateways/{gateway_id}:rollback-config`
-- 查询配置历史：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/gateways/{gateway_id}/config-revisions`
+- 发起配置变更：`POST {scope}/gateways/{gateway_id}:apply-config`
+- 发起配置回滚：`POST {scope}/gateways/{gateway_id}:rollback-config`
+- 查询配置历史：`GET {scope}/gateways/{gateway_id}/config-revisions`
 
 网关配置接口最小错误码集合：
 
@@ -1790,7 +1796,7 @@ T21 关键动作鉴权矩阵（API 入口口径）：
 | --- | --- | --- | --- | --- |
 | 共享数据服务组件 CRUD（`/applications?resource_type=DATA_SERVICE`） | 允许 | 允许 | 拒绝 | `403 FORBIDDEN_ACTION` |
 | 内置低代码平台开通/关闭（`/applications?resource_type=LOW_CODE_PLATFORM`） | 允许 | 允许 | 拒绝 | `403 FORBIDDEN_ACTION` |
-| 低代码平台导入（`/lowcodes/imports`） | 允许 | 拒绝 | 拒绝 | `403 FORBIDDEN_ACTION` |
+| 低代码平台导入（`{scope}/lowcodes/imports`） | 允许 | 拒绝 | 拒绝 | `403 FORBIDDEN_ACTION` |
 | 网关实例 CRUD（`/applications?resource_type=GATEWAY`） | 允许 | 允许 | 拒绝 | `403 FORBIDDEN_ACTION` |
 | 高代码应用 CRUD（`/applications?resource_type=HIGH_CODE_APP`） | 允许 | 允许 | 允许 | 跨 workspace 返回 `403 FORBIDDEN_WORKSPACE` |
 | 记忆体 CRUD（`/applications?resource_type=MEMORY`） | 允许 | 允许 | 允许 | 跨 workspace 返回 `403 FORBIDDEN_WORKSPACE` |
@@ -1818,9 +1824,9 @@ T21 关键动作鉴权矩阵（API 入口口径）：
 
 超管专用 `embedded` 组件独立运维接口（满足权限矩阵）：
 
-- `GET /workspaces/{workspace_id}/clusters/{cluster_id}/embeddeddataservices/{embedded_dataservice_id}`
-- `PUT /workspaces/{workspace_id}/clusters/{cluster_id}/embeddeddataservices/{embedded_dataservice_id}`
-- `DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/embeddeddataservices/{embedded_dataservice_id}`
+- `GET {scope}/embeddeddataservices/{embedded_dataservice_id}`
+- `PUT {scope}/embeddeddataservices/{embedded_dataservice_id}`
+- `DELETE {scope}/embeddeddataservices/{embedded_dataservice_id}`
 
 任务接口（T25 收敛）：
 
@@ -1960,6 +1966,7 @@ T26 单接口应用下组件查询读路径（现行）：
 - 分文件：按 tag 拆分 `paths/*.yaml`，共用模型放 `components/schemas/*.yaml`
 - 复用对象：`components/parameters`（分页、路径参数、`resource_version` 可选增强）
 - 安全定义：`components/securitySchemes/BearerAuth`
+- `{scope}` 固定展开为 `/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}`。
 
 T7+T12 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 
@@ -1974,7 +1981,7 @@ T7+T12 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 | `/lowcodes/{lowcode_id}` | `{scope}/lowcodes/{lowcode_id}` | `paths/lowcodes.yaml` |
 | `applications（单接口主路径）` | `/api/v1/applications` | `paths/applications.yaml` |
 | `/applications/{application_id}/components` | `/api/v1/applications/{application_id}/components` | `paths/applications_components.yaml` |
-| `instances（仅兼容，deprecated）` | `/api/v1/instances` | `paths/instances_compat.yaml` |
+| `instances（历史兼容包，默认不启用）` | `/api/v1/instances` | `paths/instances_compat.yaml` |
 | `applications relations` | `{scope}/applications/{application_id}/relations` | `paths/application_relations.yaml` |
 | `/applications/{application_id}/charts` | 见 7.3「发布包列表」接口 | `paths/highcode_charts.yaml` |
 | `/charts/{chart_id}/package` | `{scope}/charts/{chart_id}/package` | `paths/highcode_charts.yaml` |
@@ -2041,8 +2048,8 @@ T26 单接口 OpenAPI 约束（现行）：
   `owner_kind`、`owner_id`、`health_snapshot`。
 - 动作能力矩阵必须在 operation 扩展字段显式声明 `x-action-support`，
   不支持动作统一返回 `409 ACTION_NOT_SUPPORTED` + 标准错误对象。
-- 若保留 `/instances/*` 兼容旧路径，必须标注 `deprecated: true`，
-  并提供 `x-sunset-version: v1.22.0`。
+- `v1.22.0` 起，`/instances/*` 不得进入默认 `openapi/aether-deploy.yaml` 路径集合；
+  仅历史兼容包可保留 `deprecated: true + x-sunset-version: v1.22.0`，并标记 `x-legacy-baseline: T24`。
 
 落地建议：
 
@@ -2971,7 +2978,8 @@ sequenceDiagram
 并发控制：
 
 - Secret 更新使用 `resource_version` + 行级锁，避免并发写同名版本号冲突。
-- 幂等更新按 `Idempotency-Key` 去重，重复请求返回同一 `task_id`。
+- Secret 更新判重统一按 `idempotency_scope + request_fingerprint` 执行；
+  `Idempotency-Key` 仅作为可选增强输入与审计检索字段，重复请求返回同一 `task_id`。
 
 ### 10.4 敏感数据保护与加密策略
 
@@ -3522,6 +3530,8 @@ T9 运维补充约束：
 
 目标：把 `requirements -> design -> test case -> release gate` 串成可执行验收链路。
 
+`{scope}` 在本章统一展开为 `/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}`。
+
 用例编号规则：
 
 - `TC-<域>-<序号>`，如 `TC-ENV-01`、`TC-HCA-03`。
@@ -3574,12 +3584,12 @@ flowchart LR
 
 | 场景 | Canonical path（统一示例） |
 | --- | --- |
-| 模板查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/templates?kind=dataservice` |
-| DevBox 发布记录创建 | `POST /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/devboxes/{devbox_id}/publishes` |
-| 发布记录详情 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/publishes/{publish_id}` |
-| 高代码应用关系查询 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/relations` |
-| 高代码应用发布包列表 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts` |
-| 发布包下载 | `GET /api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package` |
+| 模板查询 | `GET {scope}/templates?kind=dataservice` |
+| DevBox 发布记录创建 | `POST {scope}/devboxes/{devbox_id}/publishes` |
+| 发布记录详情 | `GET {scope}/publishes/{publish_id}` |
+| 高代码应用关系查询 | `GET {scope}/applications/{application_id}/relations` |
+| 高代码应用发布包列表 | `GET {scope}/applications/{application_id}/charts` |
+| 发布包下载 | `GET {scope}/charts/{chart_id}/package` |
 | 超管 embedded 独立运维 | `GET {scope}/embeddeddataservices/{embedded_dataservice_id}` |
 | 资源详情轮询（异步进度外显） | `GET /api/v1/applications/{application_id}?workspace_id={workspace_id}` |
 
@@ -3615,7 +3625,7 @@ flowchart LR
 | 缺口 | 用例 ID | 通过条件 | 证据 |
 | --- | --- | --- | --- |
 | embedded 权限对齐 | `TC-DSP-04` | `dataservices/{id}=404`；admin 接口 `200`，user `403 FORBIDDEN_ACTION` | API 记录、权限测试、审计事件 |
-| relations 端点补齐 | `TC-DATA-02` | `GET /applications/{id}/relations` 返回关系与 owner 字段；可生成契约测试 | 接口响应、OpenAPI 路径、契约测试 |
+| relations 端点补齐 | `TC-DATA-02` | `GET {scope}/applications/{application_id}/relations` 返回关系与 owner 字段；可生成契约测试 | 接口响应、OpenAPI 路径、契约测试 |
 | 绑定可变更契约补齐 | `TC-ENV-05` | 绑定新增/更新返回 `202 + task_id`；状态与版本回写正确；失败分支进入补偿并审计 | 接口响应、任务结果、binding 快照、补偿任务与审计日志 |
 
 #### 14.1.6 T13 非阻断开放项收敛验收样例
@@ -3630,7 +3640,7 @@ flowchart LR
 
 | 缺口 | 用例 ID | 通过条件 | 证据 |
 | --- | --- | --- | --- |
-| 四字段模型与契约一致性 | `TC-LCP-04-A` | `GET/POST/PUT /lowcodes` 四字段与 `5.2/5.4` 一致，无字段漂移 | OpenAPI 契约测试、DDL 校验、接口响应样本 |
+| 四字段模型与契约一致性 | `TC-LCP-04-A` | `GET/POST/PUT {scope}/lowcodes` 四字段与 `5.2/5.4` 一致，无字段漂移 | OpenAPI 契约测试、DDL 校验、接口响应样本 |
 | 历史数据迁移与分阶段切换 | `TC-LCP-04-B` | 按“加字段 -> 回填 -> 读切换 -> 写强校验”完成；失败可回滚到兼容读模式 | 迁移日志、回填结果、回滚演练记录 |
 | `admin_account_ref` 引用语义与脱敏 | `TC-LCP-04-C` | 拒绝明文写入；super_admin 可读引用，user 仅见脱敏引用；日志无明文 | 错误响应、RBAC 测试、日志抽样 |
 | 四字段变更审计可追溯 | `TC-LCP-04-D` | 四字段变更均落审计，版本回滚含 `from/to` | 审计检索结果、任务结果、版本快照 |
@@ -3646,11 +3656,11 @@ flowchart LR
 `T16` 判定细则（对应上表）：
 
 - `T16-A`：
-  `POST /lowcodes/imports` 仅 `super_admin` 可调用；
+  `POST {scope}/lowcodes/imports` 仅 `super_admin` 可调用；
   返回 `202 + Location`（响应体可带 `task_id`）；
   错误码覆盖 `400/403/409/422/503`。
 - `T16-B`：
-  `DELETE /lowcodes/{lowcode_id}` 支持
+  `DELETE {scope}/lowcodes/{lowcode_id}` 支持
   `resource_version + Idempotency-Key` 可选增强；
   成功写 `delete_task_id`；
   `embedded` 回收失败进入补偿任务。
@@ -3699,7 +3709,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | 三角色授权关系与生效时机 | `TC-SEC-03-A` | `super_admin/workspace_admin/user` 角色边界一致；`workspace_admin` 仅能命中 `managed_workspace`；权限移除后 API 与 Worker 执行前均拒绝 | 鉴权日志、任务拒绝样本、审计事件 |
 | 治理动作权限收敛 | `TC-ENV-07` | 集群/仓库绑定与解绑、回滚支持 `super_admin` 与授权 `workspace_admin`；`user` 调用返回 `403 FORBIDDEN_ACTION` | Internal API 响应、错误样本、审计日志 |
-| 用户能力边界收敛 | `TC-OPS-10` | 用户仅可执行高代码应用/记忆体动作与低代码平台内应用入口；独立 CRUD `dataservices/gateways/lowcodes(import\|switch)` 被拒绝 | RBAC 测试、接口响应、审计事件 |
+| 用户能力边界收敛 | `TC-OPS-10` | 用户仅可执行高代码应用/记忆体动作与低代码平台内应用入口；独立 CRUD `dataservices/gateways/lowcodes(import\|create\|update\|delete)` 被拒绝 | RBAC 测试、接口响应、审计事件 |
 | 同 workspace 非创建者隔离与审计 | `TC-DATA-03` | 同 workspace 不校验 `owner_user_id`；操作审计包含 `actor_role/actor_id/workspace_id/resource_kind/resource_id/action/result/request_id` | 操作日志、审计检索、回归测试报告 |
 
 #### 14.1.14 T22 Redis 执行底座收敛验收样例
@@ -3721,11 +3731,13 @@ flowchart LR
 
 #### 14.1.16 T24 双视图 API 与 ID 语义收敛验收样例（历史基线）
 
+说明：本节仅用于历史追溯回放，不作为现行发布门禁；现行门禁以 `14.1.18` 为准。
+
 | 缺口 | 用例 ID | 通过条件 | 证据 |
 | --- | --- | --- | --- |
 | `instance_id/application_id` 语义冻结 | `TC-DATA-04-A` | 术语、路径、OpenAPI 参数命名不混用；历史误用示例已修正 | 文档 diff、OpenAPI lint 报告 |
-| 实例视图契约收敛 | `TC-OPS-12-A` | `POST/GET /instances`、`GET/PUT/DELETE /instances/{instance_id}` 与 `start/stop/restart` 均可执行 | 契约测试、接口回放、错误样本 |
-| 应用视图与应用下实例查询契约收敛 | `TC-DATA-04-B` | `GET /applications/{application_id}/instances` 按应用类型返回分支结构；空集返回 `200` | 查询响应样本、分支断言报告 |
+| 实例视图契约收敛 | `TC-OPS-12-A` | 历史回放环境中 `POST/GET /api/v1/instances`、`GET/PUT/DELETE /api/v1/instances/{instance_id}` 与 `start/stop/restart` 可复现实例视图行为 | 契约测试、接口回放、错误样本 |
+| 应用视图与应用下实例查询契约收敛 | `TC-DATA-04-B` | 历史回放环境中 `GET /api/v1/applications/{application_id}/instances` 按应用类型返回分支结构；空集返回 `200` | 查询响应样本、分支断言报告 |
 | OpenAPI 与治理联动 | `TC-OPS-12-B` | `R-DATA-010/011`、`R-OPS-012/013` 在 `7.5/14.4/15.2` 形成闭环追踪 | 覆盖回标、评审记录、ADR 链路 |
 
 #### 14.1.17 T25 异步契约外显收敛验收样例
@@ -3741,9 +3753,9 @@ flowchart LR
 
 | 缺口 | 用例 ID | 通过条件 | 证据 |
 | --- | --- | --- | --- |
-| 单接口主路径收敛 | `TC-DATA-05-A` | 外部主接口仅使用 `/api/v1/applications`；`/instances` 仅兼容且标注 `deprecated + sunset` | OpenAPI lint、接口回放、文档检索记录 |
+| 单接口主路径收敛 | `TC-DATA-05-A` | 外部主接口仅使用 `/api/v1/applications`；`/api/v1/instances/*` 在 `v1.22.0` 已退出现行契约，仅允许历史回放标注 | OpenAPI lint、接口回放、文档检索记录 |
 | 统一 ID 语义收敛 | `TC-DATA-05-B` | `application_id` 在术语、路径、参数对象中单口径；6 类 `resource_type` 均可映射实体主键 | 文档 diff、契约测试、映射校验报告 |
-| 组件查询语义替换 | `TC-DATA-05-C` | `GET /applications/{application_id}/components` 覆盖 6 类返回分支；空集返回 `200` | 接口响应样本、分支断言报告 |
+| 组件查询语义替换 | `TC-DATA-05-C` | `GET /api/v1/applications/{application_id}/components` 覆盖 6 类返回分支；空集返回 `200` | 接口响应样本、分支断言报告 |
 | 动作能力矩阵收敛 | `TC-OPS-14-A` | `start\|stop\|restart` 按 `resource_type` 执行；不支持动作统一返回 `409 ACTION_NOT_SUPPORTED` | 动作探测测试、错误样本、审计日志 |
 
 #### 14.1.19 T27 记忆体（MEMORY）并入与边界收敛验收样例
@@ -3751,7 +3763,7 @@ flowchart LR
 | 缺口 | 用例 ID | 通过条件 | 证据 |
 | --- | --- | --- | --- |
 | `mem0` 迁移与 6 类口径一致性 | `TC-MEM-01-A` | 数据服务固定类型不再包含 `mem0`；`MEMORY` 纳入 6 类 L1 统一统计与接口过滤 | 文档检索记录、接口样本、报表快照 |
-| 记忆体关系与组件查询闭环 | `TC-MEM-01-B` | `GET /applications/{application_id}/components` 在 `MEMORY` 分支返回 `memory_main_instance + memory_component_refs[]`，并带 `shared\|embedded` 与 `owner` 字段 | 查询响应样本、契约断言、关系表快照 |
+| 记忆体关系与组件查询闭环 | `TC-MEM-01-B` | `GET /api/v1/applications/{application_id}/components` 在 `MEMORY` 分支返回 `memory_main_instance + memory_component_refs[]`，并带 `shared\|embedded` 与 `owner` 字段 | 查询响应样本、契约断言、关系表快照 |
 | 记忆体级联删除冲突语义 | `TC-MEM-02-A` | `cascade=true` 且共享子实例被外部引用时返回 `409 REFERENCE_CONFLICT`；无误删 | 删除响应样本、引用计数校验、审计日志 |
 | 记忆体权限边界与观测指标 | `TC-MEM-02-B` | `user` 仅可操作 `HIGH_CODE_APP/MEMORY`；`dataservice` 独立 CRUD 拒绝；`12.2/13.1` 记忆体容量与关系指标可观测 | RBAC 测试、错误样本、监控截图 |
 
@@ -3763,6 +3775,15 @@ flowchart LR
 | 验收矩阵与覆盖回标编号同步 | `TC-TRACE-01-B` | `14.1` 与 `14.4.3/14.4.25` 对 `R-DSP-010~013`、`R-DATA-003~011` 引用一致，无跨章节错链 | 验收矩阵 diff、覆盖回标 diff、交叉核对清单 |
 | 失效编号回归扫描闭环 | `TC-TRACE-01-C` | 全文扫描无失效编号作为“有效引用”；历史语义仅在迁移表保留 | 扫描结果、修复清单、复核记录 |
 | 变更流程阻断门禁生效 | `TC-TRACE-01-D` | 涉及编号重排的变更未同步正文/验收/回标时，评审门禁阻断并禁止进入实现拆分 | 变更单样本、门禁日志、评审结论 |
+
+#### 14.1.21 T29 全文一致性冲突与歧义收敛验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| `R-ENV-005` 语义解耦 | `TC-ENV-08-A` | “先选 workspace/cluster”与“路径形态”分离表述；`applications-only` 不被要求显式 path 承载 `workspace_id/cluster_id` | 文档 diff、契约评审记录、检索记录 |
+| 幂等判重口径统一（含 Secret） | `TC-OPS-15-A` | 正文不再出现“按 `Idempotency-Key` 作为主判重”；统一为 `idempotency_scope + request_fingerprint`，`Idempotency-Key` 仅增强与审计 | 文档 diff、检索记录、审计字段样本 |
+| `/instances` 退场时态一致 | `TC-DATA-06-A` | `1.2/2.6/7.3/7.5/14.1/14.4` 明确 `v1.22.0` 已退出现行外部契约；历史回放条目均显式标注“历史基线” | 文档 diff、OpenAPI lint、历史回放说明 |
+| 路径前缀与术语一致性 | `TC-TRACE-02-A` | scoped 端点统一按 `{scope}` 或完整 `/api/v1/...` 单口径；验收文案无未定义 `switch` 术语残留 | 文档检索记录、验收矩阵 diff、评审结论 |
 
 ### 14.2 测试分层与关键场景
 
@@ -3885,7 +3906,7 @@ flowchart LR
 | R-ENV-002 | 4.1、5.7、6.5、7.6、8.8、11.1、11.2 | 已覆盖 | 已在 4.1、7.6、8.8 明确“工作空间创建与绑定归属平台管理面”，Aether 仅处理内部契约与任务编排。 |
 | R-ENV-003 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-004 | 4.1、5.7、6.5、7.6、10.2、11.1、11.2 | 已覆盖 | 已在 4.1、7.3、10.2 定稿用户边界：仅高代码应用/记忆体 + 低代码平台内应用入口；跨 workspace 与禁用动作统一拒绝并审计。 |
-| R-ENV-005 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
+| R-ENV-005 | 4.1、5.7、6.5、7.1、7.3、7.6、11.1、11.2 | 已覆盖 | 已在 4.1、7.1、7.3 明确“先选 workspace/cluster”与“路径形态”解耦，作用域参数不改变 `applications-only` 主路径。 |
 | R-ENV-006 | 4.1、5.7、6.5、7.6、8.7~8.8、11.1、11.2 | 已覆盖 | 已在 4.1、7.6、8.7~8.8 定义绑定新增/更新/回滚契约与补偿，见 `TC-ENV-04/05`。 |
 | R-ENV-007 | 4.1、4.5、7.6、8.5、8.7~8.8、9.3、10.5、14.1.8 | 已覆盖 | 已补齐镜像与 Chart push/pull 凭证同口径，覆盖 DevBox push 失败重试与审计字段。 |
 | R-ENV-008 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
@@ -3974,10 +3995,10 @@ flowchart LR
 | R-DATA-007 | 4.9、5.3、7.3、10.2、11.3 | 已覆盖 | 已在 4.9、5.3 定义 embedded 资源不得进入共享选择器。 |
 | R-DATA-008 | 4.9、5.3、7.3、7.4、11.3、14.1.20 | 已覆盖 | 已在 4.9、7.3/7.4 定义应用查看页字段：Agent/组件/入口/发布 Chart 版本。 |
 | R-DATA-009 | 5.5、7.3、10.5、11.3、14.1.20 | 已覆盖 | 已在 5.5、10.5、11.3 固化绑定/解绑/级联删除审计轨迹字段。 |
-| R-DATA-010 | 4.9、7.1、7.3、7.4、14.1.18、14.1.20、14.4.23、14.4.25 | 已覆盖 | T26/T28 已定稿 `applications-only` 单接口与编号迁移一致性，列表过滤覆盖 6 类 `resource_type`。 |
-| R-DATA-011 | 4.9、7.3、7.4、7.5、14.1.18、14.1.20、14.4.23、14.4.25 | 已覆盖 | 已定义 `GET /applications/{application_id}/components` 六类分支返回契约与错误语义（含 `MEMORY` 主实例+内部组件）。 |
+| R-DATA-010 | 4.9、7.1、7.3、7.4、14.1.18、14.1.21、14.4.23、14.4.26 | 已覆盖 | T26/T29 已定稿 `applications-only` 单接口与 `v1.22.0` 退场时态，列表过滤覆盖 6 类 `resource_type`。 |
+| R-DATA-011 | 4.9、7.3、7.4、7.5、14.1.18、14.1.21、14.4.23、14.4.26 | 已覆盖 | 已定义 `GET /applications/{application_id}/components` 六类分支返回契约与错误语义（含 `MEMORY` 主实例+内部组件），并完成历史/现行边界隔离。 |
 | R-OPS-001 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
-| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 4.10、7.1、8.1、8.4 收敛为“外部 `Idempotency-Key` 可选 + 内部幂等去重强制执行”。 |
+| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、10.3、12.6、14.1.21、14.4.26 | 已覆盖 | 已在 4.10、7.1、8.1、8.4、10.3 收敛为“外部 `Idempotency-Key` 可选 + 内部 `idempotency_scope + request_fingerprint` 强制判重”。 |
 | R-OPS-003 | 2.5、4.10、7.1~7.6、8.1~8.6、10.1、10.2、12.6 | 已覆盖 | 已在 2.5、10.1、10.2 固化三角色模型、`managed_workspace` 授权关系与动作矩阵。 |
 | R-OPS-004 | 4.10、7.1~7.6、8.1~8.6、10.2、11.3、12.6 | 已覆盖 | 已在 7.3、10.2、11.3 定稿用户禁用动作与同 workspace 非创建者隔离策略；越权统一 `403 FORBIDDEN_ACTION`。 |
 | R-OPS-005 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.1 固化串行化键模型与同资源串行执行。 |
@@ -3987,8 +4008,8 @@ flowchart LR
 | R-OPS-009 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 固化补偿触发与一致性策略。 |
 | R-OPS-010 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、8.2、8.3 纳入关键动作审计点。 |
 | R-OPS-011 | 4.10、7.1、7.5、8.2、8.3、8.6、12.2、14.1.17、14.4.22 | 已覆盖 | 已在 8.2.2/8.3 定义 `before_hook/after_hook` 代码注册、顺序、阻断策略与观测审计约束。 |
-| R-OPS-012 | 7.1、7.3、7.5、14.1.18、14.1.19、14.4.23、14.4.24 | 已覆盖 | T26/T27 已补齐统一应用接口 OpenAPI 清单（CRUD + actions + components）。 |
-| R-OPS-013 | 7.2、7.3、7.5、10.2、14.1.18、14.1.19、14.4.23、14.4.24 | 已覆盖 | 已按 `resource_type` 定义动作能力矩阵，不支持动作统一返回 `409 ACTION_NOT_SUPPORTED`（含 MEMORY 场景）。 |
+| R-OPS-012 | 7.1、7.3、7.5、14.1.18、14.1.19、14.1.21、14.4.23、14.4.24、14.4.26 | 已覆盖 | T26/T29 已补齐统一应用接口 OpenAPI 清单（CRUD + actions + components），并明确 `/instances` 历史退场边界。 |
+| R-OPS-013 | 7.2、7.3、7.5、10.2、14.1.18、14.1.19、14.1.21、14.4.23、14.4.24、14.4.26 | 已覆盖 | 已按 `resource_type` 定义动作能力矩阵，不支持动作统一返回 `409 ACTION_NOT_SUPPORTED`（含 MEMORY 场景），且验收文案仅引用已定义动作集合。 |
 | S-SEC-001 | 10.3、11.1、11.2 | 已覆盖 | 已在 10.3 固化 Secret 存放范围为工作空间 namespace。 |
 | S-SEC-002 | 10.1、10.4 | 已覆盖 | 已在 10.1/10.4 固化“可引用不可明文读取”权限边界。 |
 | S-SEC-003 | 10.3 | 已覆盖 | 已在 10.3 固化版本化命名 `{secret_name}.v{n}`。 |
@@ -4167,10 +4188,12 @@ flowchart LR
 
 #### 14.4.21 T24 双视图 API 与 ID 语义收敛回标记录（2026-02-27，历史基线）
 
+说明：本节仅用于历史追溯，不作为现行发布门禁；现行门禁以 `14.1.18` 与 `14.1.21` 为准。
+
 | 回标项 | 关联需求 | T24 前状态 | T24 后状态 | 证据章节 |
 | --- | --- | --- | --- | --- |
 | `instance_id/application_id` 术语与路径参数冻结 | R-DATA-010、R-OPS-012 | 待补充 | 已覆盖 | 1.2、2.6、7.1、7.3 |
-| 实例视图接口清单与动作矩阵落盘 | R-OPS-012、R-OPS-013 | 待补充 | 已覆盖 | 7.1、7.3、7.5、14.1.16 |
+| 实例视图接口清单与动作矩阵落盘（历史回放） | R-OPS-012、R-OPS-013 | 待补充 | 已覆盖 | 7.1、7.3、7.5、14.1.16 |
 | 应用下实例查询分支语义补齐 | R-DATA-011 | 待补充 | 已覆盖 | 4.9、7.4、14.1.16 |
 | 验收/回标/治理联动闭环 | R-DATA-010/011、R-OPS-012/013 | 待补充 | 已覆盖 | 14.1.16、14.4.21、15.1、15.2 |
 
@@ -4188,7 +4211,7 @@ flowchart LR
 | 回标项 | 关联需求 | T26 前状态 | T26 后状态 | 证据章节 |
 | --- | --- | --- | --- | --- |
 | `application_id` 统一 ID 语义与 6 类实体映射落盘 | R-DATA-010 | 待补充 | 已覆盖 | 1.2、2.6、7.1 |
-| 单接口主路径与过滤契约收敛（`applications-only`） | R-DATA-010、R-OPS-012 | 待补充 | 已覆盖 | 7.1、7.3、7.5、14.1.18 |
+| 单接口主路径与过滤契约收敛（`applications-only`） | R-DATA-010、R-OPS-012 | 待补充 | 已覆盖 | 7.1、7.3、7.5、14.1.18、14.1.21 |
 | 组件查询从 `/instances` 切换为 `/components` 并补齐六类分支 | R-DATA-011 | 待补充 | 已覆盖 | 4.9、7.4、7.5、14.1.18 |
 | 动作能力矩阵与 `409 ACTION_NOT_SUPPORTED` 错误模型收敛 | R-OPS-013 | 待补充 | 已覆盖 | 7.2、7.3、10.2、14.1.18 |
 
@@ -4218,7 +4241,7 @@ flowchart LR
 | `R-DATA` | `R-DATA-007` | `R-DATA-008` | 应用查看页字段集合 | 14.1、14.4.3、15.2 |
 | `R-DATA` | `R-DATA-008` | `R-DATA-009` | 关系变更审计轨迹 | 14.1、14.4.3、15.2 |
 | `R-DATA` | `R-DATA-009` | `R-DATA-010` | 统一 `applications` 视图覆盖 6 类资源 | 14.1、14.4.3、15.2 |
-| `R-DATA` | `R-DATA-010` | `R-DATA-011` | `GET /applications/{application_id}/components` 分支查询 | 14.1、14.4.3、15.2 |
+| `R-DATA` | `R-DATA-010` | `R-DATA-011` | `GET /api/v1/applications/{application_id}/components` 分支查询 | 14.1、14.4.3、15.2 |
 | `R-DATA` | 无（新增） | `R-DATA-003` | 记忆体主实例+内部组件关系持久化 | 14.1、14.4.3、15.2 |
 
 | 回标项 | 关联需求 | T28 前状态 | T28 后状态 | 证据章节 |
@@ -4228,19 +4251,29 @@ flowchart LR
 | 覆盖核对表编号重排与语义对齐 | R-DSP-010~013、R-DATA-003~011 | 待补充 | 已覆盖 | 14.4.3、14.4.25 |
 | 交付与变更流程新增“编号迁移一致性”阻断门禁 | R-OPS-010 | 待补充 | 已覆盖 | 15.1、15.2.2（第 25 条）、`docs/decision.md`（ADR-104） |
 
+#### 14.4.26 T29 全文一致性冲突与歧义收敛回标记录（2026-02-27）
+
+| 回标项 | 关联需求 | T29 前状态 | T29 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| `R-ENV-005` 语义解耦：先选 `workspace/cluster` 与路径形态分离 | R-ENV-005 | 待补充 | 已覆盖 | 4.1、7.1、7.3、14.1.21 |
+| 幂等判重统一为 `idempotency_scope + request_fingerprint`（含 Secret 章节） | R-OPS-002 | 待补充 | 已覆盖 | 2.6、7.1、8.4、10.3、14.1.21 |
+| `/instances` 兼容退场时态统一为“`v1.22.0` 已退出现行外部契约” | R-DATA-010、R-OPS-012 | 待补充 | 已覆盖 | 1.2、2.6、7.3、7.5、14.1.16、14.1.18、14.1.21 |
+| T24 历史基线与 T26/T29 现行基线隔离标注 | R-DATA-011、R-OPS-013 | 待补充 | 已覆盖 | 14.1.16、14.1.18、14.4.21、14.4.26 |
+| scoped 路径前缀与术语清理（`switch` -> 已定义动作集合） | R-OPS-004、R-OPS-013 | 待补充 | 已覆盖 | 7.3、7.5、14.1.1、14.1.13、15.2.2（第 26 条） |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
 
 | 交付物 ID | 交付物 | 内容范围 | 验收标准 | 责任角色 |
 | --- | --- | --- | --- | --- |
-| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T28 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
+| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T29 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
 | D-02 | 决策记录 | `docs/decision.md` ADR 闭环 | 关键决策均有“原因+影响+替代关系” | 架构负责人 |
 | D-03 | 需求基线 | `docs/requirements.md` | 需求 ID 稳定可追踪，可测试 | 产品负责人 |
-| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T28 状态与设计实际一致 | 项目负责人 |
+| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T29 状态与设计实际一致 | 项目负责人 |
 | D-05 | API 契约包 | OpenAPI 根文件与分组路径定义 | 可用于生成服务端桩代码与契约测试 | 后端负责人 |
 | D-06 | 数据模型包 | ERD、DDL 约束、迁移计划 | 可直接拆分 repository 层实现任务 | 后端负责人 |
-| D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景；编号迁移场景覆盖 `14.1.20` | QA 负责人 |
+| D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景；编号迁移与一致性收敛场景覆盖 `14.1.20/14.1.21` | QA 负责人 |
 | D-08 | 发布运行包 | `14.3` 发布与回滚 Runbook | 完成一次演练并可在值班手册落地 | SRE 负责人 |
 | D-09 | 编号迁移追踪包 | `14.4.25` 迁移表、扫描记录、回标闭环证据 | 旧编号退场、新编号生效且跨章节引用一致 | 架构负责人 |
 
@@ -4329,6 +4362,10 @@ flowchart LR
 25. 需求编号迁移一致性复核：凡涉及 `R-DSP/R-DATA` 编号重排或语义迁移，必须同步核对
     `14.1`（验收矩阵）、`14.4.3`（逐条覆盖）、`14.4.25`（迁移表与回标）、
     `15.1`（交付物）与本流程门禁；未完成“正文 + 验收 + 回标”三处同步前，禁止标记任务完成并进入实现拆分。
+26. 全文一致性冲突复核：凡涉及 `R-ENV-005`、`R-DATA-010/011`、`R-OPS-002/004/012/013` 的口径调整，必须同步核对
+    `1.2/2.6/4.1`（术语与时态）、`7.1/7.3/7.5`（路径/作用域/OpenAPI）、
+    `10.3`（Secret 幂等）、`14.1.16/14.1.18/14.1.21` 与 `14.4.21/14.4.26`（历史/现行隔离与回标），
+    并完成未定义术语扫描，禁止回引 `switch` 或恢复 `/instances` 现行主路径。
 
 #### 15.2.3 版本规则
 
@@ -4358,7 +4395,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T27）
+#### 15.3.1 设计自检记录（T29）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -4385,6 +4422,8 @@ flowchart LR
 | T25 异步契约外显收敛（任务内化/Hook 扩展） | 通过 | 已完成 3.5、4.10、6.4、7.1、7.2、7.5、8.1~8.6、10.2、12.2、14.1.17、14.4.22、15.1、15.2 与 ADR 回写 |
 | T26 单接口 API 基线收敛（applications-only） | 通过 | 已完成 1.2、2.6、4.9、7.1、7.3、7.4、7.5、10.2、14.1.18、14.4.23、15.1、15.2 与 ADR 回写 |
 | T27 记忆体（MEMORY）一级资源并入与六类口径补齐 | 通过 | 已完成 1.2、2.1、3.2、3.3、4.3、4.9、5.2、5.3、5.4、6.1、7.4、8.10、10.2、11.3、12.2、13.1、14.1.19、14.4.24、15.2 与 ADR 回写 |
+| T28 需求编号迁移与追踪治理收敛 | 通过 | 已完成 14.1.20、14.4.3、14.4.25、15.1、15.2 与 ADR 回写 |
+| T29 design 全文一致性冲突与歧义收敛 | 通过 | 已完成 1.2、2.6、4.1、7.1、7.3、7.5、10.3、14.1.16、14.1.18、14.1.21、14.4.3、14.4.21、14.4.23、14.4.26、15.1、15.2 与 ADR 回写 |
 | 遗漏检查 | 通过 | 当前无阻断编码的开放问题 |
 
 #### 15.3.2 开放问题（需闭环）
