@@ -35,6 +35,7 @@
 | `v1.23.0` | `2026-02-27` | 完成 T29：收敛全文冲突与歧义，定稿 `R-ENV-005` 语义解耦、`/instances` 退场时态、幂等判重口径与路径前缀一致性。 | `T29`、`ADR-105` |
 | `v1.24.0` | `2026-02-27` | 完成 T30：收敛单接口主路径时序与示例冲突，定稿“`/api/v1/applications` 主路径 + `{scope}` 补充能力接口”边界并联动验收回标。 | `T30`、`ADR-106` |
 | `v1.25.0` | `2026-02-27` | 完成 T32：补齐 `CROSS_SCOPE_REFERENCE` 错误码词典，收敛跨边界拒绝的 `403/422` 分工并联动验收回标。 | `T32`、`ADR-108` |
+| `v1.26.0` | `2026-02-27` | 完成 T33：清退外部幂等键术语与历史字段语义，统一为控制面内部 `idempotency_scope + request_fingerprint` 判重。 | `T33`、`ADR-109` |
 
 文档状态：
 
@@ -61,7 +62,7 @@
 | `CUD` | Create/Update/Delete 变更操作；本文统一走异步任务模型。 |
 | `Query` | 查询操作；本文统一走同步返回。 |
 | `AsyncTask` | 异步任务实体，承载任务状态、重试、结果与补偿语义。 |
-| `Idempotency-Key` | 变更请求幂等增强参数；当前阶段外部可选，控制面内部始终执行 `idempotency_scope + request_fingerprint` 去重。 |
+| `Idempotency Scope` | 控制面内部幂等作用域；由请求主体与作用域上下文计算，用于 24h 去重与冲突判定。 |
 | `resource_version` | 并发增强参数；当前阶段外部可选，默认并发控制基线为“资源状态前置条件 + 同资源串行化”。 |
 | `ADR` | Architecture Decision Record，记录架构决策、原因、影响与替代关系。 |
 | `NFR` | 非功能需求集合，覆盖性能、可用性、容量、安全、可扩展与可运维约束。 |
@@ -179,11 +180,11 @@ T1 阶段输出定位为“设计基线”而非“功能详设”：
 - 可见性（Visibility）：`shared` 与 `embedded` 必须在 API、权限、展示上隔离。
 - 宿主归属（Owner）：`embedded` 资源必须绑定 `owner_kind/owner_id` 并随宿主生命周期回收。
 - L1 统计口径：配额统计与审计报表仅按 6 类一级资源聚合，支撑资源只作为明细维度，不改变一级口径（`R-ABS-007`）。
-- 幂等唯一性表达：对外语义保持 `Idempotency-Key`，内部唯一键固定为 `idempotency_scope`；
-  `request_fingerprint` 用于同 scope 异载荷冲突判定；`idempotency_key` 仅保留审计检索语义（`R-OPS-002`）。
-- 幂等兼容策略：历史按 `idempotency_key` 检索的链路仅用于审计查询；任务去重与冲突判定统一迁移到 `idempotency_scope + request_fingerprint`。
-- 幂等字段 canonical 命名：`idempotency_scope`、`idempotency_key`、
-  `request_fingerprint`、`idempotency_expire_at`；除兼容说明外，正文模型/索引/验收不得使用缩写字段名。
+- 幂等唯一性表达：控制面内部唯一键固定为 `idempotency_scope`；
+  `request_fingerprint` 用于同 scope 异载荷冲突判定（`R-OPS-002`）。
+- 幂等兼容策略：历史链路统一迁移到 `idempotency_scope + request_fingerprint` 判重，不回退旧口径。
+- 幂等字段 canonical 命名：`idempotency_scope`、`request_fingerprint`、
+  `idempotency_expire_at`；除兼容说明外，正文模型/索引/验收不得使用缩写字段名。
 
 T26 单接口 ID 语义冻结（现行）：
 
@@ -207,7 +208,6 @@ T26 单接口 ID 语义冻结（现行）：
 | 历史别名 | canonical 名称 | 兼容边界 | 退场策略 |
 | --- | --- | --- | --- |
 | `idem_scope` | `idempotency_scope` | 仅用于历史数据释义与迁移脚本注释 | `v1.13.0` 起禁止在设计正文、DDL、验收用例中出现 |
-| `idem_key` | `idempotency_key` | 仅用于历史日志字段映射说明 | `v1.13.0` 起仅允许出现在历史日志解析器内部映射 |
 | `fingerprint` | `request_fingerprint` | 仅用于历史任务快照对照说明 | `v1.13.0` 起统一输出 `request_fingerprint` |
 | `expire_at` | `idempotency_expire_at` | 仅用于旧索引名迁移说明 | `v1.13.0` 起统一使用 `idempotency_expire_at` 命名 |
 
@@ -322,7 +322,7 @@ flowchart TB
 
 分层职责：
 
-- 接入层：统一认证、租户上下文注入、幂等键透传、并发版本检查入口。
+- 接入层：统一认证、租户上下文注入、幂等判重上下文注入、并发版本检查入口。
 - 领域层：只处理领域规则，不直接操作 K8S。
 - 执行层：统一 CUD 链路，按 `resource_kind` 分派适配器，确保新增资源不重写主流程。
 - 数据层：PostgreSQL 为唯一控制面事实源，运行态经 Projector 回写快照。
@@ -442,10 +442,10 @@ sequenceDiagram
   participant K8S as Managed Cluster
   participant AUD as Audit
 
-  Client->>API: CUD Request (/api/v1/applications, + Idempotency-Key/resource_version 可选)
+  Client->>API: CUD Request (/api/v1/applications, + resource_version 可选)
   API->>DB: 校验 workspace/cluster + 资源状态前置条件
   API->>DB: 幂等去重查询(24h)
-  alt 命中幂等键
+  alt 命中幂等作用域
     API-->>Client: 已有 task_id
   else 新请求
     API->>DB: 创建 AsyncTask(Pending)
@@ -588,12 +588,12 @@ sequenceDiagram
 
 | 动作 | 接口索引 | 权限 | 并发与幂等 | 审计动作 |
 | --- | --- | --- | --- | --- |
-| 新增工作空间-集群绑定 | `I1` | `super_admin` 或 `workspace_admin(managed_workspace)` | 内部按 `idempotency_scope + request_fingerprint` 判重（可选携带 `Idempotency-Key`）；按 binding 串行 | `created` |
+| 新增工作空间-集群绑定 | `I1` | `super_admin` 或 `workspace_admin(managed_workspace)` | 内部按 `idempotency_scope + request_fingerprint` 判重；按 binding 串行 | `created` |
 | 更新工作空间-集群绑定 | `I2` | `super_admin` 或 `workspace_admin(managed_workspace)` | `resource_version`；按 binding 串行 | `updated` |
 | 发起解绑（冻结） | `I3` | `super_admin` 或 `workspace_admin(managed_workspace)` | `confirmation_token`；按 binding 串行 | `freeze_requested` |
-| 新增工作空间-仓库绑定 | `I4` | `super_admin` 或 `workspace_admin(managed_workspace)` | 内部按 `idempotency_scope + request_fingerprint` 判重（可选携带 `Idempotency-Key`）；按 binding 串行 | `created` |
+| 新增工作空间-仓库绑定 | `I4` | `super_admin` 或 `workspace_admin(managed_workspace)` | 内部按 `idempotency_scope + request_fingerprint` 判重；按 binding 串行 | `created` |
 | 更新工作空间-仓库绑定 | `I5` | `super_admin` 或 `workspace_admin(managed_workspace)` | `resource_version`；按 binding 串行 | `updated` |
-| 仓库绑定回滚 | `I6` | `super_admin` 或 `workspace_admin(managed_workspace)` | 内部按 `idempotency_scope + request_fingerprint` 判重（可选携带 `Idempotency-Key`）；按 binding 串行 | `rolledback` |
+| 仓库绑定回滚 | `I6` | `super_admin` 或 `workspace_admin(managed_workspace)` | 内部按 `idempotency_scope + request_fingerprint` 判重；按 binding 串行 | `rolledback` |
 
 `workspace_admin` 授权关系与生效时机（T21）：
 
@@ -775,8 +775,7 @@ Service 命名策略（`R-DSP-007`）：
 删除契约（`R-LCP-004`，T16）：
 
 - 删除端点：`DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/lowcodes/{lowcode_id}`。
-- 请求约束：支持可选增强参数 `Idempotency-Key` 与
-  `resource_version=<n>`（`cascade` 可选，默认 `true`，仅作用于宿主派生的
+- 请求约束：支持可选增强参数 `resource_version=<n>`（`cascade` 可选，默认 `true`，仅作用于宿主派生的
   `embedded` 依赖回收）。
 - 并发与幂等：同 `idempotency_scope + request_fingerprint` 复用同一 `task_id`；
   同 scope 异指纹返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。
@@ -879,7 +878,6 @@ Service 命名策略（`R-DSP-007`）：
 | `change_reason` | string | 必填，`1..256` | 变更原因，写入审计与任务上下文。 |
 | `change_ticket_id` | string | 必填 | 外部变更单号，用于追溯。 |
 | `resource_version` | int64 | 可选增强，`>=1` | 网关资源并发控制版本（不传时走状态前置条件 + 串行化）。 |
-| `idempotency_key` | string | 可选增强，24h 去重 | 变更请求幂等键（不传时由控制面内部幂等能力兜底）。 |
 
 执行约束（`R-GTW-006`）：
 
@@ -1062,7 +1060,7 @@ T26 单接口组件查询契约（`R-DATA-010/011`）：
 统一读写语义：
 
 - 6 类一级资源 CUD 全异步，Query 全同步（`R-OPS-001`）。
-- CUD 外部不强制 `Idempotency-Key`；控制面内部始终执行
+- CUD 外部不暴露幂等键参数；控制面内部始终执行
   `idempotency_scope + request_fingerprint` 去重（`R-OPS-002`）。
 
 权限边界：
@@ -1530,7 +1528,7 @@ flowchart LR
   - Query（GET）：同步返回领域读模型。
   - CUD（POST/PUT/DELETE）：统一返回 `202 Accepted`，响应头携带 `Location` 指向资源详情查询路径，由任务系统异步执行。
 - 幂等控制：
-  - 当前阶段不强制外部携带 `Idempotency-Key`；若携带，长度建议 `8~128`。
+  - 当前阶段外部不暴露幂等键参数。
   - 控制面内部统一使用 `idempotency_scope + request_fingerprint` 做 24h 去重（见 8.4）。
 - 并发控制：
   - 当前阶段主路径为“资源状态前置条件 + 同资源串行化”。
@@ -2022,7 +2020,6 @@ T7+T12 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 
 OpenAPI 统一约束：
 
-- 每个 CUD 接口可声明请求头参数 `Idempotency-Key`（`required: false`，仅增强能力）。
 - Update/Delete 可声明 `resource_version`（`required: false`，仅增强并发控制）。
 - 每个异步接口响应必须包含 `202` 与 `AsyncAccepted`。
 - 每个异步接口 `202` 响应必须声明 `Location` 与建议轮询间隔（`Retry-After`）。
@@ -2067,7 +2064,6 @@ T16 低代码导入与删除落盘约束（`paths/lowcode_imports.yaml` + `paths
   - `202 AsyncAccepted` 与最小错误集
     `400/403/409/422/503`。
 - `DELETE {scope}/lowcodes/{lowcode_id}` 必须声明：
-  - 请求头 `Idempotency-Key`（可选增强）；
   - 查询参数 `resource_version`（可选增强）与 `cascade`（可选）；
   - `202 AsyncAccepted`；
   - operation 扩展审计动作
@@ -2155,7 +2151,6 @@ T26 单接口 OpenAPI 约束（现行）：
 仓库绑定回滚内部契约（T11）：
 
 - 端点：`POST /internal/v1/workspace-registry-bindings/{binding_id}:rollback`
-- 请求头：`Idempotency-Key`（必填）
 - 请求体最小字段：
 
 ```json
@@ -2249,7 +2244,6 @@ T26 单接口 OpenAPI 约束（现行）：
 | `resource_id` | `uuid/null` | 目标资源 ID（创建前可空） |
 | `workspace_id/cluster_id` | `uuid` | 租户与部署边界 |
 | `serialized_key` | `text` | 串行化执行键 |
-| `idempotency_key` | `text` | 原始请求头值（审计追溯） |
 | `idempotency_scope` | `text` | 幂等作用域哈希（24h 去重唯一键） |
 | `request_fingerprint` | `text` | 规范化 `body+query` 哈希 |
 | `idempotency_expire_at` | `timestamptz` | 幂等过期时间（首次接收 + 24h） |
@@ -2321,7 +2315,7 @@ sequenceDiagram
   participant DB as PostgreSQL
   participant Q as Queue
 
-  H->>S: CUD 请求 (+ Idempotency-Key/resource_version 可选)
+  H->>S: CUD 请求 (+ resource_version 可选)
   S->>DB: 参数/权限/资源状态前置条件校验
   S->>DB: 幂等作用域 + 请求指纹查重
   alt 命中且指纹一致
@@ -2430,9 +2424,8 @@ flowchart TD
 
 幂等字段与作用域（落库统一口径）：
 
-- `idempotency_key`：原始请求头，保留用于审计检索。
 - `idempotency_scope = sha256(`
-  `actor_id + workspace_id + cluster_id + method + route_template + idempotency_key)`。
+  `actor_id + workspace_id + cluster_id + method + route_template)`。
 - `request_fingerprint = sha256(canonical_json_body + canonical_query)`。
 - `idempotency_expire_at = first_seen_at + 24h`（去重窗口从首次接收时间起算）。
 
@@ -2447,7 +2440,7 @@ flowchart TD
 - 幂等记录与任务写入同事务提交，避免“查重命中但任务不存在”。
 - DDL 使用唯一约束 `uq_task_idempotency_scope(idempotency_scope)`。
 - TTL 清理任务每 10 分钟执行：删除 `idempotency_expire_at < now()` 的过期幂等记录，不影响审计事件表。
-- 兼容策略：历史数据中仅带 `idempotency_key` 的记录继续用于审计检索；新请求统一按 `idempotency_scope + request_fingerprint` 判重，禁止回退到 key 唯一判重。
+- 兼容策略：历史数据中的旧幂等字段仅用于离线回放，不参与现行判重；新请求统一按 `idempotency_scope + request_fingerprint` 判重。
 
 ### 8.5 重试、超时与取消策略
 
@@ -3015,7 +3008,7 @@ sequenceDiagram
 
 - Secret 更新使用 `resource_version` + 行级锁，避免并发写同名版本号冲突。
 - Secret 更新判重统一按 `idempotency_scope + request_fingerprint` 执行；
-  `Idempotency-Key` 仅作为可选增强输入与审计检索字段，重复请求返回同一 `task_id`。
+  重复请求返回同一 `task_id`。
 
 ### 10.4 敏感数据保护与加密策略
 
@@ -3666,7 +3659,7 @@ flowchart LR
 | 成功回滚 | `TC-ENV-04-A` | `:rollback` 返回 202；任务成功；版本从 `vN` 到 `vK`；凭证重下发成功 | API 响应、任务结果、绑定快照、Secret、审计事件 |
 | 目标版本不存在 | `TC-ENV-04-B` | 返回 `404 BINDING_VERSION_NOT_FOUND`，且无新任务入队 | 错误响应、任务表查询、审计拒绝日志 |
 | 越权调用 | `TC-ENV-04-C` | 非 `super_admin` 且不具备目标 workspace 授权的 `workspace_admin` 调用返回 `403 FORBIDDEN_ACTION`，且无绑定版本变更 | 鉴权日志、错误响应、绑定版本快照 |
-| 重复请求幂等复用 | `TC-ENV-04-D` | 同 key 同体复用同 `task_id`；同 key 异体返回 `409`（`IDEMPOTENCY_PAYLOAD_MISMATCH`） | 请求重放日志、任务记录、错误响应 |
+| 重复请求幂等复用 | `TC-ENV-04-D` | 同 scope 同体复用同 `task_id`；同 scope 异体返回 `409`（`IDEMPOTENCY_PAYLOAD_MISMATCH`） | 请求重放日志、任务记录、错误响应 |
 
 #### 14.1.5 T12 语义缺口补齐验收样例
 
@@ -3709,7 +3702,7 @@ flowchart LR
   错误码覆盖 `400/403/409/422/503`。
 - `T16-B`：
   `DELETE {scope}/lowcodes/{lowcode_id}` 支持
-  `resource_version + Idempotency-Key` 可选增强；
+  `resource_version` 可选增强；
   成功写 `delete_task_id`；
   `embedded` 回收失败进入补偿任务。
 - `T16-C`：
@@ -3792,7 +3785,7 @@ flowchart LR
 
 | 缺口 | 用例 ID | 通过条件 | 证据 |
 | --- | --- | --- | --- |
-| 外部幂等/并发参数降级 | `TC-OPS-13-A` | CUD 不携带 `Idempotency-Key/resource_version` 仍可受理并受串行化约束；携带时按增强能力生效 | 接口回放样本、任务流水、冲突响应 |
+| 外部并发参数降级 | `TC-OPS-13-A` | CUD 不携带 `resource_version` 仍可受理并受串行化约束；携带时按增强能力生效 | 接口回放样本、任务流水、冲突响应 |
 | 任务内化与资源轮询外显 | `TC-OPS-13-B` | 外部无 `/tasks/*` 查询主路径；资源详情持续返回 `status/progress/error_message/last_task` | OpenAPI lint、接口响应样本、前端轮询日志 |
 | Hook 代码扩展可配置 | `TC-OPS-13-C` | `before_hook/after_hook` 支持注册/开关/顺序；`fail_fast/continue` 阻断策略按定义执行 | 单元测试报告、任务日志、审计事件 |
 | 错误码最小集合与扩展码声明一致 | `TC-OPS-13-D` | `400/401/404/409/500` 最小集合可用，扩展码在 OpenAPI operation 级声明 | 契约测试、错误响应样本、评审记录 |
@@ -3829,7 +3822,7 @@ flowchart LR
 | 缺口 | 用例 ID | 通过条件 | 证据 |
 | --- | --- | --- | --- |
 | `R-ENV-005` 语义解耦 | `TC-ENV-08-A` | “先选 workspace/cluster”与“路径形态”分离表述；`applications-only` 不被要求显式 path 承载 `workspace_id/cluster_id` | 文档 diff、契约评审记录、检索记录 |
-| 幂等判重口径统一（含 Secret） | `TC-OPS-15-A` | 正文不再出现“按 `Idempotency-Key` 作为主判重”；统一为 `idempotency_scope + request_fingerprint`，`Idempotency-Key` 仅增强与审计 | 文档 diff、检索记录、审计字段样本 |
+| 幂等判重口径统一（含 Secret） | `TC-OPS-15-A` | 正文不再出现外部幂等键术语；统一为内部 `idempotency_scope + request_fingerprint` 判重 | 文档 diff、检索记录、审计字段样本 |
 | `/instances` 退场时态一致 | `TC-DATA-06-A` | `1.2/2.6/7.3/7.5/14.1/14.4` 明确 `v1.22.0` 已退出现行外部契约；历史回放条目均显式标注“历史基线” | 文档 diff、OpenAPI lint、历史回放说明 |
 | 路径前缀与术语一致性 | `TC-TRACE-02-A` | scoped 端点统一按 `{scope}` 或完整 `/api/v1/...` 单口径；验收文案无未定义 `switch` 术语残留 | 文档检索记录、验收矩阵 diff、评审结论 |
 
@@ -3856,6 +3849,14 @@ flowchart LR
 | `CROSS_SCOPE_REFERENCE` 词典补齐与唯一定义 | `TC-SEC-04-A` | `7.2` 错误码词典存在唯一 `422 CROSS_SCOPE_REFERENCE` 条目，且 `11.2/13.4` 触发语义一致 | 词典 diff、章节交叉核对记录 |
 | `403/422` 边界分工收敛 | `TC-SEC-04-B` | 无作用域权限或动作越权返回 `403`；权限通过但引用越界返回 `422 CROSS_SCOPE_REFERENCE` | 契约测试、错误响应样本、审计日志 |
 | OpenAPI/验收/回标语义一致 | `TC-TRACE-05-A` | 涉及跨边界引用的 operation 声明 `422 CROSS_SCOPE_REFERENCE`，并与 `14.4.29` 回标证据一致 | OpenAPI diff、覆盖回标 diff、评审记录 |
+
+#### 14.1.25 T33 幂等键术语清退验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| 外部幂等键术语清退 | `TC-OPS-16-A` | `design.md` 全文不再出现外部幂等键术语；CUD 契约不再声明对应请求头参数 | 全文检索记录、OpenAPI 约束 diff |
+| 模型字段清退 | `TC-OPS-16-B` | `5.2.3/8.1/8.4` 不再保留历史幂等键字段语义；仅保留 `idempotency_scope + request_fingerprint + idempotency_expire_at` | 模型章节 diff、DDL 草案、评审记录 |
+| 验收与治理链路同步 | `TC-OPS-16-C` | `14.1/14.4/15.2` 已同步清退旧术语并保持门禁可执行 | 验收矩阵 diff、覆盖回标 diff、流程复核记录 |
 
 ### 14.2 测试分层与关键场景
 
@@ -4070,7 +4071,7 @@ flowchart LR
 | R-DATA-010 | 3.5、4.9、7.1、7.3、7.4、14.1.18、14.1.21、14.1.22、14.1.23、14.4.23、14.4.26、14.4.27、14.4.28 | 已覆盖 | T26/T29/T30/T31 已定稿 `applications-only` 单接口与 `v1.22.0` 退场时态；主资源时序与 DATA_SERVICE 边界不再混入双口径。 |
 | R-DATA-011 | 4.9、7.3、7.4、7.5、14.1.18、14.1.21、14.4.23、14.4.26 | 已覆盖 | 已定义 `GET /applications/{application_id}/components` 六类分支返回契约与错误语义（含 `MEMORY` 主实例+内部组件），并完成历史/现行边界隔离。 |
 | R-OPS-001 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
-| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、10.3、12.6、14.1.21、14.4.26 | 已覆盖 | 已在 4.10、7.1、8.1、8.4、10.3 收敛为“外部 `Idempotency-Key` 可选 + 内部 `idempotency_scope + request_fingerprint` 强制判重”。 |
+| R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、10.3、12.6、14.1.21、14.1.25、14.4.26、14.4.30 | 已覆盖 | 已在 4.10、7.1、8.1、8.4、10.3 收敛为“外部不暴露幂等键参数 + 内部 `idempotency_scope + request_fingerprint` 强制判重”。 |
 | R-OPS-003 | 2.5、4.10、7.1~7.6、8.1~8.6、10.1、10.2、12.6 | 已覆盖 | 已在 2.5、10.1、10.2 固化三角色模型、`managed_workspace` 授权关系与动作矩阵。 |
 | R-OPS-004 | 4.10、7.1~7.6、8.1~8.6、10.2、11.2、11.3、12.6、14.1.24、14.4.29 | 已覆盖 | 已在 7.2、10.2、11.2、11.3 定稿跨边界与越权拒绝分工：越权 `403 FORBIDDEN_ACTION`，引用越界 `422 CROSS_SCOPE_REFERENCE`。 |
 | R-OPS-005 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.1 固化串行化键模型与同资源串行执行。 |
@@ -4125,14 +4126,14 @@ flowchart LR
 | API Path 命名冲突修正（旧路径 -> `applications/lowcodes/agents`；T31 后 `DATA_SERVICE` 进一步收敛到 `applications + embeddeddataservices`） | 接口契约要求（路径命名） | 待补充 | 已覆盖 | 7.3、7.5、11.3、14.1.1、14.4.28 |
 | Update 方法统一（`PATCH` -> `PUT`） | 接口契约要求（资源更新语义） | 待补充 | 已覆盖 | 7.1、7.3 |
 | Service 自动命名统一（两种规则按优先级并存） | R-DSP-007 | 待补充 | 已覆盖 | 4.3、9.4 |
-| 幂等落库口径统一（`idempotency_key` 与 `idempotency_scope`、唯一索引、24h TTL） | R-OPS-002 | 待补充 | 已覆盖 | 5.2.3、5.4、8.1、8.4 |
+| 幂等落库口径统一（`idempotency_scope`、唯一索引、24h TTL） | R-OPS-002 | 待补充 | 已覆盖 | 5.2.3、5.4、8.1、8.4 |
 | 冲突修订留痕与需求变更流程补充 | 变更流程治理要求 | 待补充 | 已覆盖 | 15.2、`docs/decision.md`（ADR-085） |
 
 #### 14.4.6 T9 语义补齐回标记录（2026-02-23）
 
 | 回标项 | 关联需求 | T9 前状态 | T9 后状态 | 证据章节 |
 | --- | --- | --- | --- | --- |
-| 幂等唯一性表达统一为“`idempotency_scope` 唯一 + `idempotency_key` 审计” | R-OPS-002 | 待补充 | 已覆盖 | 2.6、5.2.3、8.1、8.4、14.1.2 |
+| 幂等唯一性表达统一为“`idempotency_scope` 唯一 + `request_fingerprint` 冲突判定” | R-OPS-002 | 待补充 | 已覆盖 | 2.6、5.2.3、8.1、8.4、14.1.2 |
 | 配额统计与审计报表仅按 6 类一级资源聚合 | R-ABS-007 | 待补充 | 已覆盖 | 4.2、13.5、14.1.2 |
 | 下载导出到外部环境导入成功闭环与 E2E 证据定义 | R-PKG-004、R-PKG-006 | 待补充 | 已覆盖 | 4.8、14.1、14.1.2、14.2.2 |
 | embedded 组件独立运维权限与可见性统一 | R-DSP-011、R-DSP-012 | 待补充 | 已覆盖 | 10.2、11.3、14.1.2、14.1.5 |
@@ -4273,7 +4274,7 @@ flowchart LR
 
 | 回标项 | 关联需求 | T25 前状态 | T25 后状态 | 证据章节 |
 | --- | --- | --- | --- | --- |
-| 外部幂等与并发参数降级（`Idempotency-Key/resource_version` 由必填改为可选增强） | R-OPS-002、R-OPS-006 | 待补充 | 已覆盖 | 4.10、7.1、8.2、8.4、14.1.17 |
+| 外部并发参数降级（`resource_version` 由必填改为可选增强） | R-OPS-002、R-OPS-006 | 待补充 | 已覆盖 | 4.10、7.1、8.2、8.4、14.1.17 |
 | 任务实体内化与资源轮询外显（`status/progress/error_message`） | R-OPS-008 | 待补充 | 已覆盖 | 3.5、6.4、7.1、7.5、8.1、8.6、14.1.17 |
 | `before_hook/after_hook` 代码级扩展点定稿（注册/顺序/阻断/观测） | R-OPS-011 | 待补充 | 已覆盖 | 4.10、8.2.2、8.3、8.6、12.2、14.1.17 |
 | 响应与错误码最小集合收敛并完成治理联动 | R-OPS-002、R-OPS-008、R-OPS-011 | 待补充 | 已覆盖 | 7.1、7.2、7.5、10.2、15.1、15.2 |
@@ -4357,19 +4358,27 @@ flowchart LR
 | 跨边界拒绝 `403/422` 边界收敛 | R-ENV-004、R-OPS-004 | 待补充 | 已覆盖 | 7.2、10.2、11.2、14.1.24 |
 | OpenAPI/验收/回标一致性闭环 | R-OPS-004、NFR-014 | 待补充 | 已覆盖 | 7.5、14.1.24、14.4.3、14.4.29 |
 
+#### 14.4.30 T33 幂等键术语清退回标记录（2026-02-27）
+
+| 回标项 | 关联需求 | T33 前状态 | T33 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| 外部幂等键术语与请求头参数声明全量清退 | R-OPS-002、R-OPS-012 | 待补充 | 已覆盖 | 2.6、7.1、7.5、14.1.25 |
+| `async_tasks` 历史幂等键字段语义清退，模型/流程仅保留 scope+指纹 | R-OPS-002 | 待补充 | 已覆盖 | 5.2.3、8.1、8.4、14.1.25 |
+| 验收矩阵、覆盖回标、变更流程门禁同步改写 | R-OPS-002、R-OPS-010 | 待补充 | 已覆盖 | 14.1.25、14.4.30、15.2.2（第 29 条） |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
 
 | 交付物 ID | 交付物 | 内容范围 | 验收标准 | 责任角色 |
 | --- | --- | --- | --- | --- |
-| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T32 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
+| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T33 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
 | D-02 | 决策记录 | `docs/decision.md` ADR 闭环 | 关键决策均有“原因+影响+替代关系” | 架构负责人 |
 | D-03 | 需求基线 | `docs/requirements.md` | 需求 ID 稳定可追踪，可测试 | 产品负责人 |
-| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T32 状态与设计实际一致 | 项目负责人 |
+| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T33 状态与设计实际一致 | 项目负责人 |
 | D-05 | API 契约包 | OpenAPI 根文件与分组路径定义 | 可用于生成服务端桩代码与契约测试 | 后端负责人 |
 | D-06 | 数据模型包 | ERD、DDL 约束、迁移计划 | 可直接拆分 repository 层实现任务 | 后端负责人 |
-| D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景；编号迁移与一致性收敛场景覆盖 `14.1.20/14.1.21/14.1.22/14.1.23/14.1.24` | QA 负责人 |
+| D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景；编号迁移与一致性收敛场景覆盖 `14.1.20/14.1.21/14.1.22/14.1.23/14.1.24/14.1.25` | QA 负责人 |
 | D-08 | 发布运行包 | `14.3` 发布与回滚 Runbook | 完成一次演练并可在值班手册落地 | SRE 负责人 |
 | D-09 | 编号迁移追踪包 | `14.4.25` 迁移表、扫描记录、回标闭环证据 | 旧编号退场、新编号生效且跨章节引用一致 | 架构负责人 |
 
@@ -4468,6 +4477,10 @@ flowchart LR
 28. 跨边界错误码词典复核：凡涉及 `R-ENV-004`、`R-OPS-004`、`NFR-014` 或跨边界拒绝语义调整，必须同步核对
     `7.2`（错误码词典）、`11.2`（跨边界校验）、`13.4`（NFR 约束）、`7.5`（OpenAPI 声明）、
     `14.1.24/14.4.29`（验收与回标），禁止将权限越权与引用越界混写为单一错误码。
+29. 幂等键术语清退复核：凡涉及 `R-OPS-002` 幂等语义调整，必须同步核对
+    `2.6/5.2.3`（术语与模型字段）、`7.1/7.5`（对外契约与 OpenAPI）、
+    `8.1/8.4`（任务与判重流程）、`10.3`（Secret 判重）、
+    `14.1.25/14.4.30`（验收与回标），禁止恢复外部幂等键参数与历史字段语义。
 
 #### 15.2.3 版本规则
 
@@ -4497,7 +4510,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T32）
+#### 15.3.1 设计自检记录（T33）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -4529,6 +4542,7 @@ flowchart LR
 | T30 单接口主路径时序与示例路径冲突收敛 | 通过 | 已完成 3.5、7.1、7.3、14.1.22、14.4.3、14.4.27、15.1 与 ADR 回写 |
 | T31 `DATA_SERVICE` 接口口径统一（`applications` 与 `dataservices` 边界） | 通过 | 已完成 4.3、7.3、7.5、10.2、11.3、14.1.23、14.4.3、14.4.28、15.1、15.2 与 ADR 回写 |
 | T32 跨边界错误码词典补齐（`CROSS_SCOPE_REFERENCE`） | 通过 | 已完成 7.2、11.2、13.4、14.1.24、14.4.3、14.4.29、15.2 与 ADR 回写 |
+| T33 幂等键术语清退（完全移除外部幂等键） | 通过 | 已完成 2.6、5.2.3、7.1、7.5、8.1、8.4、10.3、14.1.25、14.4.30、15.2 与 ADR 回写 |
 | 遗漏检查 | 通过 | 当前无阻断编码的开放问题 |
 
 #### 15.3.2 开放问题（需闭环）
