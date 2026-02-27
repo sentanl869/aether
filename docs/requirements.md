@@ -86,8 +86,8 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
   不作为控制面领域主实体。
 - 资源模板（Template）：平台内置或管理员导入的 Helm Chart 模板与参数 schema。
 - 资源实例（Instance）：模板或制品在指定工作空间/集群/namespace 的运行实体。
-- `instance_id`：实例 ID，指任意一级资源实例主标识（用于 `/instances/{instance_id}` 路径参数）。
-- `application_id`：应用 ID，指应用聚合对象主标识（用于 `/applications/{application_id}` 路径参数）；与 `instance_id` 语义不同。
+- `application_id`：统一资源 ID，指 `/applications/{application_id}` 路径参数；
+  对外作为 5 类一级资源统一主标识，对内按 `resource_type` 映射到对应领域实体主键。
 - 高代码制品（HighCode Artifact）：用于高代码应用部署的镜像或 Helm Chart 来源。
 - 嵌入式数据服务（Embedded Data Service）：
   - 随低代码平台部署自动创建的数据服务实例。
@@ -217,10 +217,14 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 - R-DATA-006：嵌入式资源不得出现在共享资源选择器中。
 - R-DATA-007：应用查看页必须展示 Agent 集合、组件集合、入口地址、发布 Chart 版本信息。
 - R-DATA-008：关系变更（绑定/解绑/级联删除）必须记录审计轨迹。
-- R-DATA-009：应用信息查询采用统一 `applications` 接口视图，覆盖至少
-  `HIGH_CODE_APP` 与 `LOW_CODE_PLATFORM` 两类；低代码平台部署后信息查询必须通过应用接口获取。
-- R-DATA-010：需提供“应用下实例信息查询”能力；`GET /api/v1/applications/{application_id}/instances?workspace_id={workspace_id}`。
-  对 `HIGH_CODE_APP` 返回 Agent 实例与组件实例详情，对 `LOW_CODE_PLATFORM` 返回平台子组件与依赖组件实例详情。
+- R-DATA-009：应用信息查询采用统一 `applications` 接口视图，覆盖 5 类一级资源
+  `DATA_SERVICE`、`LOW_CODE_PLATFORM`、`DEVBOX`、`GATEWAY`、`HIGH_CODE_APP`；
+  低代码平台部署后信息查询必须通过应用接口获取。
+- R-DATA-010：需提供“应用下组件信息查询”能力；
+  `GET /api/v1/applications/{application_id}/components?workspace_id={workspace_id}`。
+  对 `HIGH_CODE_APP` 返回 Agent 实例与组件实例详情，对 `LOW_CODE_PLATFORM`
+  返回平台子组件与依赖组件实例详情；对 `DATA_SERVICE`、`DEVBOX`、`GATEWAY`
+  返回其运行拓扑组件明细（如 Workload/Service/PVC/Secret 映射）。
 
 ### 10. CRUD、权限与异步任务
 
@@ -239,13 +243,12 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 - R-OPS-010：所有关键操作（创建、更新、删除、发布、导出）必须记录审计日志。
 - R-OPS-011：异步 CUD 执行链路需支持前置/后置自定义埋点扩展点，供其他模块在动作前后执行业务逻辑；
   埋点能力需支持代码级可配置（注册/开关/顺序/阻断策略），不依赖配置文件、控制台配置或持久化配置。
-- R-OPS-012：实例接口需提供完整 OpenAPI 契约：
-  `POST/GET /api/v1/instances`、`GET/PUT/DELETE /api/v1/instances/{instance_id}`、
-  `POST /api/v1/instances/{instance_id}/actions/start|stop|restart`。
-- R-OPS-013：应用接口需提供与实例接口同构的一套 OpenAPI 契约，但不包含 `restart`：
+- R-OPS-012：统一应用接口需提供完整 OpenAPI 契约：
   `POST/GET /api/v1/applications`、`GET/PUT/DELETE /api/v1/applications/{application_id}`、
-  `POST /api/v1/applications/{application_id}/actions/start|stop`、
-  `GET /api/v1/applications/{application_id}/instances`。
+  `POST /api/v1/applications/{application_id}/actions/start|stop|restart`、
+  `GET /api/v1/applications/{application_id}/components`。
+- R-OPS-013：统一应用接口需定义动作能力矩阵：`start|stop|restart` 的可用性按
+  `resource_type` 约束并在 OpenAPI 中显式声明；不支持的动作返回 `409 Conflict` 与标准错误对象。
 
 ## 领域模型与唯一性约束（设计输入）
 
@@ -396,8 +399,8 @@ DevBox 补充状态：
 ### 通用契约
 
 - API 前缀统一为 `/api/v1`。
-- 当前阶段资源主路径包含 `/api/v1/instances` 与 `/api/v1/applications` 两套：
-  `/instances` 表示资源实例视图，`/applications` 表示应用聚合视图。
+- 当前阶段资源主路径统一为 `/api/v1/applications`；
+  不再保留 `/api/v1/instances` 顶层资源接口。
 - `workspace_id` 作为查询与鉴权作用域参数（query）；
   创建请求体必须包含 `workspace_id` 与 `cluster_id`。
 - CUD 接口统一返回 `202 Accepted`，并通过 `Location` + 资源详情轮询获取异步执行结果。
@@ -419,28 +422,18 @@ DevBox 补充状态：
   - 同一路径通过不同 HTTP Method 区分语义，不使用 `POST/GET/LIST` 混写。
   - Path 段尽量使用单一单词的复数名词，避免连字符拼接命名。
 
-- 实例视角接口（当前阶段必选，路径参数统一为 `instance_id`）：
-  - `GET /api/v1/instances`（支持按 `resource_type/status/cluster_id` 等过滤）
-  - `POST /api/v1/instances`
-  - `GET /api/v1/instances/{instance_id}`
-  - `PUT /api/v1/instances/{instance_id}`
-  - `DELETE /api/v1/instances/{instance_id}`
-  - `POST /api/v1/instances/{instance_id}/actions/start`
-  - `POST /api/v1/instances/{instance_id}/actions/stop`
-  - `POST /api/v1/instances/{instance_id}/actions/restart`
-
-- 应用视角接口（当前阶段必选，路径参数统一为 `application_id`）：
+- 统一应用接口（当前阶段必选，路径参数统一为 `application_id`）：
   - `POST /api/v1/applications`（请求体包含 `workspace_id`、`cluster_id`、`resource_type`）
-  - `GET /api/v1/applications?workspace_id={workspace_id}&resource_type={HIGH_CODE_APP|LOW_CODE_PLATFORM}`
+  - `GET /api/v1/applications?workspace_id={workspace_id}&resource_type={DATA_SERVICE|LOW_CODE_PLATFORM|DEVBOX|GATEWAY|HIGH_CODE_APP}`
   - `GET /api/v1/applications/{application_id}?workspace_id={workspace_id}`
   - `PUT /api/v1/applications/{application_id}?workspace_id={workspace_id}`
   - `DELETE /api/v1/applications/{application_id}?workspace_id={workspace_id}`
-  - `POST /api/v1/applications/{application_id}/actions/start?workspace_id={workspace_id}`
-  - `POST /api/v1/applications/{application_id}/actions/stop?workspace_id={workspace_id}`
-  - `GET /api/v1/applications/{application_id}/instances?workspace_id={workspace_id}`（应用下 Agent/运行实例信息查询）
+  - `POST /api/v1/applications/{application_id}/actions/start|stop|restart?workspace_id={workspace_id}`
+  - `GET /api/v1/applications/{application_id}/components?workspace_id={workspace_id}`（应用下运行组件信息查询）
 
 - 说明：
-  - 现有 OpenAPI 中 `/applications/{application_id}/...` 若实际承载实例语义，应重命名为 `/instances/{instance_id}/...`。
+  - 现有 OpenAPI 中 `/api/v1/instances/*` 若仍存在，仅可作为短期兼容路径；
+    当前需求基线不再将其作为必选主接口。
   - 发布产物（Release/Chart 下载）与模板/制品独立查询接口在后续版本补齐，不作为当前 API 基线阻断项。
   - 异步任务查询通过资源详情轮询实现，不单独开放 `/tasks/*`。
 
@@ -523,20 +516,20 @@ DevBox 补充状态：
 | R-GTW-003 | 每 workspace+cluster 仅允许一个网关实例 | 单元测试 + 集成测试 | 后端 |
 | R-HCA-003 | Chart 渠道可部署多 Agent 并处理 Chart 自带组件 | 集成测试 + E2E | 后端 |
 | R-HCA-012 | `cascade=true` 且共享组件被复用时返回 `409` | 集成测试 | 后端 |
-| R-DATA-009 | 应用信息查询统一走 `applications` 接口并覆盖高代码+低代码平台 | 集成测试 + E2E | 后端 + 前端 |
-| R-DATA-010 | 应用实例查询接口可按应用类型返回对应实例明细 | 集成测试 + E2E | 后端 + 前端 |
+| R-DATA-009 | 应用信息查询统一走 `applications` 接口并覆盖 5 类一级资源 | 集成测试 + E2E | 后端 + 前端 |
+| R-DATA-010 | 应用组件查询接口可按应用类型返回对应运行组件明细 | 集成测试 + E2E | 后端 + 前端 |
 | R-PKG-001 | 发布高代码应用后自动生成可用 Helm Chart 包 | 集成测试 + E2E | 后端 |
 | R-PKG-003 | 发布 Chart 成功推送到工作空间关联仓库并可追溯版本 | 集成测试 | 后端 |
 | R-PKG-004 | 用户可下载发布 Chart 并在外部环境导入成功 | E2E | 前端 + 后端 |
 | R-OPS-001 | 5 类资源 CUD 异步、Query 同步符合契约 | E2E | 前端 + 后端 |
 | R-OPS-011 | 异步 CUD 支持代码级可配置的前后置埋点扩展点，其他模块可注册并生效 | 单元测试 + 集成测试 | 后端 |
-| R-OPS-012 | 实例视角 CURD+start/stop/restart 在 OpenAPI 中完整定义并可用 | 集成测试 + E2E | 后端 + 前端 |
-| R-OPS-013 | 应用视角 CURD+start/stop（无 restart）在 OpenAPI 中完整定义并可用 | 集成测试 + E2E | 后端 + 前端 |
+| R-OPS-012 | 统一应用接口 CURD+start/stop/restart+components 在 OpenAPI 中完整定义并可用 | 集成测试 + E2E | 后端 + 前端 |
+| R-OPS-013 | 按 `resource_type` 的动作能力矩阵在 OpenAPI 与运行时校验中一致生效 | 集成测试 + E2E | 后端 + 前端 |
 | NFR-001~005 | 性能与可用性满足量化指标 | 压测 + 运行验收 | SRE + 后端 |
 
 ## 交付物与接口（面向设计）
 
-- OpenAPI 3.0 草案（基于 `instances` + `applications` 双资源模型，含 5 类资源、状态轮询契约与错误码）。
+- OpenAPI 3.0 草案（基于 `applications` 单资源模型，含 5 类资源、状态轮询契约与错误码）。
 - 统一资源抽象模型与 ERD（含 owner/visibility 语义、唯一性约束）。
 - 统一状态机定义（资源状态机、任务状态机、发布包状态机、解绑状态机）。
 - 异步任务与补偿设计说明（串行化键、重试、超时、取消、回收补偿；任务为内部模型）。
