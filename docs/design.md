@@ -29,6 +29,7 @@
 | `v1.17.0` | `2026-02-27` | 完成 T23：网关配置口径收敛为“变更与回滚审计”，清理历史术语并联动验收/回标/治理。 | `T23`、`ADR-099` |
 | `v1.18.0` | `2026-02-27` | 完成 T24：双视图 API 与 ID 语义收敛历史基线追溯，补齐实例/应用双视图契约、验收与回标治理链路。 | `T24`、`ADR-100` |
 | `v1.19.0` | `2026-02-27` | 完成 T25：异步契约外显收敛，定稿“任务实体内化 + 资源轮询外显 + before/after hook 代码级扩展”并联动验收回标与治理复核。 | `T25`、`ADR-101` |
+| `v1.20.0` | `2026-02-27` | 完成 T26：单接口 API 基线收敛，定稿 `applications-only` 主路径、统一 `application_id`、`/components` 查询与动作能力矩阵。 | `T26`、`ADR-102` |
 
 文档状态：
 
@@ -43,13 +44,13 @@
 | `Aether` | 部署模块控制面，负责统一资源管理、任务编排、状态回写与审计。 |
 | `Workspace` | 租户与权限边界；每个关联集群映射同名 namespace。 |
 | `Managed Cluster` | 通过 kubeconfig 纳管并可被部署模块调度的 K8S 集群。 |
-| `L1 Resource` | 一级资源，固定 5 类：数据服务组件、低代码平台、DevBox、网关、高代码应用。 |
+| `L1 Resource` | 一级资源，固定 6 类：数据服务组件、低代码平台、DevBox、网关、高代码应用、记忆体。 |
 | `Supporting Resource` | 支撑资源，如 Agent 实例、制品、发布记录、关系引用、任务与密钥版本等。 |
 | `Template` | 可部署标准单元，当前统一为 Helm Chart + 参数 schema。 |
 | `Artifact` | 高代码来源制品，类型包括 DevBox 发布镜像、用户上传镜像、用户上传 Helm Chart。 |
 | `Instance` | 模板或制品在 `workspace+cluster+namespace` 的运行实例。 |
-| `instance_id` | 历史双视图（T24）中实例视图主标识，仅用于 `/instances/{instance_id}`；不得用于应用主资源路径参数。 |
-| `application_id` | 应用视图主标识，用于 `/applications/{application_id}`；历史双视图与当前统一应用接口均保持该命名。 |
+| `instance_id` | 历史双视图（T24）兼容标识，仅用于兼容期 `deprecated` 路径 `/instances/{instance_id}`；不得用于现行主接口参数。 |
+| `application_id` | 统一资源主标识，用于 `/applications/{application_id}`；对内按 `resource_type` 映射到 6 类一级资源实体主键。 |
 | `shared` | 可复用资源可见性，进入共享列表与选择器，可被多个宿主引用。 |
 | `embedded` | 宿主内嵌资源可见性，仅随宿主创建/运维/回收，不进入共享列表。 |
 | `CUD` | Create/Update/Delete 变更操作；本文统一走异步任务模型。 |
@@ -85,7 +86,7 @@
 
 Aether 部署模块的设计目标与 `docs/requirements.md` 保持一致：
 
-- 在平台纳管的 K8S 集群上，统一管理 5 类一级资源（数据服务组件、低代码平台、DevBox、网关、高代码应用）的生命周期。
+- 在平台纳管的 K8S 集群上，统一管理 6 类一级资源（数据服务组件、低代码平台、DevBox、网关、高代码应用、记忆体）的生命周期。
 - 在“统一抽象 + 统一执行链路”前提下支持扩展，新增资源类型时不重写任务、鉴权、审计主流程。
 - 明确共享资源与嵌入式资源边界，避免资源混管。
 - 支持高代码应用发布产出标准 Helm Chart（版本化、可入库、可下载）。
@@ -162,7 +163,7 @@ T1 阶段输出定位为“设计基线”而非“功能详设”：
 
 本设计采用“一级资源 + 支撑资源 + 运行时对象”三层模型：
 
-- 一级资源（固定 5 类）：`DataServiceInstance`、`LowCodePlatformInstance`、`DevBoxInstance`、`GatewayInstance`、`HighCodeApplication`。
+- 一级资源（固定 6 类）：`DataServiceInstance`、`LowCodePlatformInstance`、`DevBoxInstance`、`GatewayInstance`、`HighCodeApplication`、`MemoryInstance`。
 - 支撑资源：`AgentInstance`、`HighCodeArtifact`、`DevBoxPublishRecord`、`HighCodeReleaseChart`、关系引用实体、任务实体、密钥版本实体。
 - 运行时对象：Pod/ReplicaSet/Job 等，仅作为观测对象，不作为控制面业务主实体。
 
@@ -172,24 +173,29 @@ T1 阶段输出定位为“设计基线”而非“功能详设”：
 - 实例（Instance）：模板/制品在 workspace+cluster+namespace 的运行实体。
 - 可见性（Visibility）：`shared` 与 `embedded` 必须在 API、权限、展示上隔离。
 - 宿主归属（Owner）：`embedded` 资源必须绑定 `owner_kind/owner_id` 并随宿主生命周期回收。
-- L1 统计口径：配额统计与审计报表仅按 5 类一级资源聚合，支撑资源只作为明细维度，不改变一级口径（`R-ABS-007`）。
+- L1 统计口径：配额统计与审计报表仅按 6 类一级资源聚合，支撑资源只作为明细维度，不改变一级口径（`R-ABS-007`）。
 - 幂等唯一性表达：对外语义保持 `Idempotency-Key`，内部唯一键固定为 `idempotency_scope`；
   `request_fingerprint` 用于同 scope 异载荷冲突判定；`idempotency_key` 仅保留审计检索语义（`R-OPS-002`）。
 - 幂等兼容策略：历史按 `idempotency_key` 检索的链路仅用于审计查询；任务去重与冲突判定统一迁移到 `idempotency_scope + request_fingerprint`。
 - 幂等字段 canonical 命名：`idempotency_scope`、`idempotency_key`、
   `request_fingerprint`、`idempotency_expire_at`；除兼容说明外，正文模型/索引/验收不得使用缩写字段名。
 
-T24 历史双视图 ID 语义冻结（追溯）：
+T26 单接口 ID 语义冻结（现行）：
 
-| 对象 | 历史主标识 | 路径参数约束 | 修正规则 |
+| `resource_type` | `application_id` 映射实体主键 | 对外路径参数约束 | 说明 |
 | --- | --- | --- | --- |
-| 实例视图资源 | `instance_id` | 仅允许出现在 `/api/v1/instances/{instance_id}` 及其子动作路径 | 旧示例若以 `application_id` 承载实例语义，统一修正为 `instance_id` |
-| 应用视图资源 | `application_id` | 仅允许出现在 `/api/v1/applications/{application_id}` 及其子路径 | 禁止在应用视图文档中以 `instance_id` 代替 |
+| `DATA_SERVICE` | `data_service_instances.id` | 仅允许 `/api/v1/applications/{application_id}` | 不再外露 `data_service_instance_id` 路径语义 |
+| `LOW_CODE_PLATFORM` | `lowcode_platform_instances.id` | 同上 | 不再外露 `lowcode_id` 路径语义 |
+| `DEVBOX` | `devbox_instances.id` | 同上 | 不再外露 `devbox_id` 路径语义 |
+| `GATEWAY` | `gateway_instances.id` | 同上 | 不再外露 `gateway_id` 路径语义 |
+| `HIGH_CODE_APP` | `highcode_applications.id` | 同上 | 对外沿用 `application_id` |
+| `MEMORY` | `memory_instances.id` | 同上 | 记忆体统一纳入应用主路径 |
 
-追溯约束：
+兼容与退场约束：
 
-- T24 为历史双视图基线，保留用于评审与追踪；当前需求主口径仍以 `applications` 单接口为准。
-- 历史双视图中的 `instance_id` 不得外溢到现行统一应用接口参数命名。
+- 现行外部主路径仅允许 `/api/v1/applications`，`instance_id` 不得出现在现行主路径示例与参数对象中。
+- `/api/v1/instances/*` 仅允许短期兼容并必须标注 `deprecated: true`；
+  计划退场版本固定为 `v1.22.0`（见 7.5 OpenAPI 约束）。
 
 历史别名兼容与退场策略（T18）：
 
@@ -978,7 +984,7 @@ E2E 通过条件（发布验收门禁）：
 - 固化依赖锁定文件；
 - 固化镜像 digest 映射。
 
-### 4.9 应用关系持久化与资源可见性（R-DATA-001~008）
+### 4.9 应用关系持久化与资源可见性（R-DATA-001~008、R-DATA-010/011）
 
 关系持久化：
 
@@ -997,17 +1003,21 @@ E2E 通过条件（发布验收门禁）：
 - 软删字段：`deleted_at`、`deleted_by`、`delete_task_id`（`R-DATA-005`）。
 - 绑定/解绑/级联删除均写审计事件（`R-DATA-008`）。
 
-T24 历史双视图查询契约（追溯，`R-DATA-010/011`）：
+T26 单接口组件查询契约（`R-DATA-010/011`）：
 
-- 双视图职责：
-  - 实例视图：聚焦实例生命周期与动作，主路径 `/api/v1/instances`。
-  - 应用视图：聚焦应用实体与应用下实例查询，主路径 `/api/v1/applications`。
-- 应用下实例查询接口：
-  `GET /api/v1/applications/{application_id}/instances?workspace_id={workspace_id}`。
-- 返回分支规则：
-  - `application_type=HIGH_CODE_APP`：返回 `agent_instances[]` 与 `component_instances[]`。
-  - `application_type=LOW_CODE_PLATFORM`：返回 `platform_components[]` 与 `dependency_components[]`。
-- 空集语义：应用存在但当前无运行实例时返回 `200` + 空数组。
+- 统一应用查询主路径：
+  `GET /api/v1/applications?workspace_id={workspace_id}&resource_type={...}`，
+  覆盖 6 类一级资源。
+- 应用下组件查询接口：
+  `GET /api/v1/applications/{application_id}/components?workspace_id={workspace_id}`。
+- 返回分支规则（按 `resource_type`）：
+  - `HIGH_CODE_APP`：返回 `agent_instances[]`、`data_service_components[]`；
+  - `LOW_CODE_PLATFORM`：返回 `platform_components[]`、`dependency_components[]`；
+  - `DATA_SERVICE`：返回 `service_components[]`；
+  - `DEVBOX`：返回 `runtime_components[]`；
+  - `GATEWAY`：返回 `gateway_components[]`；
+  - `MEMORY`：返回 `memory_main_components[]`、`memory_dependency_components[]`。
+- 空集语义：应用存在但当前无运行组件时返回 `200` + 空数组。
 - 异常语义：
   - `404 RESOURCE_NOT_FOUND`：`application_id` 不存在或不属于 `workspace_id`；
   - `403 FORBIDDEN_WORKSPACE`：调用方无工作空间权限。
@@ -1016,7 +1026,7 @@ T24 历史双视图查询契约（追溯，`R-DATA-010/011`）：
 
 统一读写语义：
 
-- 5 类一级资源 CUD 全异步，Query 全同步（`R-OPS-001`）。
+- 6 类一级资源 CUD 全异步，Query 全同步（`R-OPS-001`）。
 - CUD 外部不强制 `Idempotency-Key`；控制面内部始终执行
   `idempotency_scope + request_fingerprint` 去重（`R-OPS-002`）。
 
@@ -1454,9 +1464,10 @@ flowchart LR
   - 媒体类型：`application/json`
   - 认证：`Authorization: Bearer <token>`
 - 租户上下文：
-  - 外部资源接口统一采用工作空间/集群分层路径：
-    `/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}/...`
-  - 服务端以路径参数为准注入租户上下文，禁止请求体覆盖 `workspace_id/cluster_id/namespace`。
+  - 外部资源主接口统一采用 `/api/v1/applications`。
+  - Query 必须显式携带 `workspace_id` 作为鉴权与查询作用域参数；
+    Create 请求体必须包含 `workspace_id`、`cluster_id`、`resource_type`。
+  - 服务端以 `workspace_id + cluster_id` 注入租户上下文，禁止由请求体覆盖 `namespace`。
 - 同步与异步语义：
   - Query（GET）：同步返回领域读模型。
   - CUD（POST/PUT/DELETE）：统一返回 `202 Accepted`，响应头携带 `Location` 指向资源详情查询路径，由任务系统异步执行。
@@ -1528,17 +1539,18 @@ flowchart LR
 
 - `page`（默认 1）、`page_size`（默认 20，最大 100）
 - `sort`（如 `created_at.desc`）
-- `status`、`keyword`、`visibility`（按资源域可选）
+- `workspace_id`（必填）、`resource_type`、`status`、`cluster_id`、`keyword`
 
-T24 历史双视图通用契约补充（追溯）：
+T26 单接口主路径补充（现行）：
 
-- 历史双视图主路径：`/api/v1/instances` 与 `/api/v1/applications`。
-- Query 场景必须显式携带 `workspace_id` 作为鉴权与查询作用域参数。
-- 历史列表过滤维度最小集合：`resource_type`、`status`、`cluster_id`。
-- 动作能力矩阵（历史）：
-  - 实例视图动作：`start|stop|restart`；
-  - 应用视图动作：`start|stop`（不提供 `restart`）。
-- 兼容保留路径（若存在）必须标注 `deprecated: true` 与退场版本，不得作为默认示例。
+- canonical path 固定为 `/api/v1/applications`；
+  `/api/v1/instances/*` 不再作为外部主口径。
+- 列表过滤维度最小集合固定为：
+  `workspace_id/resource_type/status/cluster_id`。
+- 动作接口统一为
+  `POST /api/v1/applications/{application_id}/actions/start|stop|restart?workspace_id=...`，
+  是否支持由 `resource_type` 能力矩阵判定（见 7.3、10.2）。
+- 兼容保留路径（若存在）必须标注 `deprecated: true` 与 `x-sunset-version: v1.22.0`。
 
 ### 7.2 错误码与异常模型
 
@@ -1559,6 +1571,7 @@ T24 历史双视图通用契约补充（追溯）：
 | 409 | `RESOURCE_VERSION_CONFLICT` | 提供了 `resource_version` 且版本不匹配（可选增强路径） | 否 | 无 |
 | 409 | `REFERENCE_CONFLICT` | `cascade=true` 时 shared 组件仍被外部引用 | 否 | `SHARED_RESOURCE_IN_USE` 兼容至 `v1.12`，`v1.13` 下线 |
 | 409 | `RESOURCE_BUSY` | 同资源已有 Running/Pending 任务 | 是 | 无 |
+| 409 | `ACTION_NOT_SUPPORTED` | 资源类型不支持该动作（`start/stop/restart`） | 否 | 无 |
 | 409 | `IDEMPOTENCY_PAYLOAD_MISMATCH` | 同幂等作用域但请求指纹不一致 | 否 | 无 |
 | 409 | `BINDING_STATE_CONFLICT` | 绑定状态不允许回滚或目标版本与当前版本一致 | 否 | 无 |
 | 422 | `SCHEMA_VALIDATION_FAILED` | 模板/制品参数校验失败 | 否 | 无 |
@@ -1577,6 +1590,8 @@ T17 口径约束（403/409）：
 
 - 403 仅允许 `FORBIDDEN_WORKSPACE` 与 `FORBIDDEN_ACTION` 两个 canonical 业务码，按场景互斥触发。
 - 409 shared 引用冲突仅允许 `REFERENCE_CONFLICT`，删除决策表、OpenAPI、验收断言必须同码。
+- 409 不支持动作固定返回 `ACTION_NOT_SUPPORTED`，并在 `error.details[]` 给出
+  `resource_type/action`。
 - 兼容窗口内若命中旧码（`FORBIDDEN`、`SHARED_RESOURCE_IN_USE`），网关统一归并为 canonical 码并记录告警日志 `error_code_legacy_alias_total`。
 
 异常字段约定：
@@ -1588,33 +1603,36 @@ T17 口径约束（403/409）：
 
 ### 7.3 资源接口分组与路径规范
 
-资源分组：
+T26 单接口资源分组（现行 canonical path）：
 
-- 作用域前缀：`{scope}=/workspaces/{workspace_id}/clusters/{cluster_id}`
-
-| 分组 | Tag | 路径前缀 |
+| 分组 | Tag | 路径 |
 | --- | --- | --- |
-| 数据服务组件 | `DataService` | `{scope}/dataservices` |
-| 低代码平台 | `LowCodePlatform` | `{scope}/lowcodes` |
-| DevBox | `DevBox` | `{scope}/devboxes` |
-| 网关 | `Gateway` | `{scope}/gateways` |
-| 高代码应用 | `HighCodeApplication` | `{scope}/applications` |
-| Agent 实例 | `AgentInstance` | `{scope}/agents` |
-| 嵌入式组件运维（超管） | `EmbeddedDataServiceAdmin` | `{scope}/embeddeddataservices` |
-| 资源模板 | `Template` | `{scope}/templates` |
-| 高代码制品 | `HighCodeArtifact` | `{scope}/artifacts` |
-| DevBox 发布记录 | `DevBoxPublishRecord` | `{scope}/devboxes/{devbox_id}/publishes` |
-| 发布 Chart 包 | `ReleaseChart` | `{scope}/charts` |
+| 统一应用资源（6 类） | `Application` | `/api/v1/applications` |
+| 应用动作 | `ApplicationAction` | `/api/v1/applications/{application_id}/actions/{action}` |
+| 应用下组件查询 | `ApplicationComponent` | `/api/v1/applications/{application_id}/components` |
 
-标准 CRUD 模板（示例）：
+统一应用接口（当前阶段必选）：
 
-- Create：`POST /.../{resources}`
-- List：`GET /.../{resources}`
-- Get：`GET /.../{resources}/{resource_id}`
-- Update：`PUT /.../{resources}/{resource_id}`
-- Delete：`DELETE /.../{resources}/{resource_id}?cascade=<bool>&resource_version=<n 可选>`
+- `POST /api/v1/applications`
+- `GET /api/v1/applications?workspace_id={workspace_id}&resource_type={DATA_SERVICE|LOW_CODE_PLATFORM|DEVBOX|GATEWAY|HIGH_CODE_APP|MEMORY}&status={status}&cluster_id={cluster_id}`
+- `GET /api/v1/applications/{application_id}?workspace_id={workspace_id}`
+- `PUT /api/v1/applications/{application_id}?workspace_id={workspace_id}`
+- `DELETE /api/v1/applications/{application_id}?workspace_id={workspace_id}`
+- `POST /api/v1/applications/{application_id}/actions/start|stop|restart?workspace_id={workspace_id}`
+- `GET /api/v1/applications/{application_id}/components?workspace_id={workspace_id}`
 
-以下端点为文档 canonical path（T7 统一口径）：
+动作能力矩阵（`R-OPS-013`）：
+
+| `resource_type` | `start` | `stop` | `restart` | 不支持动作语义 |
+| --- | --- | --- | --- | --- |
+| `DATA_SERVICE` | 不支持 | 不支持 | 支持 | 返回 `409 ACTION_NOT_SUPPORTED` |
+| `LOW_CODE_PLATFORM` | 支持 | 支持 | 支持 | - |
+| `DEVBOX` | 支持 | 支持 | 支持 | - |
+| `GATEWAY` | 不支持 | 不支持 | 支持 | 返回 `409 ACTION_NOT_SUPPORTED` |
+| `HIGH_CODE_APP` | 支持 | 支持 | 支持 | - |
+| `MEMORY` | 支持 | 支持 | 支持 | - |
+
+以下端点为补充能力接口（非主资源 canonical path）：
 
 模板与制品查询接口：
 
@@ -1674,25 +1692,14 @@ DevBox 发布记录接口：
 - 发布包列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts`
 - 下载发布包：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package`
 
-T24 历史双视图接口清单（追溯）：
+历史兼容与退场说明（T26）：
 
-- 实例视图：
-  - `POST /api/v1/instances`
-  - `GET /api/v1/instances?workspace_id={workspace_id}&resource_type=&status=&cluster_id=`
-  - `GET /api/v1/instances/{instance_id}?workspace_id={workspace_id}`
-  - `PUT /api/v1/instances/{instance_id}?workspace_id={workspace_id}`
-  - `DELETE /api/v1/instances/{instance_id}?workspace_id={workspace_id}`
-  - `POST /api/v1/instances/{instance_id}/actions/start|stop|restart?workspace_id={workspace_id}`
-- 应用视图：
-  - `POST /api/v1/applications`
-  - `GET /api/v1/applications?workspace_id={workspace_id}&application_type={HIGH_CODE_APP|LOW_CODE_PLATFORM}`
-  - `GET /api/v1/applications/{application_id}?workspace_id={workspace_id}`
-  - `PUT /api/v1/applications/{application_id}?workspace_id={workspace_id}`
-  - `DELETE /api/v1/applications/{application_id}?workspace_id={workspace_id}`
-  - `POST /api/v1/applications/{application_id}/actions/start|stop?workspace_id={workspace_id}`
-  - `GET /api/v1/applications/{application_id}/instances?workspace_id={workspace_id}`
+- `/api/v1/instances/*` 仅作为短期兼容路径，不得出现在默认示例与 SDK 生成入口；
+  `v1.20.0` 起必须标注 `deprecated: true`，`v1.22.0` 后移除。
+- 兼容期内若调用 `/instances/*`，服务端应返回与 `/applications` 一致的 `application_id`，
+  并在响应头附加 `Deprecation` 与 `Sunset` 提示。
 
-T24 历史双视图关键时序（应用下实例查询）：
+T26 单接口关键时序（应用下组件查询）：
 
 ```mermaid
 sequenceDiagram
@@ -1701,15 +1708,15 @@ sequenceDiagram
   participant Auth as AuthZ
   participant Read as Read Model
 
-  Client->>API: GET /api/v1/applications/{application_id}/instances?workspace_id=ws-1
+  Client->>API: GET /api/v1/applications/{application_id}/components?workspace_id=ws-1
   API->>Auth: 校验 workspace 授权
   Auth-->>API: pass/fail
   alt unauthorized
     API-->>Client: 403 FORBIDDEN_WORKSPACE
   else authorized
-    API->>Read: 按 application_id 查询 application_type 与实例关系
-    Read-->>API: HIGH_CODE_APP 或 LOW_CODE_PLATFORM 结果
-    API-->>Client: 200 + 分支化 instances payload
+    API->>Read: 按 application_id 查询 resource_type 与组件关系
+    Read-->>API: 6 类资源之一的分支结果
+    API-->>Client: 200 + 分支化 components payload
   end
 ```
 
@@ -1732,12 +1739,12 @@ T21 关键动作鉴权矩阵（API 入口口径）：
 
 | 动作 | `super_admin` | `workspace_admin(managed_workspace)` | `user(associated workspace)` | 拒绝语义 |
 | --- | --- | --- | --- | --- |
-| 共享数据服务组件 CRUD（`/dataservices`） | 允许 | 允许 | 拒绝 | `403 FORBIDDEN_ACTION` |
-| 内置低代码平台开通/关闭（`/lowcodes`） | 允许 | 允许 | 拒绝 | `403 FORBIDDEN_ACTION` |
+| 共享数据服务组件 CRUD（`/applications?resource_type=DATA_SERVICE`） | 允许 | 允许 | 拒绝 | `403 FORBIDDEN_ACTION` |
+| 内置低代码平台开通/关闭（`/applications?resource_type=LOW_CODE_PLATFORM`） | 允许 | 允许 | 拒绝 | `403 FORBIDDEN_ACTION` |
 | 低代码平台导入（`/lowcodes/imports`） | 允许 | 拒绝 | 拒绝 | `403 FORBIDDEN_ACTION` |
-| 网关实例 CRUD（`/gateways`） | 允许 | 允许 | 拒绝 | `403 FORBIDDEN_ACTION` |
-| 高代码应用 CRUD（`/applications`） | 允许 | 允许 | 允许 | 跨 workspace 返回 `403 FORBIDDEN_WORKSPACE` |
-| 记忆体 CRUD（路径在 T27 落盘） | 允许 | 允许 | 允许 | 跨 workspace 返回 `403 FORBIDDEN_WORKSPACE` |
+| 网关实例 CRUD（`/applications?resource_type=GATEWAY`） | 允许 | 允许 | 拒绝 | `403 FORBIDDEN_ACTION` |
+| 高代码应用 CRUD（`/applications?resource_type=HIGH_CODE_APP`） | 允许 | 允许 | 允许 | 跨 workspace 返回 `403 FORBIDDEN_WORKSPACE` |
+| 记忆体 CRUD（`/applications?resource_type=MEMORY`） | 允许 | 允许 | 允许 | 跨 workspace 返回 `403 FORBIDDEN_WORKSPACE` |
 
 错误码收敛规则：
 
@@ -1852,10 +1859,10 @@ LowCodeSummary:
 
 应用详情固定返回结构（示例字段）：
 
-- `application`：应用主信息与 `status/resource_version/last_task`
-- `agent_instances[]`：成员 Agent 的独立状态
-- `dataservice_instances[]`：区分 `shared/embedded` 与 `owner`
-- `release_charts[]`：发布版本与 `chart_ref/digest/status`
+- `application`：应用主信息与 `resource_type/status/resource_version/last_task`
+- `components[]`：统一组件数组（按 `resource_type` 返回分支化字段）
+- `relations[]`：关系对象（`visibility/owner_kind/owner_id`）
+- `release_charts[]`：发布版本与 `chart_ref/digest/status`（仅 `HIGH_CODE_APP`）
 
 读一致性策略：
 
@@ -1872,14 +1879,17 @@ LowCodeSummary:
   `entry_url`、`admin_account_ref`（按角色脱敏）、`dependency_topology`、`version`。
 - 读路径不做实时拓扑重算：`dependency_topology` 来源于最近一次成功任务写回快照。
 
-T24 历史应用下实例查询读路径（追溯）：
+T26 单接口应用下组件查询读路径（现行）：
 
-- `GET /applications/{application_id}/instances` 必须先判定 `application_type` 再选择返回 schema。
-- `HIGH_CODE_APP` 返回 `agent_instances[]/component_instances[]`，字段最小集：
-  `instance_id`、`instance_name`、`status`、`component_kind`、`last_task_id`。
-- `LOW_CODE_PLATFORM` 返回 `platform_components[]/dependency_components[]`，字段最小集：
-  `instance_id`、`component_type`、`status`、`owner_kind`、`owner_id`。
-- 返回空集时保持 `200`，不得将“无实例”编码为 `404`。
+- `GET /applications/{application_id}/components` 必须先判定 `resource_type` 再选择返回 schema。
+- 分支返回最小字段：
+  - `HIGH_CODE_APP`：`component_id/component_name/component_kind/status/owner_kind/owner_id/last_task_id`；
+  - `LOW_CODE_PLATFORM`：`component_id/component_name/component_type/status/owner_kind/owner_id`；
+  - `DATA_SERVICE`：`component_id/component_name/component_role/status/service_name`；
+  - `DEVBOX`：`component_id/component_name/component_role/status/runtime_ref`；
+  - `GATEWAY`：`component_id/component_name/component_role/status/revision`；
+  - `MEMORY`：`component_id/component_name/component_role/status/visibility/owner_kind/owner_id`。
+- 返回空集时保持 `200`，不得将“无组件”编码为 `404`。
 
 ### 7.5 OpenAPI 3.0 组织方式
 
@@ -1901,8 +1911,9 @@ T7+T12 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 | `/lowcodes` | `{scope}/lowcodes` | `paths/lowcodes.yaml` |
 | `/lowcodes/imports` | `{scope}/lowcodes/imports` | `paths/lowcode_imports.yaml` |
 | `/lowcodes/{lowcode_id}` | `{scope}/lowcodes/{lowcode_id}` | `paths/lowcodes.yaml` |
-| `instances（历史双视图）` | `/api/v1/instances` | `paths/instances.yaml` |
-| `/applications/{application_id}/instances（历史双视图）` | `/api/v1/applications/{application_id}/instances` | `paths/applications_instances.yaml` |
+| `applications（单接口主路径）` | `/api/v1/applications` | `paths/applications.yaml` |
+| `/applications/{application_id}/components` | `/api/v1/applications/{application_id}/components` | `paths/applications_components.yaml` |
+| `instances（仅兼容，deprecated）` | `/api/v1/instances` | `paths/instances_compat.yaml` |
 | `applications relations` | `{scope}/applications/{application_id}/relations` | `paths/application_relations.yaml` |
 | `/applications/{application_id}/charts` | 见 7.3「发布包列表」接口 | `paths/highcode_charts.yaml` |
 | `/charts/{chart_id}/package` | `{scope}/charts/{chart_id}/package` | `paths/highcode_charts.yaml` |
@@ -1958,16 +1969,16 @@ T16 低代码导入与删除落盘约束（`paths/lowcode_imports.yaml` + `paths
   - operation 扩展审计动作
     `x-audit-action: lowcode_instance_delete`.
 
-T24 历史双视图 OpenAPI 约束（追溯）：
+T26 单接口 OpenAPI 约束（现行）：
 
-- `paths/instances.yaml` 中路径参数仅允许 `instance_id`；`paths/applications*.yaml` 中仅允许 `application_id`。
-- `GET /applications/{application_id}/instances` 必须以 `oneOf` 区分
-  `HIGH_CODE_APP` 与 `LOW_CODE_PLATFORM` 的返回结构。
-- 动作能力矩阵必须显式声明：
-  - 实例视图支持 `start|stop|restart`；
-  - 应用视图仅支持 `start|stop`；
-  - 不支持动作统一返回 `409` + 标准错误对象。
-- 若保留兼容旧路径，必须在 OpenAPI 标注 `deprecated: true` 并提供 `x-sunset-version`。
+- `paths/applications*.yaml` 中路径参数统一使用 `application_id`；
+  不允许新增 `instance_id` 路径参数。
+- `GET /applications/{application_id}/components` 必须以 `oneOf` 区分
+  `DATA_SERVICE/LOW_CODE_PLATFORM/DEVBOX/GATEWAY/HIGH_CODE_APP/MEMORY` 六类返回结构。
+- 动作能力矩阵必须在 operation 扩展字段显式声明 `x-action-support`，
+  不支持动作统一返回 `409 ACTION_NOT_SUPPORTED` + 标准错误对象。
+- 若保留 `/instances/*` 兼容旧路径，必须标注 `deprecated: true`，
+  并提供 `x-sunset-version: v1.22.0`。
 
 落地建议：
 
@@ -2770,6 +2781,17 @@ type RequestContext struct {
 | 高代码应用 CRUD | 允许 | 允许 | 允许 |
 | 记忆体 CRUD | 允许 | 允许 | 允许 |
 
+T26 单接口动作授权与能力联合矩阵（`R-OPS-013`）：
+
+| `resource_type` | `start` | `stop` | `restart` | 不支持动作返回 |
+| --- | --- | --- | --- | --- |
+| `DATA_SERVICE` | 否 | 否 | 是 | `409 ACTION_NOT_SUPPORTED` |
+| `LOW_CODE_PLATFORM` | 是（`super_admin/workspace_admin`） | 是（`super_admin/workspace_admin`） | 是（`super_admin/workspace_admin`） | `403 FORBIDDEN_ACTION` 或 `409 ACTION_NOT_SUPPORTED` |
+| `DEVBOX` | 是（`super_admin/workspace_admin`） | 是（`super_admin/workspace_admin`） | 是（`super_admin/workspace_admin`） | `403 FORBIDDEN_ACTION` 或 `409 ACTION_NOT_SUPPORTED` |
+| `GATEWAY` | 否 | 否 | 是（`super_admin/workspace_admin`） | `409 ACTION_NOT_SUPPORTED` |
+| `HIGH_CODE_APP` | 是（`super_admin/workspace_admin/user`） | 是（`super_admin/workspace_admin/user`） | 是（`super_admin/workspace_admin/user`） | `403 FORBIDDEN_ACTION` |
+| `MEMORY` | 是（`super_admin/workspace_admin/user`） | 是（`super_admin/workspace_admin/user`） | 是（`super_admin/workspace_admin/user`） | `403 FORBIDDEN_ACTION` |
+
 `embedded` 组件运维权限收敛（`R-DSP-011`、`R-DSP-012`）：
 
 | 场景 | `super_admin` | `workspace_admin(managed_workspace)` | `user` | 说明 |
@@ -3410,9 +3432,9 @@ T9 运维补充约束：
 | R-HCA-011~014 | 级联冲突 `TC-HCA-03` | cascade=false 保留共享；cascade=true `409 REFERENCE_CONFLICT`；embedded 回收 | 删除响应、关系与补偿 |
 | R-PKG-001~006 | 发布打包与导入（`TC-PKG-01`、`TC-PKG-02`） | 每次发布产出版本化 Chart；OCI 推送成功可下载；外部导入通过验证 | Release 记录、OCI 清单、下载与导入验证 |
 | R-DATA-001~008 | 关系查询（`TC-DATA-01/02`） | 详情与 `relations` 返回 4 类关系；变更可审计 | 详情响应、relations 响应、审计检索 |
-| R-DATA-010~011 | 历史双视图查询契约（`TC-DATA-04`） | `applications` 视图覆盖 `HIGH_CODE_APP/LOW_CODE_PLATFORM`，且 `GET /applications/{application_id}/instances` 返回分支化结构 | 契约测试、接口响应样本、鉴权日志 |
+| R-DATA-010~011 | 单接口查询契约（`TC-DATA-05`） | `applications` 视图覆盖 6 类 `resource_type`，且 `GET /applications/{application_id}/components` 返回分支化结构 | 契约测试、接口响应样本、鉴权日志 |
 | R-OPS-001~011 | 异步任务、幂等、轮询外显与 Hook 扩展（`TC-OPS-01`、`TC-OPS-13`） | CUD 返回 `202+Location`；同 scope 命中同任务；异指纹返回 `409`；资源详情轮询可观测；Hook 策略生效 | 任务流水、幂等记录、资源详情响应、Hook 指标与审计 |
-| R-OPS-012~013 | 历史双视图 OpenAPI 与动作矩阵（`TC-OPS-12`） | `instances/applications` 路径、动作能力矩阵与运行时错误码一致 | OpenAPI diff、动作探测测试、错误响应样本 |
+| R-OPS-012~013 | 单接口 OpenAPI 与动作矩阵（`TC-OPS-14`） | `applications` 路径、动作能力矩阵与运行时错误码一致；不支持动作返回 `409 ACTION_NOT_SUPPORTED` | OpenAPI diff、动作探测测试、错误响应样本 |
 | S-SEC-001~007 | Secret 边界、版本与审计（`TC-SEC-01`） | Secret 在 workspace namespace；用户不可读明文；回滚采用新版本并审计 | Secret 版本记录、RBAC、审计 |
 | NFR-001~004 | 接口延迟、排队时延、任务执行时长（`TC-NFR-01`） | 满足 13.1 阈值：提交 `P95<=300ms`、Query `P95<=800ms`、排队 `P95<=5s` | 压测报告、监控截图 |
 | NFR-005~011 | 可用性、容量、吞吐（`TC-NFR-02`） | 月可用性 `>=99.9%`；容量与吞吐达到 13.2/13.3 目标 | SLI 报表、容量与压测报告 |
@@ -3596,6 +3618,15 @@ flowchart LR
 | 任务内化与资源轮询外显 | `TC-OPS-13-B` | 外部无 `/tasks/*` 查询主路径；资源详情持续返回 `status/progress/error_message/last_task` | OpenAPI lint、接口响应样本、前端轮询日志 |
 | Hook 代码扩展可配置 | `TC-OPS-13-C` | `before_hook/after_hook` 支持注册/开关/顺序；`fail_fast/continue` 阻断策略按定义执行 | 单元测试报告、任务日志、审计事件 |
 | 错误码最小集合与扩展码声明一致 | `TC-OPS-13-D` | `400/401/404/409/500` 最小集合可用，扩展码在 OpenAPI operation 级声明 | 契约测试、错误响应样本、评审记录 |
+
+#### 14.1.18 T26 单接口 API 基线收敛验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| 单接口主路径收敛 | `TC-DATA-05-A` | 外部主接口仅使用 `/api/v1/applications`；`/instances` 仅兼容且标注 `deprecated + sunset` | OpenAPI lint、接口回放、文档检索记录 |
+| 统一 ID 语义收敛 | `TC-DATA-05-B` | `application_id` 在术语、路径、参数对象中单口径；6 类 `resource_type` 均可映射实体主键 | 文档 diff、契约测试、映射校验报告 |
+| 组件查询语义替换 | `TC-DATA-05-C` | `GET /applications/{application_id}/components` 覆盖 6 类返回分支；空集返回 `200` | 接口响应样本、分支断言报告 |
+| 动作能力矩阵收敛 | `TC-OPS-14-A` | `start\|stop\|restart` 按 `resource_type` 执行；不支持动作统一返回 `409 ACTION_NOT_SUPPORTED` | 动作探测测试、错误样本、审计日志 |
 
 ### 14.2 测试分层与关键场景
 
@@ -3796,8 +3827,8 @@ flowchart LR
 | R-DATA-006 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义 embedded 组件不进入共享关联模型。 |
 | R-DATA-007 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.3、7.3、14.1.5 定义应用详情与 relations 读模型字段集合。 |
 | R-DATA-008 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.5 定义关系变更审计事件最小字段。 |
-| R-DATA-010 | 4.9、7.1、7.3、7.4、14.1.16、14.4.21 | 已覆盖 | T24 历史双视图基线已补齐 `applications` 视图覆盖规则与验收链路。 |
-| R-DATA-011 | 4.9、7.3、7.4、7.5、14.1.16、14.4.21 | 已覆盖 | 已定义 `GET /applications/{application_id}/instances` 分支化返回契约与错误语义。 |
+| R-DATA-010 | 4.9、7.1、7.3、7.4、14.1.18、14.4.23 | 已覆盖 | T26 已定稿 `applications-only` 单接口，列表过滤覆盖 6 类 `resource_type`。 |
+| R-DATA-011 | 4.9、7.3、7.4、7.5、14.1.18、14.4.23 | 已覆盖 | 已定义 `GET /applications/{application_id}/components` 六类分支返回契约与错误语义。 |
 | R-OPS-001 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
 | R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 4.10、7.1、8.1、8.4 收敛为“外部 `Idempotency-Key` 可选 + 内部幂等去重强制执行”。 |
 | R-OPS-003 | 2.5、4.10、7.1~7.6、8.1~8.6、10.1、10.2、12.6 | 已覆盖 | 已在 2.5、10.1、10.2 固化三角色模型、`managed_workspace` 授权关系与动作矩阵。 |
@@ -3809,8 +3840,8 @@ flowchart LR
 | R-OPS-009 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 固化补偿触发与一致性策略。 |
 | R-OPS-010 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、8.2、8.3 纳入关键动作审计点。 |
 | R-OPS-011 | 4.10、7.1、7.5、8.2、8.3、8.6、12.2、14.1.17、14.4.22 | 已覆盖 | 已在 8.2.2/8.3 定义 `before_hook/after_hook` 代码注册、顺序、阻断策略与观测审计约束。 |
-| R-OPS-012 | 7.1、7.3、7.5、14.1.16、14.4.21 | 已覆盖 | T24 历史双视图 OpenAPI 路径与接口清单已补齐。 |
-| R-OPS-013 | 7.1、7.3、7.5、14.1.16、14.4.21 | 已覆盖 | 已补齐实例/应用动作能力矩阵与 `409` 冲突语义。 |
+| R-OPS-012 | 7.1、7.3、7.5、14.1.18、14.4.23 | 已覆盖 | T26 已补齐统一应用接口 OpenAPI 清单（CRUD + actions + components）。 |
+| R-OPS-013 | 7.2、7.3、7.5、10.2、14.1.18、14.4.23 | 已覆盖 | 已按 `resource_type` 定义动作能力矩阵，不支持动作统一返回 `409 ACTION_NOT_SUPPORTED`。 |
 | S-SEC-001 | 10.3、11.1、11.2 | 已覆盖 | 已在 10.3 固化 Secret 存放范围为工作空间 namespace。 |
 | S-SEC-002 | 10.1、10.4 | 已覆盖 | 已在 10.1/10.4 固化“可引用不可明文读取”权限边界。 |
 | S-SEC-003 | 10.3 | 已覆盖 | 已在 10.3 固化版本化命名 `{secret_name}.v{n}`。 |
@@ -4005,16 +4036,25 @@ flowchart LR
 | `before_hook/after_hook` 代码级扩展点定稿（注册/顺序/阻断/观测） | R-OPS-011 | 待补充 | 已覆盖 | 4.10、8.2.2、8.3、8.6、12.2、14.1.17 |
 | 响应与错误码最小集合收敛并完成治理联动 | R-OPS-002、R-OPS-008、R-OPS-011 | 待补充 | 已覆盖 | 7.1、7.2、7.5、10.2、15.1、15.2 |
 
+#### 14.4.23 T26 单接口 API 基线收敛回标记录（2026-02-27）
+
+| 回标项 | 关联需求 | T26 前状态 | T26 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| `application_id` 统一 ID 语义与 6 类实体映射落盘 | R-DATA-010 | 待补充 | 已覆盖 | 1.2、2.6、7.1 |
+| 单接口主路径与过滤契约收敛（`applications-only`） | R-DATA-010、R-OPS-012 | 待补充 | 已覆盖 | 7.1、7.3、7.5、14.1.18 |
+| 组件查询从 `/instances` 切换为 `/components` 并补齐六类分支 | R-DATA-011 | 待补充 | 已覆盖 | 4.9、7.4、7.5、14.1.18 |
+| 动作能力矩阵与 `409 ACTION_NOT_SUPPORTED` 错误模型收敛 | R-OPS-013 | 待补充 | 已覆盖 | 7.2、7.3、10.2、14.1.18 |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
 
 | 交付物 ID | 交付物 | 内容范围 | 验收标准 | 责任角色 |
 | --- | --- | --- | --- | --- |
-| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T25 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
+| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T26 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
 | D-02 | 决策记录 | `docs/decision.md` ADR 闭环 | 关键决策均有“原因+影响+替代关系” | 架构负责人 |
 | D-03 | 需求基线 | `docs/requirements.md` | 需求 ID 稳定可追踪，可测试 | 产品负责人 |
-| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T25 状态与设计实际一致 | 项目负责人 |
+| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T26 状态与设计实际一致 | 项目负责人 |
 | D-05 | API 契约包 | OpenAPI 根文件与分组路径定义 | 可用于生成服务端桩代码与契约测试 | 后端负责人 |
 | D-06 | 数据模型包 | ERD、DDL 约束、迁移计划 | 可直接拆分 repository 层实现任务 | 后端负责人 |
 | D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景 | QA 负责人 |
@@ -4093,6 +4133,10 @@ flowchart LR
     `3.5`（异步时序外显）、`4.10`（外部参数可选基线）、`6.4`（任务内化约束）、
     `7.1/7.2/7.5`（响应、错误码与 OpenAPI）、`8.1~8.6`（去重、Hook、补偿）、
     `10.2/12.2`（权限与观测）、`14.1.17/14.4.22`（验收与回标），禁止恢复 `/tasks/*` 对外主口径或回退外部必填参数约束。
+23. 单接口 API 基线一致性复核：凡涉及 `R-DATA-010/011`、`R-OPS-012/013` 的变更，必须同步核对
+    `1.2/2.6`（统一 `application_id` 映射）、`4.9`（`/components` 分支语义）、
+    `7.1/7.3/7.4/7.5`（`applications-only` 路径、过滤、动作、OpenAPI）、
+    `10.2`（动作授权矩阵）、`14.1.18/14.4.23`（验收与回标），禁止将 `/instances` 恢复为外部主路径。
 
 #### 15.2.3 版本规则
 
@@ -4122,7 +4166,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T25）
+#### 15.3.1 设计自检记录（T26）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -4147,6 +4191,7 @@ flowchart LR
 | T23 网关配置口径收敛（变更与回滚审计） | 通过 | 已完成 1.1、2.3、4.6、5.8、7.3、7.6、14.1.15、14.3、14.4.20、15.2、15.3 与 ADR 回写 |
 | T24 双视图 API 与 ID 语义收敛（历史基线） | 通过 | 已完成 1.2、2.6、4.9、7.1、7.3、7.4、7.5、14.1.16、14.4.21、15.1、15.2 与 ADR 回写 |
 | T25 异步契约外显收敛（任务内化/Hook 扩展） | 通过 | 已完成 3.5、4.10、6.4、7.1、7.2、7.5、8.1~8.6、10.2、12.2、14.1.17、14.4.22、15.1、15.2 与 ADR 回写 |
+| T26 单接口 API 基线收敛（applications-only） | 通过 | 已完成 1.2、2.6、4.9、7.1、7.3、7.4、7.5、10.2、14.1.18、14.4.23、15.1、15.2 与 ADR 回写 |
 | 遗漏检查 | 通过 | 当前无阻断编码的开放问题 |
 
 #### 15.3.2 开放问题（需闭环）

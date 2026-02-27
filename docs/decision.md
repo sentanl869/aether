@@ -982,3 +982,30 @@
   - `task_design.md` 的 T25 与 T25-01~T25-05 可标记完成，并关闭 GAP-51~GAP-57。
   - 后续若恢复 `/tasks/*` 外部主口径或重新强制外部必填并发/幂等参数，必须重新走 ADR 评审。
 - 替代关系：替代 ADR-045 中“CUD 外部强制 `Idempotency-Key` + `resource_version`”的历史口径；补充 ADR-100 的现行契约治理边界。
+
+### ADR-102: T26 单接口 API 基线定稿为“applications-only + 统一 application_id + components 查询”
+
+- 决策：
+  - 外部资源主路径固定为 `/api/v1/applications`；
+    `/api/v1/instances/*` 仅允许短期兼容，不再作为主口径。
+  - `application_id` 定稿为 6 类一级资源统一外部主标识，
+    对内按 `resource_type` 映射实体主键（`DATA_SERVICE/LOW_CODE_PLATFORM/DEVBOX/GATEWAY/HIGH_CODE_APP/MEMORY`）。
+  - 应用下运行组件查询统一切换为
+    `GET /api/v1/applications/{application_id}/components?workspace_id=...`，
+    并按 `resource_type` 返回分支结构。
+  - 动作接口固定为
+    `POST /api/v1/applications/{application_id}/actions/start|stop|restart`，
+    能力按 `resource_type` 矩阵约束；不支持动作统一返回
+    `409 ACTION_NOT_SUPPORTED` 标准错误对象。
+  - 兼容路径退场规则固定为：
+    `v1.20.0` 起 `deprecated`，`x-sunset-version` 固定 `v1.22.0`。
+- 原因：
+  - `requirements.md` 已切换 `applications-only` 新基线，但 `design.md` 仍残留
+    双视图（`instances/applications`）与双 ID 外部语义，导致实现入口与验收断言存在反向漂移风险（GAP-58~GAP-63）。
+  - `R-DATA-010/011`、`R-OPS-012/013` 要求统一主路径、统一 ID、统一组件查询和动作矩阵；若不收敛，OpenAPI 与运行时将长期双口径。
+- 影响：
+  - `design.md` 已同步修订 `1.2`、`2.6`、`4.9`、`7.1`、`7.3`、`7.4`、`7.5`、
+    `10.2`、`14.1.18`、`14.4.23`、`15.1`、`15.2`、`15.3.1`。
+  - `task_design.md` 的 T26 与 T26-01~T26-05 可标记完成，并关闭 GAP-58~GAP-63。
+  - 后续若新增或恢复 `/instances` 主路径，必须重新走 ADR 评审并同步更新验收与回标。
+- 替代关系：替代 ADR-100 中“双视图作为现行接口口径”的历史结论；保留 ADR-100 仅作为历史追溯记录。
