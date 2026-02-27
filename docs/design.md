@@ -33,6 +33,7 @@
 | `v1.21.0` | `2026-02-27` | 完成 T27：记忆体（`MEMORY`）并入 6 类一级资源，定稿 `mem0` 迁移边界、Memory 模型/契约/权限/NFR 与验收回标闭环。 | `T27`、`ADR-103` |
 | `v1.22.0` | `2026-02-27` | 完成 T28：`R-DSP/R-DATA` 编号迁移与追踪治理收敛，冻结旧新编号迁移表并统一验收/回标/治理门禁。 | `T28`、`ADR-104` |
 | `v1.23.0` | `2026-02-27` | 完成 T29：收敛全文冲突与歧义，定稿 `R-ENV-005` 语义解耦、`/instances` 退场时态、幂等判重口径与路径前缀一致性。 | `T29`、`ADR-105` |
+| `v1.24.0` | `2026-02-27` | 完成 T30：收敛单接口主路径时序与示例冲突，定稿“`/api/v1/applications` 主路径 + `{scope}` 补充能力接口”边界并联动验收回标。 | `T30`、`ADR-106` |
 
 文档状态：
 
@@ -422,6 +423,11 @@ flowchart TB
 
 ### 3.5 核心时序图（CUD/发布/回收）
 
+路径口径约束（T30）：
+
+- 现行外部主路径示例仅允许 `/api/v1/applications`。
+- `{scope}`（`/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}`）仅用于补充能力接口（如 `relations/releases/charts`），不得作为主资源 CUD canonical path。
+
 #### 3.5.1 通用 CUD 时序（创建/更新/删除）
 
 ```mermaid
@@ -435,7 +441,7 @@ sequenceDiagram
   participant K8S as Managed Cluster
   participant AUD as Audit
 
-  Client->>API: CUD Request (+ Idempotency-Key/resource_version 可选)
+  Client->>API: CUD Request (/api/v1/applications, + Idempotency-Key/resource_version 可选)
   API->>DB: 校验 workspace/cluster + 资源状态前置条件
   API->>DB: 幂等去重查询(24h)
   alt 命中幂等键
@@ -443,7 +449,7 @@ sequenceDiagram
   else 新请求
     API->>DB: 创建 AsyncTask(Pending)
     API->>Q: 投递 task_id
-    API-->>Client: 202 + Location(/applications/{application_id}?workspace_id=...)
+    API-->>Client: 202 + Location(/api/v1/applications/{application_id}?workspace_id=...)
     Q->>W: 拉取任务(串行键加锁)
     W->>DB: 置 Running + started_at
     W->>AD: render/apply/delete
@@ -465,7 +471,7 @@ sequenceDiagram
   participant W as Release Worker
   participant OCI as OCI Registry
 
-  User->>API: POST /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/releases
+  User->>API: POST {scope}/applications/{application_id}/releases
   API->>DB: 校验应用归属/网关可用性/镜像依赖
   API->>DB: 创建发布任务 + ReleaseChart(Packaging)
   API-->>User: 202 + Location
@@ -489,7 +495,7 @@ sequenceDiagram
   participant W as Delete Worker
   participant K8S as Managed Cluster
 
-  User->>API: DELETE /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}?cascade=true
+  User->>API: DELETE /api/v1/applications/{application_id}?workspace_id={workspace_id}&cascade=true
   API->>DB: 查询共享组件引用关系
   alt 存在被其他应用引用
     API-->>User: 409 Conflict(阻断组件删除)
@@ -1514,6 +1520,7 @@ flowchart LR
   - 服务端以 `workspace_id + cluster_id` 注入租户上下文，禁止由请求体覆盖 `namespace`。
   - `R-ENV-005` 约束的是“先选工作空间/集群”，而非“路径必须显式携带二者”；
     当前现行主接口保持 `applications-only`，作用域参数通过 query/body 传递，补充能力接口按 `{scope}` 展开（见 7.3）。
+  - `3.5` 时序示例遵循同一规则：主资源 CUD/轮询仅使用 `/api/v1/applications`，`{scope}` 仅用于补充能力接口。
 - 同步与异步语义：
   - Query（GET）：同步返回领域读模型。
   - CUD（POST/PUT/DELETE）：统一返回 `202 Accepted`，响应头携带 `Location` 指向资源详情查询路径，由任务系统异步执行。
@@ -1689,6 +1696,8 @@ T26 单接口资源分组（现行 canonical path）：
 以下端点为补充能力接口（非主资源 canonical path）：
 
 - `{scope}` 统一展开为 `/api/v1/workspaces/{workspace_id}/clusters/{cluster_id}`。
+- 不得将 `{scope}/applications/{application_id}` 作为主资源 CRUD 示例；
+  仅允许出现在 `relations/releases/charts` 等补充能力端点。
 
 模板与制品查询接口：
 
@@ -3785,6 +3794,14 @@ flowchart LR
 | `/instances` 退场时态一致 | `TC-DATA-06-A` | `1.2/2.6/7.3/7.5/14.1/14.4` 明确 `v1.22.0` 已退出现行外部契约；历史回放条目均显式标注“历史基线” | 文档 diff、OpenAPI lint、历史回放说明 |
 | 路径前缀与术语一致性 | `TC-TRACE-02-A` | scoped 端点统一按 `{scope}` 或完整 `/api/v1/...` 单口径；验收文案无未定义 `switch` 术语残留 | 文档检索记录、验收矩阵 diff、评审结论 |
 
+#### 14.1.22 T30 单接口主路径时序与示例路径冲突收敛验收样例
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| 主资源 CUD 时序路径收敛 | `TC-DATA-07-A` | `3.5.1/3.5.3` 主资源变更与轮询示例仅使用 `/api/v1/applications`；`Location` 与 `7.1/7.3` 一致 | 时序图 diff、接口回放、契约评审记录 |
+| scoped 补充能力接口边界收敛 | `TC-DATA-07-B` | `3.5.2` 发布时序使用 `{scope}` 补充接口；`{scope}` 不再作为主资源 CUD 示例 | 文档检索记录、示例路径清单、OpenAPI 路径核对 |
+| 验收与回标路径单口径 | `TC-TRACE-03-A` | `14.1/14.4` 新增条目与 `7.1/7.3` 保持同一 canonical path 语义，无 scoped 主路径残留 | 验收矩阵 diff、回标记录、评审结论 |
+
 ### 14.2 测试分层与关键场景
 
 #### 14.2.1 测试分层
@@ -3906,7 +3923,7 @@ flowchart LR
 | R-ENV-002 | 4.1、5.7、6.5、7.6、8.8、11.1、11.2 | 已覆盖 | 已在 4.1、7.6、8.8 明确“工作空间创建与绑定归属平台管理面”，Aether 仅处理内部契约与任务编排。 |
 | R-ENV-003 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
 | R-ENV-004 | 4.1、5.7、6.5、7.6、10.2、11.1、11.2 | 已覆盖 | 已在 4.1、7.3、10.2 定稿用户边界：仅高代码应用/记忆体 + 低代码平台内应用入口；跨 workspace 与禁用动作统一拒绝并审计。 |
-| R-ENV-005 | 4.1、5.7、6.5、7.1、7.3、7.6、11.1、11.2 | 已覆盖 | 已在 4.1、7.1、7.3 明确“先选 workspace/cluster”与“路径形态”解耦，作用域参数不改变 `applications-only` 主路径。 |
+| R-ENV-005 | 4.1、5.7、6.5、7.1、7.3、7.6、11.1、11.2、14.1.22、14.4.27 | 已覆盖 | 已在 4.1、7.1、7.3、3.5 定稿“先选 workspace/cluster”与“路径形态”解耦，主资源路径固定 `/api/v1/applications`，`{scope}` 仅补充能力接口。 |
 | R-ENV-006 | 4.1、5.7、6.5、7.6、8.7~8.8、11.1、11.2 | 已覆盖 | 已在 4.1、7.6、8.7~8.8 定义绑定新增/更新/回滚契约与补偿，见 `TC-ENV-04/05`。 |
 | R-ENV-007 | 4.1、4.5、7.6、8.5、8.7~8.8、9.3、10.5、14.1.8 | 已覆盖 | 已补齐镜像与 Chart push/pull 凭证同口径，覆盖 DevBox push 失败重试与审计字段。 |
 | R-ENV-008 | 4.1、5.7、6.5、7.6、11.1、11.2 | 已覆盖 | 已在 4.1 与 9.3 补齐工作空间绑定、凭证下发与解绑约束。 |
@@ -3995,7 +4012,7 @@ flowchart LR
 | R-DATA-007 | 4.9、5.3、7.3、10.2、11.3 | 已覆盖 | 已在 4.9、5.3 定义 embedded 资源不得进入共享选择器。 |
 | R-DATA-008 | 4.9、5.3、7.3、7.4、11.3、14.1.20 | 已覆盖 | 已在 4.9、7.3/7.4 定义应用查看页字段：Agent/组件/入口/发布 Chart 版本。 |
 | R-DATA-009 | 5.5、7.3、10.5、11.3、14.1.20 | 已覆盖 | 已在 5.5、10.5、11.3 固化绑定/解绑/级联删除审计轨迹字段。 |
-| R-DATA-010 | 4.9、7.1、7.3、7.4、14.1.18、14.1.21、14.4.23、14.4.26 | 已覆盖 | T26/T29 已定稿 `applications-only` 单接口与 `v1.22.0` 退场时态，列表过滤覆盖 6 类 `resource_type`。 |
+| R-DATA-010 | 3.5、4.9、7.1、7.3、7.4、14.1.18、14.1.21、14.1.22、14.4.23、14.4.26、14.4.27 | 已覆盖 | T26/T29/T30 已定稿 `applications-only` 单接口与 `v1.22.0` 退场时态；主资源时序与示例不再混入 scoped 主路径。 |
 | R-DATA-011 | 4.9、7.3、7.4、7.5、14.1.18、14.1.21、14.4.23、14.4.26 | 已覆盖 | 已定义 `GET /applications/{application_id}/components` 六类分支返回契约与错误语义（含 `MEMORY` 主实例+内部组件），并完成历史/现行边界隔离。 |
 | R-OPS-001 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
 | R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、10.3、12.6、14.1.21、14.4.26 | 已覆盖 | 已在 4.10、7.1、8.1、8.4、10.3 收敛为“外部 `Idempotency-Key` 可选 + 内部 `idempotency_scope + request_fingerprint` 强制判重”。 |
@@ -4008,7 +4025,7 @@ flowchart LR
 | R-OPS-009 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 固化补偿触发与一致性策略。 |
 | R-OPS-010 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、8.2、8.3 纳入关键动作审计点。 |
 | R-OPS-011 | 4.10、7.1、7.5、8.2、8.3、8.6、12.2、14.1.17、14.4.22 | 已覆盖 | 已在 8.2.2/8.3 定义 `before_hook/after_hook` 代码注册、顺序、阻断策略与观测审计约束。 |
-| R-OPS-012 | 7.1、7.3、7.5、14.1.18、14.1.19、14.1.21、14.4.23、14.4.24、14.4.26 | 已覆盖 | T26/T29 已补齐统一应用接口 OpenAPI 清单（CRUD + actions + components），并明确 `/instances` 历史退场边界。 |
+| R-OPS-012 | 3.5、7.1、7.3、7.5、14.1.18、14.1.19、14.1.21、14.1.22、14.4.23、14.4.24、14.4.26、14.4.27 | 已覆盖 | T26/T29/T30 已补齐统一应用接口 OpenAPI 清单（CRUD + actions + components），并收敛主路径时序示例与补充接口边界。 |
 | R-OPS-013 | 7.2、7.3、7.5、10.2、14.1.18、14.1.19、14.1.21、14.4.23、14.4.24、14.4.26 | 已覆盖 | 已按 `resource_type` 定义动作能力矩阵，不支持动作统一返回 `409 ACTION_NOT_SUPPORTED`（含 MEMORY 场景），且验收文案仅引用已定义动作集合。 |
 | S-SEC-001 | 10.3、11.1、11.2 | 已覆盖 | 已在 10.3 固化 Secret 存放范围为工作空间 namespace。 |
 | S-SEC-002 | 10.1、10.4 | 已覆盖 | 已在 10.1/10.4 固化“可引用不可明文读取”权限边界。 |
@@ -4261,19 +4278,27 @@ flowchart LR
 | T24 历史基线与 T26/T29 现行基线隔离标注 | R-DATA-011、R-OPS-013 | 待补充 | 已覆盖 | 14.1.16、14.1.18、14.4.21、14.4.26 |
 | scoped 路径前缀与术语清理（`switch` -> 已定义动作集合） | R-OPS-004、R-OPS-013 | 待补充 | 已覆盖 | 7.3、7.5、14.1.1、14.1.13、15.2.2（第 26 条） |
 
+#### 14.4.27 T30 单接口主路径时序与示例路径冲突收敛回标记录（2026-02-27）
+
+| 回标项 | 关联需求 | T30 前状态 | T30 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| 主资源 CUD 时序示例统一到 `/api/v1/applications` | R-DATA-010、R-OPS-012 | 待补充 | 已覆盖 | 3.5.1、3.5.3、7.1、7.3、14.1.22 |
+| scoped 路径仅保留为补充能力接口（`{scope}`） | R-ENV-005、R-OPS-012 | 待补充 | 已覆盖 | 3.5.2、7.1、7.3、14.1.22 |
+| 验收与覆盖回标路径口径一致 | R-ENV-005、R-DATA-010、R-OPS-012 | 待补充 | 已覆盖 | 14.1.22、14.4.3、14.4.27 |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
 
 | 交付物 ID | 交付物 | 内容范围 | 验收标准 | 责任角色 |
 | --- | --- | --- | --- | --- |
-| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T29 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
+| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T30 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
 | D-02 | 决策记录 | `docs/decision.md` ADR 闭环 | 关键决策均有“原因+影响+替代关系” | 架构负责人 |
 | D-03 | 需求基线 | `docs/requirements.md` | 需求 ID 稳定可追踪，可测试 | 产品负责人 |
-| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T29 状态与设计实际一致 | 项目负责人 |
+| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T30 状态与设计实际一致 | 项目负责人 |
 | D-05 | API 契约包 | OpenAPI 根文件与分组路径定义 | 可用于生成服务端桩代码与契约测试 | 后端负责人 |
 | D-06 | 数据模型包 | ERD、DDL 约束、迁移计划 | 可直接拆分 repository 层实现任务 | 后端负责人 |
-| D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景；编号迁移与一致性收敛场景覆盖 `14.1.20/14.1.21` | QA 负责人 |
+| D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景；编号迁移与一致性收敛场景覆盖 `14.1.20/14.1.21/14.1.22` | QA 负责人 |
 | D-08 | 发布运行包 | `14.3` 发布与回滚 Runbook | 完成一次演练并可在值班手册落地 | SRE 负责人 |
 | D-09 | 编号迁移追踪包 | `14.4.25` 迁移表、扫描记录、回标闭环证据 | 旧编号退场、新编号生效且跨章节引用一致 | 架构负责人 |
 
@@ -4395,7 +4420,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T29）
+#### 15.3.1 设计自检记录（T30）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -4424,6 +4449,7 @@ flowchart LR
 | T27 记忆体（MEMORY）一级资源并入与六类口径补齐 | 通过 | 已完成 1.2、2.1、3.2、3.3、4.3、4.9、5.2、5.3、5.4、6.1、7.4、8.10、10.2、11.3、12.2、13.1、14.1.19、14.4.24、15.2 与 ADR 回写 |
 | T28 需求编号迁移与追踪治理收敛 | 通过 | 已完成 14.1.20、14.4.3、14.4.25、15.1、15.2 与 ADR 回写 |
 | T29 design 全文一致性冲突与歧义收敛 | 通过 | 已完成 1.2、2.6、4.1、7.1、7.3、7.5、10.3、14.1.16、14.1.18、14.1.21、14.4.3、14.4.21、14.4.23、14.4.26、15.1、15.2 与 ADR 回写 |
+| T30 单接口主路径时序与示例路径冲突收敛 | 通过 | 已完成 3.5、7.1、7.3、14.1.22、14.4.3、14.4.27、15.1 与 ADR 回写 |
 | 遗漏检查 | 通过 | 当前无阻断编码的开放问题 |
 
 #### 15.3.2 开放问题（需闭环）
