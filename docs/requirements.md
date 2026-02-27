@@ -18,7 +18,7 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 
 目标：
 
-- 支持 5 类资源的统一 CRUD：数据服务组件、低代码平台、DevBox、网关、高代码应用。
+- 支持 6 类资源的统一 CRUD：数据服务组件、低代码平台、DevBox、网关、高代码应用、记忆体。
 - 在“都部署到 K8S Pod”的前提下建立统一抽象，保证新增资源类型时可复用同一部署行为。
 - 明确共享资源与“应用内嵌资源”的可见性与管理边界，避免资源混管。
 - 支持高代码应用发布时自动生成 Helm Chart、版本化入库并可下载导出。
@@ -30,11 +30,12 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 
 - 消费平台管理面输出的纳管 K8S 集群（kubeconfig）与工作空间绑定结果，并执行部署面校验与编排。
 - 消费工作空间与集群、镜像仓库关联结果；维护同名 namespace 映射与运行态一致性。
-- 5 类资源的 CRUD、状态管理、异步任务执行与审计。
-- 平台内置模板（数据服务组件、Dify/FastGPT、DevBox 框架、Higress）管理与部署。
+- 6 类资源的 CRUD、状态管理、异步任务执行与审计。
+- 平台内置模板（数据服务组件、Dify/FastGPT、DevBox 模板、网关、记忆体）管理与部署。
 - 低代码平台 Helm 导入能力（Coze Studio、n8n、外部 Dify/FastGPT）。
 - 高代码应用三类创建来源：DevBox 发布镜像、用户上传镜像、用户上传 Helm Chart。
 - 高代码应用与数据服务组件关系管理、级联删除策略、引用冲突处理。
+- 记忆体内部组件编排、关系管理、级联删除策略与引用冲突处理。
 - 高代码应用发布 Chart 的自动生成、版本记录、仓库存储、下载导出。
 - 统一资源抽象与统一部署执行链路（可扩展到未来新资源类型）。
 
@@ -64,19 +65,20 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
   - 可管理其工作空间内的部署资源与生命周期，不可越权到其他工作空间。
 - 用户：
   - 仅可在“已关联”的工作空间内操作资源，禁止跨工作空间。
-  - 可对工作空间内高代码应用执行 CRUD，并进入已开通低代码平台执行低代码应用 CRUD。
-  - 同一工作空间内资源不做“创建者隔离”，用户可操作该工作空间内全部高代码应用资源（含其他用户创建的资源）。
+  - 可对工作空间内高代码应用、数据服务组件、记忆体执行 CRUD，并进入已开通低代码平台执行低代码应用 CRUD。
+  - 同一工作空间内资源不做“创建者隔离”，用户可操作该工作空间内全部高代码应用、数据服务组件与记忆体资源（含其他用户创建的资源）。
   - 不可开通/关闭低代码平台，不可创建/删除网关实例，不可给工作空间关联 K8S 集群或镜像仓库。
 
 ## 资源分层与关键概念
 
 - 工作空间（Workspace）：资源与权限边界；每个关联集群中映射一个同名 namespace。
-- 一级资源类型（L1 Resource Kind）：部署模块对外提供独立业务语义与管理边界的资源，固定 5 类：
-  - 数据服务组件（Postgres、Redis、mem0、milvus、weaviate、pgvector、neo4j、NebulaGraph、MongoDB、MinIO）
+- 一级资源类型（L1 Resource Kind）：部署模块对外提供独立业务语义与管理边界的资源，固定 6 类：
+  - 数据服务组件（Postgres、Redis、milvus、weaviate、pgvector、NebulaGraph、MongoDB）
   - 低代码平台（Dify、FastGPT、Coze Studio、n8n）
   - DevBox
   - 网关（Higress）
   - 高代码应用（openclaw、zeroclaw 等）
+  - 记忆体（mem0）
 - 支撑资源（Supporting Resource）：服务于一级资源的领域对象，包括
   `AgentInstance`、`HighCodeArtifact`、`DevBoxPublishRecord`、
   `HighCodeReleaseChart` 及各类关系引用对象。部分支撑资源可提供独立 CRUD
@@ -87,8 +89,9 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 - 资源模板（Template）：平台内置或管理员导入的 Helm Chart 模板与参数 schema。
 - 资源实例（Instance）：模板或制品在指定工作空间/集群/namespace 的运行实体。
 - `application_id`：统一资源 ID，指 `/applications/{application_id}` 路径参数；
-  对外作为 5 类一级资源统一主标识，对内按 `resource_type` 映射到对应领域实体主键。
+  对外作为 6 类一级资源统一主标识，对内按 `resource_type` 映射到对应领域实体主键。
 - 高代码制品（HighCode Artifact）：用于高代码应用部署的镜像或 Helm Chart 来源。
+- 记忆体（mem0）：复合一级资源，至少包含一个记忆体主实例与多个内部组件子实例，统一以组件关系进行编排与生命周期管理。
 - 嵌入式数据服务（Embedded Data Service）：
   - 随低代码平台部署自动创建的数据服务实例。
   - 或随高代码 Helm Chart 自带创建的数据服务实例。
@@ -101,7 +104,7 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 - R-ENV-001：平台管理面通过 kubeconfig 纳管 K8S 集群；Aether 消费 `ManagedCluster` 只读视图并在部署前校验可达性。
 - R-ENV-002：工作空间创建/删除与空间管理员配置由平台管理面负责且仅超级管理员可执行；工作空间关联纳管集群、镜像仓库与成员管理由平台管理面负责并允许超级管理员或该工作空间空间管理员执行；Aether 仅消费生效绑定用于鉴权与编排。
 - R-ENV-003：一个工作空间在每个关联集群必须映射同名 namespace；若不存在则自动创建。
-- R-ENV-004：用户仅能操作与其关联工作空间内的高代码应用资源，并通过已开通低代码平台入口执行低代码应用操作；禁止跨工作空间操作。
+- R-ENV-004：用户仅能操作与其关联工作空间内的高代码应用与记忆体资源，并通过已开通低代码平台入口执行低代码应用操作；禁止跨工作空间操作。
 - R-ENV-005：创建任意资源实例时必须先选择工作空间与目标集群；namespace 由映射规则确定，禁止自定义其他 namespace。
 - R-ENV-006：工作空间与镜像仓库关联关系必须可审计、可变更、可回滚。
 - R-ENV-007：镜像仓库凭证可下发到工作空间 namespace，用于镜像与 Chart 推拉。
@@ -111,14 +114,14 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 
 ### 2. 统一资源抽象与可扩展部署行为
 
-- R-ABS-001：5 类资源必须统一映射到“模板/制品 + 实例 + 关系 + 发布记录”抽象模型。
-- R-ABS-002：5 类资源的 CUD 必须复用统一执行链路：参数校验 -> 模板渲染
+- R-ABS-001：6 类资源必须统一映射到“模板/制品 + 实例 + 关系 + 发布记录”抽象模型。
+- R-ABS-002：6 类资源的 CUD 必须复用统一执行链路：参数校验 -> 模板渲染
   -> K8S Apply/Upgrade/Delete -> 状态回写 -> 审计落库。
 - R-ABS-003：部署驱动采用可扩展适配器机制，默认 Helm 适配器；镜像型高代码应用通过平台生成 Chart 后复用 Helm 链路。
 - R-ABS-004：新增资源类型时，不得重写任务队列、鉴权、审计、状态机主流程，只允许新增资源 schema 与适配器实现。
 - R-ABS-005：统一资源标签规范：`workspace_id`、`cluster_id`、`resource_kind`、`resource_id`、`owner_kind`、`owner_id`。
 - R-ABS-006：所有资源的可观测字段（状态、事件、最近任务）结构统一，便于通用列表与运维视图复用。
-- R-ABS-007：领域模型采用“一级资源 + 支撑资源”分层；5 类一级资源口径用于权限矩阵、配额统计、审计报表与对外能力边界。
+- R-ABS-007：领域模型采用“一级资源 + 支撑资源”分层；6 类一级资源口径用于权限矩阵、配额统计、审计报表与对外能力边界。
 - R-ABS-008：控制面不得以 Pod 作为业务主实体；Pod/ReplicaSet/Job
   等仅作为运行时观测对象，并通过 `resource_kind/resource_id`
   回挂到领域实例。
@@ -126,7 +129,7 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 ### 3. 数据服务组件
 
 - R-DSP-001：平台内置数据服务组件类型固定为：
-  Postgres、Redis、mem0、milvus、weaviate、pgvector、neo4j、NebulaGraph、MongoDB、MinIO。
+  Postgres、Redis、milvus、weaviate、pgvector、NebulaGraph、MongoDB。
 - R-DSP-002：上述组件模板全部由平台内置并以 Helm Chart 形式提供。
 - R-DSP-003：共享数据服务组件实例支持独立创建、更新、删除、查询。
 - R-DSP-004：高代码应用创建时可关联已创建的共享数据服务组件实例。
@@ -137,9 +140,10 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
   - 独立创建场景允许用户显式自定义（同 namespace 唯一）。
 - R-DSP-008：随低代码平台部署自动创建的数据服务实例必须标记为 `embedded_by_lowcode_platform`，不在共享组件列表中展示。
 - R-DSP-009：随高代码 Helm Chart 自带创建的数据服务实例必须标记为 `embedded_by_highcode_chart`，不在共享组件列表中展示。
-- R-DSP-010：嵌入式数据服务实例默认仅允许其宿主资源访问与运维；允许超级管理员通过专用独立运维接口执行运维动作。嵌入式实例不允许被其他高代码应用或低代码平台复用绑定。
-- R-DSP-011：共享组件与嵌入式组件必须在 API、控制台列表和权限校验上完全隔离展示。
-- R-DSP-012：删除宿主资源时，嵌入式组件按宿主生命周期回收，不参与共享组件引用计数。
+- R-DSP-010：随记忆体部署自动创建的数据服务实例必须标记为 `embedded_by_memory`，不在共享组件列表中展示。
+- R-DSP-011：嵌入式数据服务实例默认仅允许其宿主资源访问与运维；允许超级管理员通过专用独立运维接口执行运维动作。嵌入式实例不允许被其他高代码应用、低代码平台或记忆体复用绑定。
+- R-DSP-012：共享组件与嵌入式组件必须在 API、控制台列表和权限校验上完全隔离展示。
+- R-DSP-013：删除宿主资源时，嵌入式组件按宿主生命周期回收，不参与共享组件引用计数。
 
 ### 4. 低代码平台
 
@@ -197,7 +201,18 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 - R-HCA-013：`cascade=true` 时删除该应用关联的 Agent 实例与独占派生资源（PVC/Secret/ConfigMap 等）。
 - R-HCA-014：Chart 自带嵌入式组件随该应用生命周期管理，不进入共享组件池。
 
-### 8. 高代码应用发布与 Helm Chart 沉淀
+### 8. 记忆体（mem0）
+
+- R-MEM-001：记忆体（`MEMORY`）作为一级资源，支持 CRUD、状态查询、扩缩容、升级/回滚与滚动重启。
+- R-MEM-002：记忆体部署形态为“1 个记忆体主实例 + 1..N 个内部组件实例”。
+- R-MEM-003：记忆体仅支持基于平台内置模板创建，模板格式为 Helm Chart；不支持用户上传镜像/Helm Chart 或导入外部模板创建。
+- R-MEM-004：记忆体与内部组件关系为 1:N；组件关系必须记录 `shared|embedded`、`owner_kind/owner_id` 与健康状态快照。
+- R-MEM-005：关联限制：仅允许同一工作空间、同一集群（同 namespace）的实例参与同一记忆体编排。
+- R-MEM-006：删除记忆体默认不级联删除共享子实例；`cascade=true` 时可删除该记忆体独占与嵌入式子实例。若共享子实例仍被其他资源引用，返回 `409 Conflict` 并阻断该实例删除。
+- R-MEM-007：记忆体详情与组件查询必须返回“主实例 + 内部组件实例列表”，并标注运行状态与引用关系。
+- R-MEM-008：记忆体需记录版本、入口地址（如有）、依赖拓扑与最近一次编排任务结果，便于统一运维视图展示。
+
+### 9. 高代码应用发布与 Helm Chart 沉淀
 
 - R-PKG-001：用户在平台发布高代码应用时，平台必须生成该应用对应 Helm Chart 包（标准化导出包）。
 - R-PKG-002：生成的应用 Chart 必须版本化管理，并与应用发布记录一一关联。
@@ -207,32 +222,34 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
   `application_id`、`release_version`、`chart_ref`、`source_type`、`source_version`、`digest`、`created_by`、`created_at`。
 - R-PKG-006：镜像型来源与 Helm 来源都必须产出可复现的导出 Chart（包含渲染后必要 values/依赖锁定信息）。
 
-### 9. 应用关系持久化与资源可见性
+### 10. 应用关系持久化与资源可见性
 
 - R-DATA-001：高代码应用保存“Agent 实例集合 + 共享数据服务组件集合 + 嵌入式组件集合”关系。
 - R-DATA-002：低代码平台保存“平台实例 + 嵌入式组件集合”关系。
-- R-DATA-003：关系查询需区分 `shared` 与 `embedded` 资源类型，并标注 `owner_kind/owner_id`。
-- R-DATA-004：查询接口不做跨资源实时聚合计算；应用状态由应用自身任务结果驱动。
-- R-DATA-005：资源软删后保留审计字段：`deleted_at`、`deleted_by`、`delete_task_id`。
-- R-DATA-006：嵌入式资源不得出现在共享资源选择器中。
-- R-DATA-007：应用查看页必须展示 Agent 集合、组件集合、入口地址、发布 Chart 版本信息。
-- R-DATA-008：关系变更（绑定/解绑/级联删除）必须记录审计轨迹。
-- R-DATA-009：应用信息查询采用统一 `applications` 接口视图，覆盖 5 类一级资源
-  `DATA_SERVICE`、`LOW_CODE_PLATFORM`、`DEVBOX`、`GATEWAY`、`HIGH_CODE_APP`；
+- R-DATA-003：记忆体保存“记忆体主实例 + 内部组件实例集合”关系，并标注 `shared|embedded` 与 `owner_kind/owner_id`。
+- R-DATA-004：关系查询需区分 `shared` 与 `embedded` 资源类型，并标注 `owner_kind/owner_id`。
+- R-DATA-005：查询接口不做跨资源实时聚合计算；应用状态由应用自身任务结果驱动。
+- R-DATA-006：资源软删后保留审计字段：`deleted_at`、`deleted_by`、`delete_task_id`。
+- R-DATA-007：嵌入式资源不得出现在共享资源选择器中。
+- R-DATA-008：应用查看页必须展示 Agent 集合、组件集合、入口地址、发布 Chart 版本信息。
+- R-DATA-009：关系变更（绑定/解绑/级联删除）必须记录审计轨迹。
+- R-DATA-010：应用信息查询采用统一 `applications` 接口视图，覆盖 6 类一级资源
+  `DATA_SERVICE`、`LOW_CODE_PLATFORM`、`DEVBOX`、`GATEWAY`、`HIGH_CODE_APP`、`MEMORY`；
   低代码平台部署后信息查询必须通过应用接口获取。
-- R-DATA-010：需提供“应用下组件信息查询”能力；
+- R-DATA-011：需提供“应用下组件信息查询”能力；
   `GET /api/v1/applications/{application_id}/components?workspace_id={workspace_id}`。
   对 `HIGH_CODE_APP` 返回 Agent 实例与组件实例详情，对 `LOW_CODE_PLATFORM`
-  返回平台子组件与依赖组件实例详情；对 `DATA_SERVICE`、`DEVBOX`、`GATEWAY`
+  返回平台子组件与依赖组件实例详情；对 `MEMORY` 返回主实例与内部组件实例详情；
+  对 `DATA_SERVICE`、`DEVBOX`、`GATEWAY`
   返回其运行拓扑组件明细（如 Workload/Service/PVC/Secret 映射）。
 
-### 10. CRUD、权限与异步任务
+### 11. CRUD、权限与异步任务
 
-- R-OPS-001：数据服务组件、低代码平台、DevBox、网关、高代码应用 5 类资源的 CUD 统一走异步任务模型；Query 同步返回。
+- R-OPS-001：数据服务组件、低代码平台、DevBox、网关、高代码应用、记忆体 6 类资源的 CUD 统一走异步任务模型；Query 同步返回。
 - R-OPS-002：当前阶段 CUD 接口不强制暴露 `Idempotency-Key` 契约；
   控制面幂等去重作为内部实现能力保留，后续参数版本可升级为对外必填头。
 - R-OPS-003：权限模型固定为“超级管理员 + 空间管理员 + 用户”，并按工作空间做资源边界控制。
-- R-OPS-004：用户只能操作其已关联工作空间内的高代码应用资源；不得开通/关闭低代码平台、不得创建/删除网关实例、不得变更工作空间与集群/镜像仓库绑定；跨工作空间、跨集群、跨 namespace 请求必须拒绝并审计。
+- R-OPS-004：用户只能操作其已关联工作空间内的高代码应用与记忆体资源；不得开通/关闭低代码平台、不得创建/删除网关实例、不得变更工作空间与集群/镜像仓库绑定；跨工作空间、跨集群、跨 namespace 请求必须拒绝并审计。
 - R-OPS-005：同资源串行化执行，防止并发更新破坏状态一致性。
 - R-OPS-006：更新/删除当前阶段通过“资源状态前置条件 + 同资源串行化”做并发控制；
   `resource_version` 作为可选增强能力保留。
@@ -254,9 +271,9 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 
 模型分层约束：
 
-- 一级资源实体固定为：`DataServiceInstance`、`LowCodePlatformInstance`、`DevBoxInstance`、`GatewayInstance`、`HighCodeApplication`。
-- 支撑资源实体包括：`AgentInstance`、`HighCodeArtifact`、`DevBoxPublishRecord`、`HighCodeReleaseChart`、关系引用实体、任务实体与密钥版本实体。
-- 一级资源承担平台一级能力边界；支撑资源可独立存储或独立接口化，但不改变“5 类一级资源”口径。
+- 一级资源实体固定为：`DataServiceInstance`、`LowCodePlatformInstance`、`DevBoxInstance`、`GatewayInstance`、`HighCodeApplication`、`MemoryInstance`。
+- 支撑资源实体包括：`AgentInstance`、`HighCodeArtifact`、`DevBoxPublishRecord`、`HighCodeReleaseChart`、`MemoryComponentRef`、关系引用实体、任务实体与密钥版本实体。
+- 一级资源承担平台一级能力边界；支撑资源可独立存储或独立接口化，但不改变“6 类一级资源”口径。
 
 - `Workspace`
   - 主标识：`workspace_id`
@@ -279,7 +296,7 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
   - 主标识：`template_id`
   - 唯一约束：`(template_kind, template_name, template_version)` 唯一
   - 删除策略：软删
-  - 备注：`template_kind` in `{data_service, lowcode_platform, devbox, gateway}`
+  - 备注：`template_kind` in `{data_service, lowcode_platform, devbox, gateway, memory}`
 - `HighCodeArtifact`
   - 主标识：`artifact_id`
   - 唯一约束：`(workspace_id, artifact_name, artifact_version, artifact_type)` 唯一
@@ -311,6 +328,15 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
   - 主标识：`application_id`
   - 唯一约束：`(workspace_id, cluster_id, application_name)` 唯一
   - 删除策略：软删
+- `MemoryInstance`
+  - 主标识：`memory_instance_id`
+  - 唯一约束：`(workspace_id, cluster_id, memory_name)` 唯一
+  - 删除策略：软删
+- `MemoryComponentRef`
+  - 主标识：`id`
+  - 唯一约束：`(memory_instance_id, component_id)` 唯一
+  - 删除策略：硬删
+  - 备注：必须记录 `visibility`、`owner_kind/owner_id`
 - `AgentInstance`
   - 主标识：`agent_instance_id`
   - 唯一约束：`(workspace_id, cluster_id, agent_instance_name)` 唯一
@@ -346,11 +372,12 @@ Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8
 - `DataServiceInstance.visibility=embedded` 时，必须存在合法 `owner_kind/owner_id`。
 - 删除高代码应用且 `cascade=true` 时，共享组件若被其他应用引用返回 `409 Conflict`。
 - 删除低代码平台实例时，回收其 `embedded` 组件，不影响共享组件。
+- 删除记忆体且 `cascade=true` 时，共享子实例若被其他资源引用返回 `409 Conflict`。
 - 软删实体必须保留审计字段并支持按 `delete_task_id` 追踪任务。
 
 ## 资源状态机（设计输入）
 
-### 资源状态（五类一级资源 + AgentInstance）
+### 资源状态（六类一级资源 + AgentInstance）
 
 - `Creating`：已受理创建任务，资源尚未可用。
 - `Running`：资源可用，健康检查通过。
@@ -424,7 +451,7 @@ DevBox 补充状态：
 
 - 统一应用接口（当前阶段必选，路径参数统一为 `application_id`）：
   - `POST /api/v1/applications`（请求体包含 `workspace_id`、`cluster_id`、`resource_type`）
-  - `GET /api/v1/applications?workspace_id={workspace_id}&resource_type={DATA_SERVICE|LOW_CODE_PLATFORM|DEVBOX|GATEWAY|HIGH_CODE_APP}`
+  - `GET /api/v1/applications?workspace_id={workspace_id}&resource_type={DATA_SERVICE|LOW_CODE_PLATFORM|DEVBOX|GATEWAY|HIGH_CODE_APP|MEMORY}`
   - `GET /api/v1/applications/{application_id}?workspace_id={workspace_id}`
   - `PUT /api/v1/applications/{application_id}?workspace_id={workspace_id}`
   - `DELETE /api/v1/applications/{application_id}?workspace_id={workspace_id}`
@@ -448,6 +475,7 @@ DevBox 补充状态：
 | 数据服务组件实例 CRUD（共享） | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
 | 低代码平台实例开通/变更/删除 | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
 | 低代码平台实例查询 | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
+| 记忆体实例 CRUD | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
 | DevBox 实例 CRUD | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
 | DevBox 镜像发布 | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
 | 网关实例 CRUD | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
@@ -485,8 +513,8 @@ DevBox 补充状态：
 
 - NFR-006：支持 >= 100 个工作空间，>= 50 个纳管集群。
 - NFR-007：支持 >= 5000 个共享数据服务实例。
-- NFR-008：支持 >= 2000 个低代码平台实例、>= 5000 个 DevBox 实例、>= 5000 个网关实例。
-- NFR-009：支持 >= 5000 个高代码应用实例，>= 10000 个 Agent 实例。
+- NFR-008：支持 >= 2000 个低代码平台实例、>= 5000 个 DevBox 实例、>= 5000 个网关实例、>= 5000 个记忆体实例。
+- NFR-009：支持 >= 5000 个高代码应用实例，>= 10000 个 Agent 实例，>= 20000 个记忆体子实例关系。
 - NFR-010：支持日均 >= 10000 个异步任务提交。
 - NFR-011：支持日均 >= 2000 次高代码应用发布 Chart 产物生成与存储。
 
@@ -509,19 +537,21 @@ DevBox 补充状态：
 | 需求 ID | 验收条件 | 测试类型 | 责任方 |
 | --- | --- | --- | --- |
 | R-ENV-003 | 绑定 workspace 与 cluster 后，自动创建/复用同名 namespace | 集成测试 | 后端 |
-| R-ABS-002 | 5 类资源 CUD 均复用统一执行链路并产出统一状态结构 | 集成测试 | 后端 |
+| R-ABS-002 | 6 类资源 CUD 均复用统一执行链路并产出统一状态结构 | 集成测试 | 后端 |
 | R-DSP-008 | 低代码平台嵌入式组件不出现在共享组件列表 | 集成测试 + E2E | 后端 + 前端 |
 | R-LCP-003 | 超级管理员可通过 Helm 导入 Coze/n8n/外部 Dify/FastGPT | 集成测试 | 后端 |
 | R-DBX-006 | 未发布镜像不能创建高代码应用 | 单元测试 + 集成测试 | 后端 |
 | R-GTW-003 | 每 workspace+cluster 仅允许一个网关实例 | 单元测试 + 集成测试 | 后端 |
 | R-HCA-003 | Chart 渠道可部署多 Agent 并处理 Chart 自带组件 | 集成测试 + E2E | 后端 |
 | R-HCA-012 | `cascade=true` 且共享组件被复用时返回 `409` | 集成测试 | 后端 |
-| R-DATA-009 | 应用信息查询统一走 `applications` 接口并覆盖 5 类一级资源 | 集成测试 + E2E | 后端 + 前端 |
-| R-DATA-010 | 应用组件查询接口可按应用类型返回对应运行组件明细 | 集成测试 + E2E | 后端 + 前端 |
+| R-DATA-010 | 应用信息查询统一走 `applications` 接口并覆盖 6 类一级资源 | 集成测试 + E2E | 后端 + 前端 |
+| R-DATA-011 | 应用组件查询接口可按应用类型返回对应运行组件明细 | 集成测试 + E2E | 后端 + 前端 |
+| R-MEM-002 | 记忆体可按“主实例 + 内部组件实例”完成创建/更新编排 | 集成测试 + E2E | 后端 + 前端 |
+| R-MEM-007 | 记忆体组件查询返回主实例与内部组件实例详情 | 集成测试 + E2E | 后端 + 前端 |
 | R-PKG-001 | 发布高代码应用后自动生成可用 Helm Chart 包 | 集成测试 + E2E | 后端 |
 | R-PKG-003 | 发布 Chart 成功推送到工作空间关联仓库并可追溯版本 | 集成测试 | 后端 |
 | R-PKG-004 | 用户可下载发布 Chart 并在外部环境导入成功 | E2E | 前端 + 后端 |
-| R-OPS-001 | 5 类资源 CUD 异步、Query 同步符合契约 | E2E | 前端 + 后端 |
+| R-OPS-001 | 6 类资源 CUD 异步、Query 同步符合契约 | E2E | 前端 + 后端 |
 | R-OPS-011 | 异步 CUD 支持代码级可配置的前后置埋点扩展点，其他模块可注册并生效 | 单元测试 + 集成测试 | 后端 |
 | R-OPS-012 | 统一应用接口 CURD+start/stop/restart+components 在 OpenAPI 中完整定义并可用 | 集成测试 + E2E | 后端 + 前端 |
 | R-OPS-013 | 按 `resource_type` 的动作能力矩阵在 OpenAPI 与运行时校验中一致生效 | 集成测试 + E2E | 后端 + 前端 |
@@ -529,7 +559,7 @@ DevBox 补充状态：
 
 ## 交付物与接口（面向设计）
 
-- OpenAPI 3.0 草案（基于 `applications` 单资源模型，含 5 类资源、状态轮询契约与错误码）。
+- OpenAPI 3.0 草案（基于 `applications` 单资源模型，含 6 类资源、状态轮询契约与错误码）。
 - 统一资源抽象模型与 ERD（含 owner/visibility 语义、唯一性约束）。
 - 统一状态机定义（资源状态机、任务状态机、发布包状态机、解绑状态机）。
 - 异步任务与补偿设计说明（串行化键、重试、超时、取消、回收补偿；任务为内部模型）。
