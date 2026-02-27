@@ -1111,3 +1111,24 @@
   - `task_design.md` 的 T31 已标记完成，并补齐完成证据与 DoD 回写。
   - 后续若恢复 `applications` 与 `dataservices` 双主口径，必须重新走 ADR 评审并同步更新验收/回标章节。
 - 替代关系：补充 ADR-102（单接口 API 基线）与 ADR-105（一致性治理）在 `DATA_SERVICE` 子域的执行约束；替代 ADR-085 中将 `dataservices` 作为现行外部路径示例的历史口径。
+
+### ADR-108: T32 跨边界错误码词典补齐定稿为“403 权限拒绝 + 422 引用越界拒绝”
+
+- 日期：2026-02-27
+- 决策：
+  - 错误码词典正式纳入 `422 CROSS_SCOPE_REFERENCE`，并定义为“权限通过后的引用越界拒绝”唯一业务码。
+  - `403/422` 分工固定为：
+    - `403 FORBIDDEN_WORKSPACE` / `403 FORBIDDEN_ACTION`：权限准入失败（无工作空间权限或动作越权）；
+    - `422 CROSS_SCOPE_REFERENCE`：权限已通过，但引用关系跨越 `workspace/cluster/namespace`。
+  - 涉及跨边界引用的 OpenAPI operation 必须显式声明 `422 CROSS_SCOPE_REFERENCE` 触发条件，不得与 `403` 混写。
+  - 审计口径固定为：所有跨边界拒绝都写 `result=failed`，并记录 `requested_scope/resolved_scope` 差异（当返回 `422` 时必填）。
+- 原因：
+  - `task_design.md` 的 GAP-84 指出：`11.2/13.4` 已使用 `CROSS_SCOPE_REFERENCE`，但 `7.2` 错误码词典未定义，造成契约不可编程且验收不可闭环。
+  - 历史文案中 `FORBIDDEN_WORKSPACE` 与跨边界引用拒绝存在混写，导致实现侧容易将“权限越权”和“引用越界”合并处理，破坏错误码稳定性。
+  - `R-ENV-004`、`R-OPS-004` 与 `NFR-014` 需要可测试的单口径拒绝语义，否则会出现“正文已覆盖、词典缺码”的回归风险。
+- 影响：
+  - `design.md` 已同步修订 `7.2`、`7.5`、`11.2`、`13.4`、`14.1.24`、`14.4.3`、`14.4.29`、`15.1`、`15.2`、`15.3`。
+  - `task_design.md` 的 T32 已可标记完成，并新增验收/回标证据链：
+    `TC-SEC-04-A`、`TC-SEC-04-B`、`TC-TRACE-05-A`。
+  - 后续凡调整跨边界拒绝语义，必须同步执行 `15.2.2` 第 28 条复核门禁。
+- 替代关系：补充 ADR-093（403/409 错误码收敛）在跨边界场景的执行约束；无被替代 ADR。
