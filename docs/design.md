@@ -27,6 +27,7 @@
 | `v1.15.0` | `2026-02-27` | 完成 T21：三角色权限模型重构，定稿 `super_admin/workspace_admin/user` 授权边界与验收回标联动。 | `T21`、`ADR-097` |
 | `v1.16.0` | `2026-02-27` | 完成 T22：执行底座收敛为 `Postgres + Redis`，定稿 Redis 队列/分布式锁/EventBus 语义并联动验收回标。 | `T22`、`ADR-098` |
 | `v1.17.0` | `2026-02-27` | 完成 T23：网关配置口径收敛为“变更与回滚审计”，清理历史术语并联动验收/回标/治理。 | `T23`、`ADR-099` |
+| `v1.18.0` | `2026-02-27` | 完成 T24：双视图 API 与 ID 语义收敛历史基线追溯，补齐实例/应用双视图契约、验收与回标治理链路。 | `T24`、`ADR-100` |
 
 文档状态：
 
@@ -46,6 +47,8 @@
 | `Template` | 可部署标准单元，当前统一为 Helm Chart + 参数 schema。 |
 | `Artifact` | 高代码来源制品，类型包括 DevBox 发布镜像、用户上传镜像、用户上传 Helm Chart。 |
 | `Instance` | 模板或制品在 `workspace+cluster+namespace` 的运行实例。 |
+| `instance_id` | 历史双视图（T24）中实例视图主标识，仅用于 `/instances/{instance_id}`；不得用于应用主资源路径参数。 |
+| `application_id` | 应用视图主标识，用于 `/applications/{application_id}`；历史双视图与当前统一应用接口均保持该命名。 |
 | `shared` | 可复用资源可见性，进入共享列表与选择器，可被多个宿主引用。 |
 | `embedded` | 宿主内嵌资源可见性，仅随宿主创建/运维/回收，不进入共享列表。 |
 | `CUD` | Create/Update/Delete 变更操作；本文统一走异步任务模型。 |
@@ -174,6 +177,18 @@ T1 阶段输出定位为“设计基线”而非“功能详设”：
 - 幂等兼容策略：历史按 `idempotency_key` 检索的链路仅用于审计查询；任务去重与冲突判定统一迁移到 `idempotency_scope + request_fingerprint`。
 - 幂等字段 canonical 命名：`idempotency_scope`、`idempotency_key`、
   `request_fingerprint`、`idempotency_expire_at`；除兼容说明外，正文模型/索引/验收不得使用缩写字段名。
+
+T24 历史双视图 ID 语义冻结（追溯）：
+
+| 对象 | 历史主标识 | 路径参数约束 | 修正规则 |
+| --- | --- | --- | --- |
+| 实例视图资源 | `instance_id` | 仅允许出现在 `/api/v1/instances/{instance_id}` 及其子动作路径 | 旧示例若以 `application_id` 承载实例语义，统一修正为 `instance_id` |
+| 应用视图资源 | `application_id` | 仅允许出现在 `/api/v1/applications/{application_id}` 及其子路径 | 禁止在应用视图文档中以 `instance_id` 代替 |
+
+追溯约束：
+
+- T24 为历史双视图基线，保留用于评审与追踪；当前需求主口径仍以 `applications` 单接口为准。
+- 历史双视图中的 `instance_id` 不得外溢到现行统一应用接口参数命名。
 
 历史别名兼容与退场策略（T18）：
 
@@ -981,6 +996,21 @@ E2E 通过条件（发布验收门禁）：
 - 软删字段：`deleted_at`、`deleted_by`、`delete_task_id`（`R-DATA-005`）。
 - 绑定/解绑/级联删除均写审计事件（`R-DATA-008`）。
 
+T24 历史双视图查询契约（追溯，`R-DATA-010/011`）：
+
+- 双视图职责：
+  - 实例视图：聚焦实例生命周期与动作，主路径 `/api/v1/instances`。
+  - 应用视图：聚焦应用实体与应用下实例查询，主路径 `/api/v1/applications`。
+- 应用下实例查询接口：
+  `GET /api/v1/applications/{application_id}/instances?workspace_id={workspace_id}`。
+- 返回分支规则：
+  - `application_type=HIGH_CODE_APP`：返回 `agent_instances[]` 与 `component_instances[]`。
+  - `application_type=LOW_CODE_PLATFORM`：返回 `platform_components[]` 与 `dependency_components[]`。
+- 空集语义：应用存在但当前无运行实例时返回 `200` + 空数组。
+- 异常语义：
+  - `404 RESOURCE_NOT_FOUND`：`application_id` 不存在或不属于 `workspace_id`；
+  - `403 FORBIDDEN_WORKSPACE`：调用方无工作空间权限。
+
 ### 4.10 CRUD、权限与异步任务（R-OPS-001~010）
 
 统一读写语义：
@@ -1484,6 +1514,16 @@ flowchart LR
 - `sort`（如 `created_at.desc`）
 - `status`、`keyword`、`visibility`（按资源域可选）
 
+T24 历史双视图通用契约补充（追溯）：
+
+- 历史双视图主路径：`/api/v1/instances` 与 `/api/v1/applications`。
+- Query 场景必须显式携带 `workspace_id` 作为鉴权与查询作用域参数。
+- 历史列表过滤维度最小集合：`resource_type`、`status`、`cluster_id`。
+- 动作能力矩阵（历史）：
+  - 实例视图动作：`start|stop|restart`；
+  - 应用视图动作：`start|stop`（不提供 `restart`）。
+- 兼容保留路径（若存在）必须标注 `deprecated: true` 与退场版本，不得作为默认示例。
+
 ### 7.2 错误码与异常模型
 
 错误码分层：
@@ -1613,6 +1653,45 @@ DevBox 发布记录接口：
 - 发布：`POST /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/releases`
 - 发布包列表：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/applications/{application_id}/charts`
 - 下载发布包：`GET /workspaces/{workspace_id}/clusters/{cluster_id}/charts/{chart_id}/package`
+
+T24 历史双视图接口清单（追溯）：
+
+- 实例视图：
+  - `POST /api/v1/instances`
+  - `GET /api/v1/instances?workspace_id={workspace_id}&resource_type=&status=&cluster_id=`
+  - `GET /api/v1/instances/{instance_id}?workspace_id={workspace_id}`
+  - `PUT /api/v1/instances/{instance_id}?workspace_id={workspace_id}`
+  - `DELETE /api/v1/instances/{instance_id}?workspace_id={workspace_id}`
+  - `POST /api/v1/instances/{instance_id}/actions/start|stop|restart?workspace_id={workspace_id}`
+- 应用视图：
+  - `POST /api/v1/applications`
+  - `GET /api/v1/applications?workspace_id={workspace_id}&application_type={HIGH_CODE_APP|LOW_CODE_PLATFORM}`
+  - `GET /api/v1/applications/{application_id}?workspace_id={workspace_id}`
+  - `PUT /api/v1/applications/{application_id}?workspace_id={workspace_id}`
+  - `DELETE /api/v1/applications/{application_id}?workspace_id={workspace_id}`
+  - `POST /api/v1/applications/{application_id}/actions/start|stop?workspace_id={workspace_id}`
+  - `GET /api/v1/applications/{application_id}/instances?workspace_id={workspace_id}`
+
+T24 历史双视图关键时序（应用下实例查询）：
+
+```mermaid
+sequenceDiagram
+  participant Client as Caller
+  participant API as API Server
+  participant Auth as AuthZ
+  participant Read as Read Model
+
+  Client->>API: GET /api/v1/applications/{application_id}/instances?workspace_id=ws-1
+  API->>Auth: 校验 workspace 授权
+  Auth-->>API: pass/fail
+  alt unauthorized
+    API-->>Client: 403 FORBIDDEN_WORKSPACE
+  else authorized
+    API->>Read: 按 application_id 查询 application_type 与实例关系
+    Read-->>API: HIGH_CODE_APP 或 LOW_CODE_PLATFORM 结果
+    API-->>Client: 200 + 分支化 instances payload
+  end
+```
 
 网关配置变更与回滚接口（T23）：
 
@@ -1775,6 +1854,15 @@ LowCodeSummary:
   `entry_url`、`admin_account_ref`（按角色脱敏）、`dependency_topology`、`version`。
 - 读路径不做实时拓扑重算：`dependency_topology` 来源于最近一次成功任务写回快照。
 
+T24 历史应用下实例查询读路径（追溯）：
+
+- `GET /applications/{application_id}/instances` 必须先判定 `application_type` 再选择返回 schema。
+- `HIGH_CODE_APP` 返回 `agent_instances[]/component_instances[]`，字段最小集：
+  `instance_id`、`instance_name`、`status`、`component_kind`、`last_task_id`。
+- `LOW_CODE_PLATFORM` 返回 `platform_components[]/dependency_components[]`，字段最小集：
+  `instance_id`、`component_type`、`status`、`owner_kind`、`owner_id`。
+- 返回空集时保持 `200`，不得将“无实例”编码为 `404`。
+
 ### 7.5 OpenAPI 3.0 组织方式
 
 规范组织：
@@ -1796,6 +1884,8 @@ T7+T12 必选路径落盘（要求端点 -> OpenAPI 路径文件）：
 | `/lowcodes` | `{scope}/lowcodes` | `paths/lowcodes.yaml` |
 | `/lowcodes/imports` | `{scope}/lowcodes/imports` | `paths/lowcode_imports.yaml` |
 | `/lowcodes/{lowcode_id}` | `{scope}/lowcodes/{lowcode_id}` | `paths/lowcodes.yaml` |
+| `instances（历史双视图）` | `/api/v1/instances` | `paths/instances.yaml` |
+| `/applications/{application_id}/instances（历史双视图）` | `/api/v1/applications/{application_id}/instances` | `paths/applications_instances.yaml` |
 | `applications relations` | `{scope}/applications/{application_id}/relations` | `paths/application_relations.yaml` |
 | `/applications/{application_id}/charts` | 见 7.3「发布包列表」接口 | `paths/highcode_charts.yaml` |
 | `/charts/{chart_id}/package` | `{scope}/charts/{chart_id}/package` | `paths/highcode_charts.yaml` |
@@ -1848,6 +1938,17 @@ T16 低代码导入与删除落盘约束（`paths/lowcode_imports.yaml` + `paths
   - `202 AsyncAccepted`；
   - operation 扩展审计动作
     `x-audit-action: lowcode_instance_delete`.
+
+T24 历史双视图 OpenAPI 约束（追溯）：
+
+- `paths/instances.yaml` 中路径参数仅允许 `instance_id`；`paths/applications*.yaml` 中仅允许 `application_id`。
+- `GET /applications/{application_id}/instances` 必须以 `oneOf` 区分
+  `HIGH_CODE_APP` 与 `LOW_CODE_PLATFORM` 的返回结构。
+- 动作能力矩阵必须显式声明：
+  - 实例视图支持 `start|stop|restart`；
+  - 应用视图仅支持 `start|stop`；
+  - 不支持动作统一返回 `409` + 标准错误对象。
+- 若保留兼容旧路径，必须在 OpenAPI 标注 `deprecated: true` 并提供 `x-sunset-version`。
 
 落地建议：
 
@@ -3238,7 +3339,9 @@ T9 运维补充约束：
 | R-HCA-011~014 | 级联冲突 `TC-HCA-03` | cascade=false 保留共享；cascade=true `409 REFERENCE_CONFLICT`；embedded 回收 | 删除响应、关系与补偿 |
 | R-PKG-001~006 | 发布打包与导入（`TC-PKG-01`、`TC-PKG-02`） | 每次发布产出版本化 Chart；OCI 推送成功可下载；外部导入通过验证 | Release 记录、OCI 清单、下载与导入验证 |
 | R-DATA-001~008 | 关系查询（`TC-DATA-01/02`） | 详情与 `relations` 返回 4 类关系；变更可审计 | 详情响应、relations 响应、审计检索 |
+| R-DATA-010~011 | 历史双视图查询契约（`TC-DATA-04`） | `applications` 视图覆盖 `HIGH_CODE_APP/LOW_CODE_PLATFORM`，且 `GET /applications/{application_id}/instances` 返回分支化结构 | 契约测试、接口响应样本、鉴权日志 |
 | R-OPS-001~010 | 异步任务、幂等与补偿（`TC-OPS-01`） | CUD 返回 `202+task_id`；同 scope 命中同任务；异指纹返回 `409` | 任务流水、幂等记录、补偿、错误样本 |
+| R-OPS-012~013 | 历史双视图 OpenAPI 与动作矩阵（`TC-OPS-12`） | `instances/applications` 路径、动作能力矩阵与运行时错误码一致 | OpenAPI diff、动作探测测试、错误响应样本 |
 | S-SEC-001~007 | Secret 边界、版本与审计（`TC-SEC-01`） | Secret 在 workspace namespace；用户不可读明文；回滚采用新版本并审计 | Secret 版本记录、RBAC、审计 |
 | NFR-001~004 | 接口延迟、排队时延、任务执行时长（`TC-NFR-01`） | 满足 13.1 阈值：提交 `P95<=300ms`、Query `P95<=800ms`、排队 `P95<=5s` | 压测报告、监控截图 |
 | NFR-005~011 | 可用性、容量、吞吐（`TC-NFR-02`） | 月可用性 `>=99.9%`；容量与吞吐达到 13.2/13.3 目标 | SLI 报表、容量与压测报告 |
@@ -3404,6 +3507,15 @@ flowchart LR
 | 网关配置变更与回滚审计口径收敛 | `TC-GTW-02-A` | `4.6/7.3/7.6` 仅保留“变更+回滚+审计”约束，无策略算法描述 | 文档 diff、架构评审记录 |
 | 配置失败自动回滚闭环 | `TC-GTW-02-B` | 配置生效失败后自动回滚至稳定 revision，任务状态与审计一致 | 任务结果、回滚日志、审计事件 |
 | 术语一致性与回标同步 | `TC-GTW-02-C` | 文本检索无旧术语残留；`14.4.20/15.3.3` 证据链闭环 | 检索记录、回标记录、开放项关单记录 |
+
+#### 14.1.16 T24 双视图 API 与 ID 语义收敛验收样例（历史基线）
+
+| 缺口 | 用例 ID | 通过条件 | 证据 |
+| --- | --- | --- | --- |
+| `instance_id/application_id` 语义冻结 | `TC-DATA-04-A` | 术语、路径、OpenAPI 参数命名不混用；历史误用示例已修正 | 文档 diff、OpenAPI lint 报告 |
+| 实例视图契约收敛 | `TC-OPS-12-A` | `POST/GET /instances`、`GET/PUT/DELETE /instances/{instance_id}` 与 `start/stop/restart` 均可执行 | 契约测试、接口回放、错误样本 |
+| 应用视图与应用下实例查询契约收敛 | `TC-DATA-04-B` | `GET /applications/{application_id}/instances` 按应用类型返回分支结构；空集返回 `200` | 查询响应样本、分支断言报告 |
+| OpenAPI 与治理联动 | `TC-OPS-12-B` | `R-DATA-010/011`、`R-OPS-012/013` 在 `7.5/14.4/15.2` 形成闭环追踪 | 覆盖回标、评审记录、ADR 链路 |
 
 ### 14.2 测试分层与关键场景
 
@@ -3604,6 +3716,8 @@ flowchart LR
 | R-DATA-006 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.3 定义 embedded 组件不进入共享关联模型。 |
 | R-DATA-007 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.3、7.3、14.1.5 定义应用详情与 relations 读模型字段集合。 |
 | R-DATA-008 | 4.9、5.3、5.5、7.3、7.5、11.3、12.6 | 已覆盖 | 已在 5.5 定义关系变更审计事件最小字段。 |
+| R-DATA-010 | 4.9、7.1、7.3、7.4、14.1.16、14.4.21 | 已覆盖 | T24 历史双视图基线已补齐 `applications` 视图覆盖规则与验收链路。 |
+| R-DATA-011 | 4.9、7.3、7.4、7.5、14.1.16、14.4.21 | 已覆盖 | 已定义 `GET /applications/{application_id}/instances` 分支化返回契约与错误语义。 |
 | R-OPS-001 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.4/2.5 固化异步/同步与角色基线。 |
 | R-OPS-002 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 2.6、5.2.3、8.1、8.4 统一幂等口径并与 `requirements.md` 对齐。 |
 | R-OPS-003 | 2.5、4.10、7.1~7.6、8.1~8.6、10.1、10.2、12.6 | 已覆盖 | 已在 2.5、10.1、10.2 固化三角色模型、`managed_workspace` 授权关系与动作矩阵。 |
@@ -3614,6 +3728,8 @@ flowchart LR
 | R-OPS-008 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 明确任务结果最小字段集合。 |
 | R-OPS-009 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 8.6 固化补偿触发与一致性策略。 |
 | R-OPS-010 | 4.10、7.1~7.6、8.1~8.6、12.6 | 已覆盖 | 已在 7.1、8.2、8.3 纳入关键动作审计点。 |
+| R-OPS-012 | 7.1、7.3、7.5、14.1.16、14.4.21 | 已覆盖 | T24 历史双视图 OpenAPI 路径与接口清单已补齐。 |
+| R-OPS-013 | 7.1、7.3、7.5、14.1.16、14.4.21 | 已覆盖 | 已补齐实例/应用动作能力矩阵与 `409` 冲突语义。 |
 | S-SEC-001 | 10.3、11.1、11.2 | 已覆盖 | 已在 10.3 固化 Secret 存放范围为工作空间 namespace。 |
 | S-SEC-002 | 10.1、10.4 | 已覆盖 | 已在 10.1/10.4 固化“可引用不可明文读取”权限边界。 |
 | S-SEC-003 | 10.3 | 已覆盖 | 已在 10.3 固化版本化命名 `{secret_name}.v{n}`。 |
@@ -3790,16 +3906,25 @@ flowchart LR
 | 验收与覆盖回标改写 | R-GTW-006、R-OPS-010 | 待补充 | 已覆盖 | 14.1.15、14.4.3、14.4.20 |
 | 变更治理新增术语一致性复核门禁 | R-OPS-010 | 待补充 | 已覆盖 | 15.2.2（第 20 条）、15.3.3、`docs/decision.md`（ADR-099） |
 
+#### 14.4.21 T24 双视图 API 与 ID 语义收敛回标记录（2026-02-27，历史基线）
+
+| 回标项 | 关联需求 | T24 前状态 | T24 后状态 | 证据章节 |
+| --- | --- | --- | --- | --- |
+| `instance_id/application_id` 术语与路径参数冻结 | R-DATA-010、R-OPS-012 | 待补充 | 已覆盖 | 1.2、2.6、7.1、7.3 |
+| 实例视图接口清单与动作矩阵落盘 | R-OPS-012、R-OPS-013 | 待补充 | 已覆盖 | 7.1、7.3、7.5、14.1.16 |
+| 应用下实例查询分支语义补齐 | R-DATA-011 | 待补充 | 已覆盖 | 4.9、7.4、14.1.16 |
+| 验收/回标/治理联动闭环 | R-DATA-010/011、R-OPS-012/013 | 待补充 | 已覆盖 | 14.1.16、14.4.21、15.1、15.2 |
+
 ## 15. 交付物与需求管理
 
 ### 15.1 设计交付物清单
 
 | 交付物 ID | 交付物 | 内容范围 | 验收标准 | 责任角色 |
 | --- | --- | --- | --- | --- |
-| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T23 DoD 全满足 | 架构负责人 |
+| D-01 | 设计主文档 | `docs/design.md` 全章节（1~15） | 与 `requirements.md` 无冲突，T1~T24 DoD 全满足（T24 为历史追溯基线） | 架构负责人 |
 | D-02 | 决策记录 | `docs/decision.md` ADR 闭环 | 关键决策均有“原因+影响+替代关系” | 架构负责人 |
 | D-03 | 需求基线 | `docs/requirements.md` | 需求 ID 稳定可追踪，可测试 | 产品负责人 |
-| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T23 状态与设计实际一致 | 项目负责人 |
+| D-04 | 任务跟踪 | `docs/task/task_design.md` | T1~T24 状态与设计实际一致 | 项目负责人 |
 | D-05 | API 契约包 | OpenAPI 根文件与分组路径定义 | 可用于生成服务端桩代码与契约测试 | 后端负责人 |
 | D-06 | 数据模型包 | ERD、DDL 约束、迁移计划 | 可直接拆分 repository 层实现任务 | 后端负责人 |
 | D-07 | 测试与验收包 | `14.1/14.2` 用例、压测与演练方案 | 可执行且覆盖 P0/P1 场景 | QA 负责人 |
@@ -3871,6 +3996,9 @@ flowchart LR
 20. 网关配置口径与术语一致性复核：凡涉及 `R-GTW-006` 或网关配置语义改词，必须同步核对
     `4.6`（正文边界）、`7.3/7.6`（接口与事件契约）、`14.1.15/14.4.20`（验收与回标）、
     `15.3.3`（开放项证据），并执行全文术语扫描，禁止旧术语回流。
+21. 双视图历史基线复核：凡涉及 `R-DATA-010/011`、`R-OPS-012/013` 的回溯修订，必须同步核对
+    `1.2/2.6`（ID 语义冻结）、`4.9`（应用下实例查询）、`7.1/7.3/7.4/7.5`（双视图契约与 OpenAPI）、
+    `14.1.16/14.4.21`（验收与回标）；若当前需求主口径已切换，必须显式标注“历史基线追溯”避免误作为现行开发入口。
 
 #### 15.2.3 版本规则
 
@@ -3900,7 +4028,7 @@ flowchart LR
 
 ### 15.3 开放问题清单
 
-#### 15.3.1 设计自检记录（T23）
+#### 15.3.1 设计自检记录（T24）
 
 | 自检项 | 结论 | 说明 |
 | --- | --- | --- |
@@ -3923,6 +4051,7 @@ flowchart LR
 | T21 三角色权限模型重构（超管/空间管理员/用户） | 通过 | 已完成 2.5、4.1、4.4、4.6、4.7、7.3、7.6、10.1~10.2、11.3、14.1.13、14.4.18、15.2 与 ADR 回写 |
 | T22 Redis 执行底座收敛（队列/分布式锁/事件总线） | 通过 | 已完成 3.2、7.6、8.1.1、8.3、8.5、8.6、8.9、12.2、13.1、14.1.14、14.2、14.4.19、15.2 与 ADR 回写 |
 | T23 网关配置口径收敛（变更与回滚审计） | 通过 | 已完成 1.1、2.3、4.6、5.8、7.3、7.6、14.1.15、14.3、14.4.20、15.2、15.3 与 ADR 回写 |
+| T24 双视图 API 与 ID 语义收敛（历史基线） | 通过 | 已完成 1.2、2.6、4.9、7.1、7.3、7.4、7.5、14.1.16、14.4.21、15.1、15.2 与 ADR 回写 |
 | 遗漏检查 | 通过 | 当前无阻断编码的开放问题 |
 
 #### 15.3.2 开放问题（需闭环）
