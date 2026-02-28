@@ -1,0 +1,4 @@
+interface:
+  display_name: "Commit Message Writer"
+  short_description: "Draft concise commit messages from diff and local history"
+  default_prompt: "Use $commit-msg to analyze current changes, follow recent commit style in this repo, and draft a short, accurate commit message without running git commit."
