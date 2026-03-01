@@ -252,7 +252,202 @@ sequenceDiagram
 
 ## §3 统一接口契约、DTO、错误码（T03）
 
-待 T03 补充。
+### 3.1 需求追踪与章节边界
+
+| 追踪ID | 来源 | 设计落点 |
+| --- | --- | --- |
+| API-01 | FR-API-001 | Aether 仅定义代码级 Go 接口，不直接暴露对外 OpenAPI。 |
+| API-02 | FR-API-002 | 统一 CUD 请求 DTO，固定最小字段与校验规则。 |
+| API-03 | FR-API-003 | CUD 同步返回固定受理模型，`status=ACCEPTED`。 |
+| API-04 | FR-API-004 | Query 仅支持 `task_id` 单任务查询，不提供列表检索。 |
+| API-05 | FR-API-005 | 错误码类别一一映射，无“兜底模糊错误”。 |
+| API-06 | FR-API-006 | RenderValues 复用 CUD 语义并提供数据/文件两种输出。 |
+| CORE-03 | FR-CORE-003 | 资源标识在接口模型中统一携带 `resource_id/workspace_id/cluster_id/namespace/resource_type`。 |
+| GC-02 | requirements §13.2 | 章节必须给出 Go 接口签名、DTO、枚举、字段校验、错误码。 |
+| GC-03 | requirements §13.2 | 明确上层 OpenAPI 3.0 RESTful 到 Aether 代码接口映射。 |
+
+章节边界：
+
+1. 本节定义接口契约、DTO 与错误码，不定义执行状态机细节（状态机与重入细节见 §4）。
+2. 本节定义“接口级并发/幂等约束”，不引入资源级并发锁实现（由上层治理，见 requirements NFR-003）。
+3. 本节中 OpenAPI 仅作边界映射示意，Aether 仍保持“非对外 OpenAPI”定位。
+
+### 3.2 代码级接口签名（Go）
+
+```go
+type DeploymentAPI interface {
+    Create(ctx context.Context, req CUDRequest) (CUDAcceptedResponse, *AetherError)
+    Update(ctx context.Context, req CUDRequest) (CUDAcceptedResponse, *AetherError)
+    Delete(ctx context.Context, req CUDRequest) (CUDAcceptedResponse, *AetherError)
+    QueryTask(ctx context.Context, req QueryTaskRequest) (QueryTaskResponse, *AetherError)
+    RenderValues(ctx context.Context, req RenderValuesRequest) (RenderValuesResponse, *AetherError)
+}
+```
+
+接口语义约束：
+
+1. `Create/Update/Delete` 必须复用同一 `CUDRequest` 结构，动作语义由调用方法名确定。
+2. `QueryTask` 的业务检索键仅允许 `task_id`；`workspace_id` 仅用于授权与作用域判定，不属于任务检索过滤条件。
+3. `RenderValues` 仅支持 `DEPLOY_CREATE`、`DEPLOY_UPDATE` 两类渲染意图；不提供 `DEPLOY_DELETE` 渲染。
+
+### 3.3 DTO、枚举与字段约束
+
+#### 3.3.1 枚举定义
+
+| 枚举 | 取值 | 说明 |
+| --- | --- | --- |
+| `CUDAction` | `DEPLOY_CREATE`、`DEPLOY_UPDATE`、`DEPLOY_DELETE` | 用于幂等键中的 `action` 维度。 |
+| `RenderIntent` | `DEPLOY_CREATE`、`DEPLOY_UPDATE` | Render 仅覆盖需要 values 输入的动作。 |
+| `AcceptedStatus` | `ACCEPTED` | CUD 受理态固定枚举，不允许扩展。 |
+| `TaskStatus` | `ACCEPTED`、`RUNNING`、`SUCCEEDED`、`FAILED`、`UNKNOWN` | Query 返回状态枚举（详细流转见 §4）。 |
+| `RenderOutputFormat` | `YAML_DATA`、`EXECUTABLE_FILE` | 对应 FR-API-006 输出形态。 |
+
+#### 3.3.2 请求 DTO
+
+| DTO | 字段 | 类型 | 必填 | 约束 |
+| --- | --- | --- | --- | --- |
+| `CUDRequest` | `request_id` | `string` | 是 | 非空；用于幂等键组成。 |
+| `CUDRequest` | `operator` | `OperatorContext` | 是 | 与 §2 授权模型一致；不可为空对象。 |
+| `CUDRequest` | `workspace_id` | `string` | 是 | 非空；由上层传入，不允许 Aether 推断。 |
+| `CUDRequest` | `target.resource_type` | `ResourceType` | 是 | 必须是已注册资源类型。 |
+| `CUDRequest` | `target.resource_id` | `string` | 条件必填 | `Update/Delete` 必填；`Create` 可选。 |
+| `CUDRequest` | `cluster_id` | `string` | 是 | 所有 CUD 必填；缺失返回 `AETHER_INVALID_ARGUMENT`。 |
+| `CUDRequest` | `spec` | `map[string]any` | 是 | 非空；结构校验由类型注册 schema 执行。 |
+| `CUDRequest` | `labels` | `map[string]string` | 否 | 键值需满足 K8S label 约束。 |
+| `CUDRequest` | `annotations` | `map[string]string` | 否 | 键值需满足 K8S annotation 约束。 |
+| `QueryTaskRequest` | `task_id` | `string` | 是 | 任务唯一查询键；禁止列表参数。 |
+| `QueryTaskRequest` | `workspace_id` | `string` | 是 | 仅用于权限与作用域校验，不参与查询过滤。 |
+| `QueryTaskRequest` | `operator` | `OperatorContext` | 是 | 与 CUD 相同授权输入。 |
+| `RenderValuesRequest` | `intent` | `RenderIntent` | 是 | 仅允许 `DEPLOY_CREATE/DEPLOY_UPDATE`。 |
+| `RenderValuesRequest` | `cud_request` | `CUDRequest` | 是 | 与目标 CUD 的语义字段完全一致。 |
+| `RenderValuesRequest` | `output_format` | `RenderOutputFormat` | 是 | 决定返回 YAML 数据或文件内容。 |
+
+#### 3.3.3 响应 DTO
+
+| DTO | 字段 | 类型 | 必填 | 约束 |
+| --- | --- | --- | --- | --- |
+| `CUDAcceptedResponse` | `request_id` | `string` | 是 | 回显请求值。 |
+| `CUDAcceptedResponse` | `task_id` | `string` | 是 | 后续 Query 唯一查询键。 |
+| `CUDAcceptedResponse` | `resource_id` | `string` | 是 | `Create` 可新分配；`Update/Delete` 与目标一致。 |
+| `CUDAcceptedResponse` | `accepted_at` | `string(date-time)` | 是 | RFC3339 UTC 时间戳。 |
+| `CUDAcceptedResponse` | `status` | `AcceptedStatus` | 是 | 固定为 `ACCEPTED`。 |
+| `CUDAcceptedResponse` | `resource_ref` | `ResourceRef` | 是 | 包含 `workspace_id/cluster_id/namespace/resource_type/resource_id`。 |
+| `QueryTaskResponse` | `task_id` | `string` | 是 | 与请求一致。 |
+| `QueryTaskResponse` | `resource_ref` | `ResourceRef` | 是 | 统一资源标识（FR-CORE-003）。 |
+| `QueryTaskResponse` | `status` | `TaskStatus` | 是 | 当前任务状态。 |
+| `QueryTaskResponse` | `result` | `TaskResult` | 是 | 当前任务结果快照。 |
+| `QueryTaskResponse` | `observed_at` | `string(date-time)` | 是 | 状态观测时间。 |
+| `RenderValuesResponse` | `request_id` | `string` | 是 | 回显渲染输入中的 `request_id`。 |
+| `RenderValuesResponse` | `output_format` | `RenderOutputFormat` | 是 | 返回形态标记。 |
+| `RenderValuesResponse` | `yaml_data` | `string` | 条件必填 | `output_format=YAML_DATA` 时必填。 |
+| `RenderValuesResponse` | `file_content` | `[]byte` | 条件必填 | `output_format=EXECUTABLE_FILE` 时必填。 |
+| `RenderValuesResponse` | `values_digest` | `string` | 是 | 渲染内容摘要，用于与 CUD 执行输入对账。 |
+| `RenderValuesResponse` | `template_version` | `string` | 是 | 标识渲染使用的模板版本。 |
+
+### 3.4 字段校验、失败分支与状态约束
+
+| 校验规则ID | 规则 | 失败错误码 |
+| --- | --- | --- |
+| VAL-01 | CUD 缺失 `request_id/workspace_id/cluster_id/spec/target.resource_type` 任一必填字段 | `AETHER_INVALID_ARGUMENT` |
+| VAL-02 | `Update/Delete` 缺失 `target.resource_id` | `AETHER_INVALID_ARGUMENT` |
+| VAL-03 | `QueryTaskRequest` 含分页、过滤、排序类参数 | `AETHER_INVALID_ARGUMENT` |
+| VAL-04 | `QueryTaskRequest.task_id` 为空 | `AETHER_INVALID_ARGUMENT` |
+| VAL-05 | `RenderValuesRequest.intent=DEPLOY_DELETE` | `AETHER_INVALID_ARGUMENT` |
+| VAL-06 | `target.resource_type` 未注册 | `AETHER_RESOURCE_NOT_FOUND` |
+| VAL-07 | 请求通过语法校验但权限不足/作用域不合法 | `AETHER_PERMISSION_DENIED` |
+
+接口状态约束：
+
+1. CUD 成功受理时 `status` 必须且仅能为 `ACCEPTED`。
+2. Query 返回状态必须属于 `TaskStatus` 枚举集合；`UNKNOWN` 仅表示查询降级态。
+3. Render 不产生 `task_id`，其结果仅作为 CUD 输入等价视图。
+
+### 3.5 统一错误响应与错误码体系
+
+统一错误 DTO：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `code` | `string` | Aether 统一错误码。 |
+| `message` | `string` | 面向调用方的稳定错误消息模板。 |
+| `details` | `map[string]any` | 字段级错误详情（可选）。 |
+| `retriable` | `bool` | 是否建议上层重试。 |
+| `trace_id` | `string` | 调用链跟踪标识。 |
+
+错误码映射（与 FR-API-005 一一对应）：
+
+| 错误码 | 类别 | 典型触发场景 | `retriable` | 上层 OpenAPI 建议 HTTP 状态 |
+| --- | --- | --- | --- | --- |
+| `AETHER_INVALID_ARGUMENT` | 参数错误 | 缺失必填字段、枚举非法、Query 出现列表参数 | `false` | `400` |
+| `AETHER_PERMISSION_DENIED` | 权限错误 | workspace/角色/集群作用域不满足 | `false` | `403` |
+| `AETHER_RESOURCE_NOT_FOUND` | 资源不存在 | `task_id` 不存在、类型未注册、namespace 不存在 | `false` | `404` |
+| `AETHER_CONFLICT` | 资源冲突 | 幂等键命中但请求指纹冲突、namespace 映射冲突 | `false` | `409` |
+| `AETHER_DEPENDENCY_MISSING` | 依赖缺失 | `spec.dependencies` 中 required 依赖未找到 | `false` | `422` |
+| `AETHER_RENDER_ERROR` | 渲染错误 | values 渲染失败、渲染结果不满足模板/schema | `false` | `422` |
+| `AETHER_QUERY_CONTEXT_UNAVAILABLE` | 查询上下文不可用 | Query 时 Helm/K8S 暂不可达 | `true` | `503` |
+| `AETHER_INTERNAL` | 内部错误 | 非预期运行时异常 | `true` | `500` |
+
+禁止规则：
+
+1. 禁止定义“`UNKNOWN_ERROR`/`AETHER_ERROR`”等模糊兜底业务错误码。
+2. 所有失败分支必须映射到上表 8 类之一；无法归类时只能落 `AETHER_INTERNAL`。
+
+### 3.6 OpenAPI 3.0 RESTful 到代码接口映射
+
+说明：以下路径由上层模块对外提供，Aether 仅提供代码接口实现（FR-API-001，GC-03）。
+
+| 上层 REST 路径 | 方法 | Aether 接口 | 关键 DTO | 关键返回 |
+| --- | --- | --- | --- | --- |
+| `/api/v1/workspaces/{workspace_id}/resources/{resource_type}` | `POST` | `Create` | `CUDRequest` | `CUDAcceptedResponse` |
+| `/api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}` | `PUT` | `Update` | `CUDRequest` | `CUDAcceptedResponse` |
+| `/api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}` | `DELETE` | `Delete` | `CUDRequest` | `CUDAcceptedResponse` |
+| `/api/v1/workspaces/{workspace_id}/tasks/{task_id}` | `GET` | `QueryTask` | `QueryTaskRequest` | `QueryTaskResponse` |
+| `/api/v1/workspaces/{workspace_id}/resources/{resource_type}/render-values` | `POST` | `RenderValues` (`intent=DEPLOY_CREATE`) | `RenderValuesRequest` | `RenderValuesResponse` |
+| `/api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}/render-values` | `POST` | `RenderValues` (`intent=DEPLOY_UPDATE`) | `RenderValuesRequest` | `RenderValuesResponse` |
+
+### 3.7 并发、幂等与一致性约束（接口层）
+
+1. 幂等键固定为 `request_id + workspace_id + action`，`action` 由 `Create/Update/Delete` 方法确定（与 §4 保持一致）。
+2. 同幂等键且请求指纹一致时，CUD 必须返回同一 `task_id/resource_id`（不重复触发执行）；指纹冲突返回 `AETHER_CONFLICT`。
+3. Query 不提供批量、列表、分页、过滤、排序参数；任何此类扩展均判定为越界。
+4. 同一资源的并发治理策略由上层负责，Aether 不在接口层声明强制互斥锁。
+5. `RenderValuesResponse.values_digest` 必须可用于与后续 CUD 实际执行输入进行等价对账（渲染一致性细节见 §7）。
+
+### 3.8 关键时序（Mermaid）
+
+```mermaid
+sequenceDiagram
+    participant Client as 上层模块(OpenAPI)
+    participant Adapter as API适配层
+    participant Aether as Aether DeploymentAPI
+    participant Auth as AuthZ/Scope
+    participant Exec as 执行器
+
+    Client->>Adapter: CUD 请求
+    Adapter->>Aether: Create/Update/Delete(CUDRequest)
+    Aether->>Auth: 字段校验 + 鉴权/作用域判定
+    alt 参数或权限失败
+        Auth-->>Adapter: AETHER_INVALID_ARGUMENT / AETHER_PERMISSION_DENIED
+        Adapter-->>Client: 4xx + AetherError
+    else 通过
+        Aether->>Exec: 幂等判定并触发执行
+        Exec-->>Aether: task_id/resource_id
+        Aether-->>Adapter: CUDAcceptedResponse(status=ACCEPTED)
+        Adapter-->>Client: 202 Accepted
+        Client->>Adapter: GET /tasks/{task_id}
+        Adapter->>Aether: QueryTask(task_id, workspace_id)
+        Aether-->>Adapter: QueryTaskResponse(当前状态与结果)
+        Adapter-->>Client: 200 OK
+    end
+```
+
+### 3.9 边界条件与禁止操作
+
+1. 禁止在 Aether 侧新增“任务列表检索接口”或“资源运行态聚合视图接口”。
+2. 禁止在 CUD 受理响应中返回除 `ACCEPTED` 以外的状态值。
+3. 禁止 Render 接口接受与 CUD 语义不一致的独立参数模型（避免两套输入语义分叉）。
+4. `resource_id` 全局唯一性冲突治理由上层负责；Aether 不承担跨业务域唯一性仲裁。
+5. `workspace_id` 必须贯穿 CUD/Query/Render 请求，禁止由 `task_id` 反推并隐式覆盖调用方作用域。
 
 ## §4 执行状态机、幂等与重入（T04）
 
