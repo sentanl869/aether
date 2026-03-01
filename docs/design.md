@@ -112,7 +112,143 @@ sequenceDiagram
 
 ## §2 授权模型与工作空间/多集群作用域（T02）
 
-待 T02 补充。
+### 2.1 需求追踪与约束
+
+| 追踪ID | 来源 | 设计落点 |
+| --- | --- | --- |
+| ACL-01 | FR-ACL-001 | 定义超级管理员对全部资源类型 CUD/QueryTask 的授权能力，并声明纳管资产管理动作由上层模块承载。 |
+| ACL-02 | FR-ACL-002 | 定义空间管理员在授权工作空间内的全量工作空间级操作能力。 |
+| ACL-03 | FR-ACL-003 | 定义普通用户可操作资源类型集合（数据服务、DevBox、高代码应用、记忆体）。 |
+| ACL-04 | FR-ACL-004 | 明确同工作空间内不按创建者做二级隔离。 |
+| WS-01 | FR-WS-001 | 固化 `workspace -> cluster -> namespace` 映射规则与校验点。 |
+| WS-02 | FR-WS-002 | 定义工作空间仓库关联为“上层维护、Aether 消费引用”的边界。 |
+| WS-03 | FR-WS-003 | 固化 `cluster_id` 必填规则及错误码/错误消息模板。 |
+
+基线约束：本章节仅定义授权与作用域判定，不下沉登录认证与业务规则前置校验（D-005、D-010、D-017）。
+
+### 2.2 授权输入模型与领域结构
+
+| 结构 | 字段 | 规则 |
+| --- | --- | --- |
+| `OperatorContext` | `operator_id`, `roles[]`, `workspace_grants[]` | `roles` 取值：`SUPER_ADMIN`、`WORKSPACE_ADMIN`、`USER`。`workspace_grants` 由上层鉴权系统下发，Aether 不反查 IAM。 |
+| `WorkspaceGrant` | `workspace_id`, `role`, `granted_at`, `expires_at` | 同一 `workspace_id` 可出现多角色并集；过期授权不得用于 CUD/Query。 |
+| `AuthorizationRequest` | `action`, `workspace_id`, `cluster_id`, `resource_type`, `resource_id?`, `task_id?` | `action` 取值：`DEPLOY_CREATE`、`DEPLOY_UPDATE`、`DEPLOY_DELETE`、`QUERY_TASK`。 |
+| `WorkspaceClusterBinding` | `workspace_id`, `cluster_id`, `namespace`, `registry_refs[]` | `namespace` 必须与该工作空间的命名空间键一致；`registry_refs` 只用于镜像引用合法性消费。 |
+| `AuthorizationDecision` | `allowed`, `deny_code?`, `deny_message?`, `resolved_namespace?` | 拒绝时必须返回统一错误码；允许时输出 `resolved_namespace` 供执行链路复用。 |
+
+字段约束：
+
+1. CUD 请求的 `cluster_id` 必填（Create/Update/Delete 一致）。
+2. `workspace_id` 必须来自上层请求路径或业务上下文，不允许由 Aether 推断。
+3. `namespace` 不接受调用方自由传入，必须由 `WorkspaceClusterBinding` 解析得到。
+
+### 2.3 角色-动作-资源矩阵
+
+#### 2.3.1 Aether 资源操作矩阵
+
+| 资源类型 | CUD 允许角色 | QueryTask 允许角色 | 说明 |
+| --- | --- | --- | --- |
+| `DATA_SERVICE` | `SUPER_ADMIN`、`WORKSPACE_ADMIN`、`USER` | 同 CUD | 对应 FR-ACL-003“创建数据服务组件实例”。 |
+| `LOW_CODE_PLATFORM` | `SUPER_ADMIN`、`WORKSPACE_ADMIN` | 同 CUD | 普通用户在低代码平台内的业务操作不经 Aether CUD。 |
+| `DEVBOX` | `SUPER_ADMIN`、`WORKSPACE_ADMIN`、`USER` | 同 CUD | 对应 FR-ACL-003“DevBox CRUD”。 |
+| `GATEWAY` | `SUPER_ADMIN` | `SUPER_ADMIN` | 网关实例管理保留超级管理员权限。 |
+| `HIGH_CODE_APP` | `SUPER_ADMIN`、`WORKSPACE_ADMIN`、`USER` | 同 CUD | 对应 FR-ACL-003“创建高代码应用”。 |
+| `MEMORY` | `SUPER_ADMIN`、`WORKSPACE_ADMIN`、`USER` | 同 CUD | 对应 FR-ACL-003“创建记忆体实例”。 |
+
+同工作空间内授权规则：
+
+1. 不按资源创建者做隔离，判定维度仅为 `workspace_id + role + resource_type`（FR-ACL-004）。
+2. QueryTask 与 CUD 使用同一资源权限矩阵（覆盖 TC-017）。
+
+#### 2.3.2 超出 Aether 范围的管理动作
+
+FR-ACL-001 中“纳管集群/仓库/工作空间 CRUD、空间管理员配置”等平台管理动作由上层模块实现；Aether 仅消费其产出（如 `WorkspaceClusterBinding`、`workspace_grants`），不提供对应 CUD 接口。
+
+### 2.4 工作空间/多集群作用域规则
+
+| 规则ID | 规则 | 失败处理 |
+| --- | --- | --- |
+| SCOPE-01 | `workspace_id` 必须存在于 `workspace_grants`（或 `SUPER_ADMIN` 全局放行）。 | `AETHER_PERMISSION_DENIED` |
+| SCOPE-02 | CUD 的 `cluster_id` 必填。 | `AETHER_INVALID_ARGUMENT` |
+| SCOPE-03 | `cluster_id` 必须在 `WorkspaceClusterBinding` 中与 `workspace_id` 成对存在。 | `AETHER_PERMISSION_DENIED`（避免泄露绑定拓扑） |
+| SCOPE-04 | `resolved_namespace` 必须等于该工作空间的规范命名空间键（默认同 `workspace_id`）。 | `AETHER_CONFLICT` |
+| SCOPE-05 | 目标集群中必须已存在 `resolved_namespace`。 | `AETHER_RESOURCE_NOT_FOUND` |
+| SCOPE-06 | `registry_refs` 仅作引用消费，不在 Aether 内落库。 | 非法引用由上层拒绝；Aether 不新增持久化实体 |
+
+多集群同名 namespace 约束（FR-WS-001）：
+
+1. 同一 `workspace_id` 绑定多个集群时，所有绑定记录的 `namespace` 必须一致。
+2. 若任一集群缺失该 namespace，Aether 不自动创建，直接拒绝执行。
+3. 绑定关系变更后，后续请求按最新绑定快照判定；Aether 不缓存长期拓扑状态。
+
+### 2.5 接口边界映射（OpenAPI 3.0 RESTful -> Aether 代码接口）
+
+Aether 本身不对外暴露 OpenAPI；本表用于固定上层 REST 接口与 Aether 鉴权输入的映射关系（GC-03）。
+
+| 上层 OpenAPI 3.0 路径（RESTful） | Aether 动作 | 必要鉴权字段 | 备注 |
+| --- | --- | --- | --- |
+| `POST /api/v1/workspaces/{workspace_id}/resources/{resource_type}` | `DEPLOY_CREATE` | `operator`, `workspace_id`, `cluster_id`, `resource_type` | 缺失 `cluster_id` 按参数错误拒绝。 |
+| `PUT /api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}` | `DEPLOY_UPDATE` | 同上 + `resource_id` | 更新沿用创建同一作用域规则。 |
+| `DELETE /api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}` | `DEPLOY_DELETE` | 同上 + `resource_id` | 删除同样要求显式 `cluster_id`。 |
+| `GET /api/v1/workspaces/{workspace_id}/tasks/{task_id}` | `QUERY_TASK` | `operator`, `workspace_id`, `task_id` | QueryTask 在工作空间维度校验权限。 |
+
+错误码与错误消息模板（T02 DoD）：
+
+| 场景 | 错误码 | 错误消息模板 |
+| --- | --- | --- |
+| CUD 缺失 `cluster_id` | `AETHER_INVALID_ARGUMENT` | `cluster_id is required (action={action}, workspace_id={workspace_id})` |
+| 操作者不具备工作空间授权 | `AETHER_PERMISSION_DENIED` | `operator has no permission in workspace {workspace_id}` |
+| 角色不允许操作目标资源类型 | `AETHER_PERMISSION_DENIED` | `role {role} cannot {action} on {resource_type} in workspace {workspace_id}` |
+| 目标集群未绑定到工作空间 | `AETHER_PERMISSION_DENIED` | `cluster scope is not allowed for workspace {workspace_id}` |
+| 工作空间 namespace 配置冲突 | `AETHER_CONFLICT` | `workspace namespace mapping conflict for workspace {workspace_id}` |
+| 集群缺失目标 namespace | `AETHER_RESOURCE_NOT_FOUND` | `namespace {namespace} not found in cluster {cluster_id}` |
+
+### 2.6 授权与作用域判定关键时序（Mermaid）
+
+```mermaid
+sequenceDiagram
+    participant Caller as 上层模块
+    participant Auth as Aether AuthZ
+    participant Scope as ScopeResolver
+    participant K8S as Cluster API
+    participant Exec as Deployment Executor
+
+    Caller->>Auth: CUD/QueryTask 请求（operator/workspace/cluster/resource）
+    Auth->>Auth: 校验角色矩阵 + workspace_grants
+    alt cluster_id 缺失（CUD）
+        Auth-->>Caller: AETHER_INVALID_ARGUMENT
+    else 工作空间或角色未授权
+        Auth-->>Caller: AETHER_PERMISSION_DENIED
+    else 鉴权通过
+        Auth->>Scope: 查询 WorkspaceClusterBinding
+        alt cluster 未绑定或 namespace 映射冲突
+            Scope-->>Caller: AETHER_PERMISSION_DENIED or AETHER_CONFLICT
+        else 绑定合法
+            Scope->>K8S: 校验 namespace 存在
+            alt namespace 不存在
+                K8S-->>Caller: AETHER_RESOURCE_NOT_FOUND
+            else 作用域确定
+                Scope-->>Exec: resolved_namespace
+                Exec-->>Caller: ACCEPTED / QueryTask Result
+            end
+        end
+    end
+```
+
+### 2.7 并发、幂等与边界条件
+
+并发与幂等协同规则（与 §4 对齐）：
+
+1. 授权/作用域判定必须发生在幂等键计算与 `task_id` 生成之前；鉴权失败不得占用幂等键。
+2. 同一 `request_id + workspace_id + action` 的重试请求，若当前操作者在该工作空间仍有权限，则允许命中同一幂等结果（不要求“原操作者本人”）。
+3. 任务执行中若角色被撤销，不影响已受理执行；后续 CUD/QueryTask 重新按最新授权快照判定。
+
+边界条件与禁止操作：
+
+1. 禁止通过伪造 `workspace_id` 访问其他工作空间任务或资源。
+2. 禁止调用方显式覆盖 `resolved_namespace`（仅允许由绑定关系解析）。
+3. 普通用户禁止对 `LOW_CODE_PLATFORM`、`GATEWAY` 发起 CUD/QueryTask。
+4. 多集群绑定中出现 namespace 不一致时，所有涉及该工作空间的 CUD 必须失败，直至绑定修复。
 
 ## §3 统一接口契约、DTO、错误码（T03）
 
