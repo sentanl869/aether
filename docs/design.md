@@ -1081,7 +1081,200 @@ sequenceDiagram
 
 ## §7 values 渲染与 Helm 等效执行（T07）
 
-待 T07 补充。
+### 7.1 需求追踪与章节边界
+
+| 追踪ID | 来源 | 设计落点 |
+| --- | --- | --- |
+| CORE-04 | FR-CORE-004 | 定义统一 values 渲染抽象、双输出形态与确定性约束。 |
+| API-06 | FR-API-006 | 固化 RenderValues 与 CUD 复用同一渲染规则链。 |
+| API-05-R | FR-API-005（渲染错误分支） | 定义渲染失败、模板/Schema 不满足时的错误映射。 |
+| EXEC-04 | FR-EXEC-004 | 定义 Create/Update 与 `helm install/upgrade -f values.yaml` 等效规则。 |
+| NFR-05 | NFR-005 | 定义重复渲染语义一致性与执行输入可追溯约束。 |
+| AC-05 | AC-005 | 覆盖 `YAML_DATA/EXECUTABLE_FILE` 两种输出语义等价。 |
+| AC-06 | AC-006 | 定义等效性验证口径与执行绑定规则。 |
+| TC-019~022 | requirements §13.6 | 将渲染输出、等效执行、错误分支与一致性测试点映射到实现约束。 |
+| DS-13.2-9 | requirements §13.2 #9 | 章节必须覆盖渲染规则、输出形态、一致性策略与 Helm 等效保证。 |
+
+章节边界：
+
+1. 本节定义 values 渲染与执行等效语义，不重复定义 §3 DTO 基础字段与 §4 任务状态机。
+2. 本节复用 §6 显式依赖解析结果：`Create/Update` 在依赖注入后进入渲染链路，禁止旁路渲染。
+3. 本节只约束 Aether 内部渲染与 Helm 输入绑定，不扩展上层业务 OpenAPI 职责边界。
+
+### 7.2 渲染领域模型与输入规范
+
+| 结构 | 字段 | 规则 |
+| --- | --- | --- |
+| `RenderContext` | `intent`, `cud_request`, `resolved_spec`, `template_profile`, `template_version` | `intent` 仅允许 `DEPLOY_CREATE/DEPLOY_UPDATE`；`resolved_spec` 必须完成 defaults 与依赖注入。 |
+| `RenderArtifact` | `yaml_data`, `file_content`, `values_digest`, `template_version`, `rendered_at` | 双输出形态必须表达同一语义内容；`values_digest` 必填。 |
+| `RenderProvenance` | `task_id`, `request_id`, `workspace_id`, `resource_ref`, `template_version`, `values_digest`, `chart_ref` | 用于“渲染结果 -> 执行输入”追溯，不引入持久化强依赖。 |
+| `HelmExecutionInput` | `command_kind`, `release_name`, `chart_ref`, `values_file_bytes`, `lifecycle_options` | `values_file_bytes` 仅允许来自 `RenderArtifact.file_content`。 |
+
+输入规范：
+
+1. `RenderValuesRequest.cud_request` 必须满足 §3 的 `CUDRequest` 校验规则；渲染前先完成 §2 鉴权与作用域判定。
+2. `RenderContext.template_version` 由注册中心快照 `registry.revision + template_profile.resolved_version` 组合生成，作为渲染确定性语义版本。
+3. `Create/Update` 执行路径必须调用与 `RenderValues` 同一 `RenderPipeline`，仅 `mode=EXECUTE/PREVIEW` 不同，规则链完全一致。
+4. 对于包含 `spec.dependencies` 的请求，渲染输入必须是 §6 产出的注入结果；禁止执行路径跳过依赖注入直接渲染。
+
+### 7.3 标准化渲染规则链
+
+统一渲染规则链（`RenderPipeline`）按以下顺序执行：
+
+1. `NormalizeInput`：对 `spec.values` 与渲染相关字段做稳定化处理（Map key 字典序、空值语义归一、换行统一为 `\n`）。
+2. `ResolveTemplate`：根据 `resource_type + template_profile` 解析唯一 Chart/模板引用与 `template_version`。
+3. `ApplyDefaults`：按 `defaults_ref` 填充缺省字段；调用方显式传入 `null` 视为“清空默认值”而非“回落默认值”。
+4. `InjectDependencies`：将 §6 解析结果写入 `bind_path`，产生最终 `resolved_spec.values`。
+5. `ValidateSchema`：使用 `spec_schema_ref` 做结构校验；失败统一进入渲染错误分支。
+6. `MaterializeYAML`：将规范化数据序列化为 YAML，生成 `yaml_data` 与 `file_content`（UTF-8，无 BOM）。
+7. `ComputeDigest`：`values_digest = sha256("template_version=" + template_version + "\n" + canonical_json(resolved_spec.values))`。
+
+确定性约束（满足 FR-CORE-004、NFR-005）：
+
+1. 在“同请求参数 + 同模板版本 + 同依赖解析结果”前提下，`values_digest` 必须稳定一致。
+2. `yaml_data` 与 `file_content` 允许文本格式差异（缩进/换行），但解析后的 YAML 语义必须等价。
+3. 数组顺序严格保留调用方输入顺序；Aether 不得重排列表元素。
+
+### 7.4 输出形态与接口契约（渲染维度）
+
+`RenderValuesResponse` 输出语义：
+
+| `output_format` | 响应字段要求 | 语义约束 |
+| --- | --- | --- |
+| `YAML_DATA` | `yaml_data` 必填，`file_content` 可为空 | 用于预览/审计；内容必须可直接落盘供 Helm 消费。 |
+| `EXECUTABLE_FILE` | `file_content` 必填，`yaml_data` 可选 | 字节内容必须可被 Helm `-f` 直接消费。 |
+
+统一约束：
+
+1. 任一输出模式都必须返回同一 `values_digest` 与 `template_version`。
+2. `output_format` 非法或与响应字段不匹配时返回 `AETHER_INVALID_ARGUMENT`。
+3. `RenderValues` 不返回 `task_id`，但其 `values_digest` 必须可与后续 CUD 执行输入对账（见 §7.5）。
+
+上层 OpenAPI 3.0 RESTful 映射补充（与 §3.6 保持一致）：
+
+| 上层 REST 路径 | 方法 | Aether 接口 | 关键约束 |
+| --- | --- | --- | --- |
+| `/api/v1/workspaces/{workspace_id}/resources/{resource_type}/render-values` | `POST` | `RenderValues(intent=DEPLOY_CREATE)` | 使用 `CUDRequest` 语义输入，禁止独立渲染入参模型。 |
+| `/api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}/render-values` | `POST` | `RenderValues(intent=DEPLOY_UPDATE)` | 与 Update 执行前渲染规则链一致。 |
+
+### 7.5 Create/Update 与 Helm 命令等效规则
+
+命令等效映射（满足 FR-EXEC-004、AC-006）：
+
+| Aether 动作 | Helm 等效命令模板 | 输入绑定规则 |
+| --- | --- | --- |
+| `Create` | `helm install <release> <chart> -f <rendered-values.yaml>` | `<rendered-values.yaml>` 必须来自同次 `RenderPipeline` 的 `file_content`。 |
+| `Update` | `helm upgrade <release> <chart> -f <rendered-values.yaml>` | 禁止在执行阶段再次拼接或覆盖 values 字段。 |
+
+执行绑定规则：
+
+1. `HelmExecutor` 仅接受 `RenderArtifact` 作为 values 输入；不得接受二次组装的 map/kv 参数。
+2. 执行前必须记录 `RenderProvenance`（`task_id/template_version/values_digest/chart_ref`）；该记录用于 Query 结果与日志追溯。
+3. 若执行前发现渲染元数据缺失或不一致（如无 `values_digest`），必须终止并返回 `AETHER_INTERNAL`，不得降级继续执行。
+4. `Create/Update` 的渲染失败必须在 Helm 调用前返回 `AETHER_RENDER_ERROR`，禁止进入执行器后再映射为泛化内部错误。
+
+等效验证口径（用于 TC-020）：
+
+1. 对同一 `chart_ref + rendered-values.yaml`，比较 Aether 执行与手工 Helm 的 release 结果语义（状态、revision 变化、关键 manifest 差异）。
+2. 若语义差异来自 values 输入不一致，判定为渲染/执行绑定缺陷；若来自外部环境漂移，归类为环境噪音并记录观测上下文。
+
+### 7.6 错误码、失败分支与可审计日志
+
+渲染与等效执行相关错误映射：
+
+| 场景 | 错误码 | 说明 |
+| --- | --- | --- |
+| `intent` 非 `DEPLOY_CREATE/DEPLOY_UPDATE` | `AETHER_INVALID_ARGUMENT` | 例如 `DEPLOY_DELETE` 调用 Render。 |
+| `output_format` 非法或响应字段组合非法 | `AETHER_INVALID_ARGUMENT` | 不满足输出契约。 |
+| 模板版本解析失败/模板不可用 | `AETHER_RESOURCE_NOT_FOUND` | 模板引用不可解析。 |
+| defaults 合并、依赖注入后 schema 校验失败 | `AETHER_RENDER_ERROR` | 渲染结果不满足模板约束。 |
+| YAML 序列化失败或模板渲染异常 | `AETHER_RENDER_ERROR` | 渲染链路内部失败。 |
+| 渲染成功但执行绑定校验失败 | `AETHER_INTERNAL` | 实现缺陷或运行时异常。 |
+
+结构化日志约束（满足 NFR-005 与可追溯性）：
+
+| 事件 | 必填字段 |
+| --- | --- |
+| `values_render_started` | `request_id`, `workspace_id`, `intent`, `resource_type`, `template_profile` |
+| `values_render_succeeded` | `request_id`, `template_version`, `values_digest`, `output_format`, `dependency_count` |
+| `values_render_failed` | `request_id`, `template_version`, `error_code`, `failed_stage` |
+| `values_bound_to_execution` | `task_id`, `request_id`, `chart_ref`, `template_version`, `values_digest`, `helm_command_kind` |
+| `helm_equivalence_checked` | `task_id`, `values_digest`, `comparison_scope`, `result` |
+
+### 7.7 并发、幂等与一致性约束
+
+1. 对同幂等键同指纹请求（见 §4），若解析到同一 `template_version`，则 `values_digest` 必须一致；不一致视为实现错误。
+2. 模板版本变化视为不同渲染上下文，不承诺 `values_digest` 一致；调用方如需稳定结果应固定模板版本输入。
+3. 并发触发 `RenderValues`（预览）与 `Create/Update`（执行）时，不共享可变全局缓存；渲染结果一致性仅依赖输入与版本，不依赖调用顺序。
+4. Aether 不提供跨请求渲染分布式锁；重复请求收敛依赖 §4 幂等规则，上层仍负责资源级并发治理。
+5. `values_digest` 作为执行可追溯标识，不作为新的幂等键字段，避免违反 D-013。
+
+### 7.8 关键时序（Mermaid）
+
+预览渲染（YAML/文件双输出）：
+
+```mermaid
+sequenceDiagram
+    participant Caller as 上层模块
+    participant API as DeploymentAPI.RenderValues
+    participant Auth as AuthZ/Scope
+    participant Resolver as DependencyResolver
+    participant Render as RenderPipeline
+
+    Caller->>API: RenderValues(RenderValuesRequest)
+    API->>Auth: 鉴权 + 作用域校验
+    alt 校验失败
+        Auth-->>Caller: AETHER_INVALID_ARGUMENT / AETHER_PERMISSION_DENIED
+    else 校验通过
+        API->>Resolver: 解析显式依赖(如有)
+        Resolver-->>API: resolved_spec
+        API->>Render: Normalize -> Defaults -> Inject -> Validate -> YAML -> Digest
+        alt 渲染失败
+            Render-->>Caller: AETHER_RENDER_ERROR
+        else 渲染成功
+            Render-->>Caller: RenderValuesResponse(values_digest, template_version, output)
+        end
+    end
+```
+
+Create/Update 执行等效绑定：
+
+```mermaid
+sequenceDiagram
+    participant Caller as 上层模块
+    participant API as DeploymentAPI.Create/Update
+    participant Render as RenderPipeline
+    participant Exec as HelmExecutor
+    participant Helm as Helm CLI
+
+    Caller->>API: CUD(CUDRequest)
+    API->>Render: 使用同一规则链渲染 RenderArtifact
+    alt 渲染失败
+        Render-->>Caller: AETHER_RENDER_ERROR
+    else 渲染成功
+        API->>Exec: 绑定(task_id, template_version, values_digest, file_content)
+        Exec->>Helm: helm install/upgrade ... -f rendered-values.yaml
+        Helm-->>Exec: 执行反馈
+        Exec-->>Caller: CUDAcceptedResponse(status=ACCEPTED)
+    end
+```
+
+### 7.9 边界条件与禁止操作
+
+1. 禁止实现“预览渲染”和“执行渲染”两套不同规则链路。
+2. 禁止在 Helm 执行阶段通过 `--set` 或临时覆盖再次改写已渲染 values。
+3. 禁止将 `DEPLOY_DELETE` 暴露为 RenderValues 合法意图。
+4. 禁止渲染成功但无 `values_digest/template_version` 仍进入执行流程。
+5. 禁止将模板/schema 约束失败映射为 `AETHER_INTERNAL`；必须使用 `AETHER_RENDER_ERROR`。
+6. 禁止把渲染缓存或历史结果当作任务持久化事实来源，避免越界到状态存储职责。
+
+### 7.10 DoD 对照
+
+| T07 DoD | 设计落点 |
+| --- | --- |
+| 预览渲染与执行渲染复用同一规则链路，不允许双轨实现 | §7.2 输入规范 #3、§7.3 规则链、§7.9 禁止操作 #1 |
+| 同请求+同模板版本重复渲染语义等价 | §7.3 确定性约束、§7.7 一致性约束 #1/#2 |
+| 执行输入可追溯到渲染结果摘要，并定义异常分支错误码 | §7.5 执行绑定规则、§7.6 错误映射与日志事件 |
 
 ## §8 无状态执行与任务查询架构（T08）
 

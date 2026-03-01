@@ -295,3 +295,21 @@
   - `BLOCK` 策略语义稳定：仅对“请求声明存在依赖”场景返回 `AETHER_CONFLICT`，不因外部拓扑变化产生不确定行为。
   - `CASCADE_EXPLICIT` 删除目标集合可预测且可审计，避免隐式级联删除风险。
 - 替代关系：无（对 D-015 的实现细化，不替代既有 ADR）。
+
+## D-026 T07 values 渲染单轨规则与 Helm 执行绑定
+
+- 日期：2026-03-01
+- 状态：已采纳
+- 决策：
+  - `RenderValues` 预览渲染与 `Create/Update` 执行前渲染必须复用同一 `RenderPipeline`（`Normalize -> ResolveTemplate -> ApplyDefaults -> InjectDependencies -> ValidateSchema -> MaterializeYAML -> ComputeDigest`），仅调用模式不同，不允许双轨实现。
+  - `values_digest` 统一按 `template_version + canonical_json(resolved_values)` 计算；同请求 + 同模板版本 + 同依赖解析结果必须稳定得到同一摘要。
+  - `HelmExecutor` 仅可消费 `RenderArtifact.file_content` 作为 `-f` 输入，并记录 `task_id/template_version/values_digest/chart_ref` 追溯元数据；禁止执行阶段二次拼装 values。
+- 原因：
+  - FR-CORE-004、FR-API-006 要求渲染能力对预览与执行语义一致，避免“预览正确、执行偏移”。
+  - FR-EXEC-004、AC-006 要求 Aether Create/Update 与 `helm install/upgrade -f values.yaml` 等效，必须确保执行输入直接绑定渲染产物。
+  - NFR-005、TC-022 要求重复渲染确定性与执行可追溯，需要稳定摘要算法与统一日志字段。
+- 影响：
+  - `docs/design.md` §7 可直接指导实现渲染链路、输出契约、错误分支与等效验证，不需再引入额外渲染接口模型。
+  - 上层模块可先 Render 再 CUD，或直接 CUD，均可通过 `values_digest` 完成输入对账与审计。
+  - 渲染失败将稳定映射到 `AETHER_RENDER_ERROR`，执行绑定异常映射到 `AETHER_INTERNAL`，降低错误分类歧义。
+- 替代关系：无（新增补充决策）。
