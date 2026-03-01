@@ -630,7 +630,201 @@ sequenceDiagram
 
 ## §5 资源类型注册与扩展机制（T05）
 
-待 T05 补充。
+### 5.1 需求追踪与章节边界
+
+| 追踪ID | 来源 | 设计落点 |
+| --- | --- | --- |
+| RT-01 | FR-RT-001 | 固化六类资源的注册标识与分类，统一进入同一执行链路。 |
+| RT-02 | FR-RT-002 | 数据服务组件仅允许平台内置 Chart 模板，依赖绑定按请求显式声明。 |
+| RT-03 | FR-RT-003 | 低代码平台支持“内置 Chart + 超级管理员导入外部 Chart”双来源。 |
+| RT-04 | FR-RT-004 | DevBox 复用平台内置高代码模板，不新增独立执行器。 |
+| RT-05 | FR-RT-005 | 网关（Higress）固定平台内置 Chart 模板。 |
+| RT-06 | FR-RT-006 | 高代码应用支持镜像与外部 Chart 两种模板来源，依赖仅解析显式声明。 |
+| RT-07 | FR-RT-007 | 记忆体使用平台内置 Chart，依赖输入由上层显式提供。 |
+| CORE-01 | FR-CORE-001 | 注册模型覆盖 `type/category/template/schema/defaults/lifecycle/capabilities/query-adapter` 全字段。 |
+| CORE-02 | FR-CORE-002 | 新增资源类型通过注册与配置接入，不复制业务流程。 |
+| EXT-01 | NFR-002 | 扩展时不改动通用编排核心，仅新增类型定义与规则。 |
+| AC-01 | AC-001 | 六类资源均可通过同一套 CUD/Query 流程完成生命周期操作。 |
+| REG-01 | requirements §13.4.1 | 注册 schema 字段与约束对齐需求附录示例。 |
+| REG-02 | requirements §13.4.2 | 新增资源类型接入步骤与回归检查清单可独立执行。 |
+
+章节边界：
+
+1. 本节仅定义资源类型注册与扩展规则，不重复定义 §3 接口 DTO 与 §4 状态机细节。
+2. 本节定义“资源模板来源与依赖表达边界”，不引入依赖展示模型（详见 §6）。
+3. Query 仍沿用 `task_id` 单任务查询模型；本节只定义各类型 `query.adapter` 绑定规则。
+
+### 5.2 注册目录模型与字段契约
+
+| 结构 | 字段 | 规则 |
+| --- | --- | --- |
+| `ResourceTypeRegistry` | `revision`, `definitions[]`, `loaded_at` | `definitions` 至少包含六类内置资源；`revision` 用于标识注册快照版本。 |
+| `ResourceTypeDefinition` | `resource_type`, `category`, `template_profiles[]`, `spec_schema_ref`, `defaults_ref`, `lifecycle`, `capabilities`, `query` | 对齐 requirements §13.4.1；缺任一必填字段视为无效注册定义。 |
+| `TemplateProfile` | `profile_id`, `source_kind`, `ref`, `version_constraint`, `selector_rules` | `source_kind` 仅允许 `BUILTIN_CHART`、`IMAGE`、`EXTERNAL_CHART`。 |
+| `LifecyclePolicy` | `install_timeout_seconds`, `upgrade_timeout_seconds`, `uninstall_timeout_seconds`, `atomic`, `cleanup_on_fail` | 所有 CUD 动作均映射到统一 Helm 生命周期执行器。 |
+| `CapabilityPolicy` | `supports_create`, `supports_update`, `supports_delete`, `dependency_mode` | 当前六类资源均要求 `supports_* = true`；`dependency_mode=EXPLICIT_ONLY`。 |
+| `QueryAdapterBinding` | `adapter`, `result_projection` | 当前统一为 `HELM_TASK_ADAPTER`，返回结构与 §3/§4 保持一致。 |
+
+字段契约约束（与 requirements §13.4.1 对齐）：
+
+1. `resource_type` 必须是稳定枚举值，不允许以模板来源动态派生新类型。
+2. `template_profiles` 用于表达同一资源类型下的来源分支，不允许通过新增执行器代码分支表达来源差异。
+3. `spec_schema_ref` 负责结构校验，`defaults_ref` 负责默认值补齐；两者缺失均不得进入执行阶段。
+4. `lifecycle` 仅声明参数，不改变统一执行器的动作集合（`install/upgrade/uninstall`）。
+5. `query.adapter` 必须能够产出 `task_id` 维度的当前状态与结果快照。
+
+### 5.3 六类资源注册配置表
+
+| `resource_type` | `category` | `template_profiles`（`source_kind -> ref`） | `spec_schema_ref` / `defaults_ref` | `lifecycle`（秒） | `capabilities` / `query.adapter` |
+| --- | --- | --- | --- | --- | --- |
+| `DATA_SERVICE` | `DATA` | `builtin-datasvc -> BUILTIN_CHART:data-services/{engine}` | `data_service.schema.json` / `data_service.defaults.yaml` | `i=900,u=900,d=600,atomic` | `shared-capability` |
+| `LOW_CODE_PLATFORM` | `LOW_CODE` | `builtin/imported -> CHART:lowcode/{slug}` | `low_code_platform.schema.json` / `low_code_platform.defaults.yaml` | `i=1200,u=1200,d=900,atomic` | `shared-capability` |
+| `DEVBOX` | `DEV_ENV` | `builtin-devbox -> BUILTIN_CHART:devbox/base` | `devbox.schema.json` / `devbox.defaults.yaml` | `i=900,u=900,d=600,atomic` | `shared-capability` |
+| `GATEWAY` | `GATEWAY` | `builtin-higress -> BUILTIN_CHART:gateway/higress` | `gateway.schema.json` / `gateway.defaults.yaml` | `i=900,u=900,d=600,atomic` | `shared-capability` |
+| `HIGH_CODE_APP` | `HIGH_CODE` | `image -> IMAGE:{registry}/{repo}:{tag}`; `chart -> EXTERNAL_CHART:charts/{artifact_id}` | `high_code_app.schema.json` / `high_code_app.defaults.yaml` | `i=900,u=900,d=600,atomic` | `shared-capability` |
+| `MEMORY` | `MEMORY` | `builtin-memory -> BUILTIN_CHART:memory/mem0` | `memory.schema.json` / `memory.defaults.yaml` | `i=1200,u=1200,d=900,atomic` | `shared-capability` |
+
+补充说明：
+
+1. `DATA_SERVICE` 的 `{engine}` 覆盖 PostgreSQL、Redis、Milvus、Weaviate、pgvector、NebulaGraph、MongoDB。
+2. `LOW_CODE_PLATFORM` 的 `builtin` 覆盖 `Dify/FastGPT`，`imported` 仅允许超级管理员导入（与 §2 角色矩阵一致）。
+3. `HIGH_CODE_APP` 的 `image-runtime` 覆盖 DevBox 发布镜像与用户上传镜像两类来源。
+4. 表中 `shared-capability` 固定为 `create/update/delete=true`、`dependency_mode=EXPLICIT_ONLY`、`query.adapter=HELM_TASK_ADAPTER`。
+
+一致性约束：
+
+1. 六类资源必须全部在注册表中显式出现，不允许通过“默认兜底类型”隐式映射。
+2. 任一类型若未配置 `query.adapter`，该类型视为未完成注册，不可受理 CUD。
+3. `HIGH_CODE_APP` 来源分支由 `template_profiles` 表达，不拆分为额外资源类型，保证 AC-001 与 NFR-002。
+
+### 5.4 模板来源与依赖表达边界
+
+| 资源类型 | 模板来源边界 | 依赖表达边界（与 FR-DM-002/003 对齐） |
+| --- | --- | --- |
+| `DATA_SERVICE` | 仅平台内置 Helm Chart。 | 可作为他类资源依赖目标；Aether 仅解析请求内显式依赖引用。 |
+| `LOW_CODE_PLATFORM` | 内置 `Dify/FastGPT`；`Coze Studio/n8n/外部 Dify/FastGPT` 通过超级管理员导入外部 Chart。 | 依赖项必须由上层在请求中显式声明；Aether 不推断低代码内部依赖。 |
+| `DEVBOX` | 仅平台内置高代码模板派生的 DevBox Chart。 | 不内建依赖展示模型；若请求声明依赖，按显式规则展开。 |
+| `GATEWAY` | 仅平台内置 Higress Chart。 | 默认无强制依赖；请求显式声明时仍按统一依赖 schema 处理。 |
+| `HIGH_CODE_APP` | 支持 DevBox 发布镜像、用户上传镜像、用户上传 Chart 三类来源。 | 镜像/Chart 场景下的数据服务绑定由上层显式传入；Aether 不解释 Chart 内部隐式依赖。 |
+| `MEMORY` | 仅平台内置 mem0 Chart。 | 记忆体业务实例与数据服务绑定由上层显式声明，Aether 仅做显式依赖解析与执行。 |
+
+边界规则：
+
+1. 资源来源合法性由“类型注册 + 来源枚举”判定，不由业务流程分支硬编码。
+2. Aether 不承担“依赖展示语义”与“依赖分类可视化”职责，仅消费请求中的依赖引用。
+3. 资源级业务约束（如实例数量上限、来源组合策略）保持上层前置校验边界，不在注册层新增业务规则。
+
+### 5.5 生命周期参数与统一执行器映射
+
+动作映射：
+
+| CUD 动作 | 执行器动作 | 生命周期参数来源 | 返回契约 |
+| --- | --- | --- | --- |
+| `DEPLOY_CREATE` | `helm install` | `ResourceTypeDefinition.lifecycle.install_*` | 同步返回 `ACCEPTED + task_id + resource_id`（§3、§4）。 |
+| `DEPLOY_UPDATE` | `helm upgrade` | `ResourceTypeDefinition.lifecycle.upgrade_*` | 同上。 |
+| `DEPLOY_DELETE` | `helm uninstall` | `ResourceTypeDefinition.lifecycle.uninstall_*` | 同上。 |
+| `QUERY_TASK` | `query.adapter` 投影 | `ResourceTypeDefinition.query.adapter` | 返回当前任务状态与结果快照。 |
+
+生命周期规则：
+
+1. 六类资源共享同一 Helm 生命周期执行器，禁止为任一类型新增独立 CUD 编排引擎。
+2. `atomic/cleanup_on_fail` 只作为执行参数，不改变状态机定义（状态机见 §4）。
+3. 执行参数读取顺序固定为：`类型 defaults -> 请求 spec 覆盖 -> 生命周期参数绑定`。
+4. 生命周期参数缺失或无效时，受理前失败并返回 `AETHER_INTERNAL`（注册定义缺陷）。
+
+### 5.6 新资源类型接入模板与回归检查
+
+#### 5.6.1 接入步骤（requirements §13.4.2 落地）
+
+1. 新增注册定义：补齐 `resource_type/category/template_profiles/spec_schema_ref/defaults_ref`。
+2. 新增参数 schema：确保 `spec` 可做结构校验，明确必填字段与枚举边界。
+3. 新增默认值模板：保证渲染与执行可得到完整输入，不依赖代码默认分支。
+4. 配置生命周期参数：定义 install/upgrade/uninstall 超时与原子性策略。
+5. 配置能力与依赖模式：当前必须声明 `dependency_mode=EXPLICIT_ONLY`。
+6. 绑定查询适配器：声明 `query.adapter` 并保证可返回 §3 `QueryTaskResponse` 结构。
+7. 编写契约测试：覆盖 Create/Update/Delete/QueryTask 成功与错误分支。
+8. 编写扩展性回归：验证新增类型不改动通用编排核心逻辑。
+
+#### 5.6.2 回归检查清单
+
+| 检查ID | 检查项 | 通过标准 |
+| --- | --- | --- |
+| REG-CHECK-01 | 六类内置类型仍全部可加载 | 注册加载后 `definitions` 至少包含六类基础类型。 |
+| REG-CHECK-02 | 新类型接入仅走注册扩展点 | 变更集中在注册/Schema/defaults/测试文件，不引入新的执行主流程。 |
+| REG-CHECK-03 | CUD/Query 契约不变 | 不修改 §3 `DeploymentAPI` 签名与标准响应模型。 |
+| REG-CHECK-04 | 错误码映射不漂移 | 失败分支仍映射 §3.5 定义的 8 类错误码。 |
+| REG-CHECK-05 | AC-001 回归 | 六类资源 + 新增类型均通过同一 CUD/Query 路径。 |
+| REG-CHECK-06 | NFR-002 回归 | 未修改通用编排核心逻辑，仅新增类型定义和规则。 |
+
+### 5.7 关键流程（Mermaid）
+
+```mermaid
+sequenceDiagram
+    participant Caller as 上层模块
+    participant API as DeploymentAPI
+    participant Registry as TypeRegistry
+    participant Schema as SpecValidator
+    participant Render as ValuesRenderer
+    participant Exec as HelmExecutor
+    participant Query as HELM_TASK_ADAPTER
+
+    Caller->>API: CUD(request_id, workspace_id, target.resource_type, spec)
+    API->>Registry: 按 resource_type 解析注册定义
+    alt 未注册或定义缺失
+        Registry-->>Caller: AETHER_RESOURCE_NOT_FOUND / AETHER_INTERNAL
+    else 注册定义有效
+        API->>Schema: 按 spec_schema_ref 校验 spec
+        alt schema 校验失败
+            Schema-->>Caller: AETHER_INVALID_ARGUMENT
+        else 校验通过
+            API->>Render: 合并 defaults_ref + spec
+            alt 渲染失败
+                Render-->>Caller: AETHER_RENDER_ERROR
+            else 渲染成功
+                API->>Exec: 统一执行器(install/upgrade/uninstall, lifecycle)
+                Exec-->>Caller: ACCEPTED + task_id + resource_id
+                Caller->>API: QueryTask(task_id)
+                API->>Query: query.adapter=HELM_TASK_ADAPTER
+                Query-->>Caller: 当前状态与结果
+            end
+        end
+    end
+```
+
+### 5.8 并发、幂等与扩展性约束
+
+1. 注册解析发生在鉴权之后、幂等冲突判定之前；注册失败不得占用幂等命中结果。
+2. 同幂等键请求若 `target.resource_type` 或 `template_profile/source_kind` 不一致，应由指纹差异分支返回 `AETHER_CONFLICT`（规则继承 §4.4）。
+3. 单次请求内使用不可变注册快照；请求处理中不切换 `template_profiles`，避免并发热更新导致语义漂移。
+4. 新增资源类型只能通过“注册定义 + schema/defaults + 测试”扩展点接入，禁止修改通用执行编排主干。
+5. Query 适配器输出必须与 §4 状态机一致，禁止按资源类型定义私有状态枚举。
+
+### 5.9 错误分支与禁止操作
+
+| 场景 | 错误码 | 说明 |
+| --- | --- | --- |
+| `resource_type` 未注册 | `AETHER_RESOURCE_NOT_FOUND` | 命中 §3 `VAL-06` 分支。 |
+| 注册类型存在但 `source_kind` 不在允许集合 | `AETHER_INVALID_ARGUMENT` | 请求模板来源与注册定义不一致。 |
+| `spec` 不满足 `spec_schema_ref` | `AETHER_INVALID_ARGUMENT` | 结构校验失败，受理前拒绝。 |
+| defaults 合并/渲染失败 | `AETHER_RENDER_ERROR` | values 生成失败。 |
+| 注册定义缺失生命周期或查询适配器关键字段 | `AETHER_INTERNAL` | 配置缺陷，需修复注册定义。 |
+| Query 适配器暂不可达 | `AETHER_QUERY_CONTEXT_UNAVAILABLE` 或 `UNKNOWN` | 与 §4.5 降级规则一致。 |
+
+禁止操作：
+
+1. 禁止为某一资源类型复制或派生独立 CUD 编排流程。
+2. 禁止通过新增“来源专用资源类型”绕开统一 `resource_type` 枚举边界。
+3. 禁止在注册层引入依赖展示分类、依赖可视化状态或隐式依赖推断。
+4. 禁止跳过 `spec_schema_ref/defaults_ref` 直接执行 Helm。
+5. 禁止定义与 §4 不一致的资源类型私有任务状态机。
+
+### 5.10 DoD 对照
+
+| T05 DoD | 设计落点 |
+| --- | --- |
+| 六类资源均可通过统一执行器进入 CUD/Query 流程 | §5.3 注册配置表、§5.5 动作映射、§5.7 时序图 |
+| 新资源接入步骤可独立执行且不改通用编排核心 | §5.6 接入步骤与回归检查、§5.8 扩展性约束 |
+| 模板来源和依赖表达边界与需求一致 | §5.4 资源边界表、§5.9 禁止操作 |
 
 ## §6 依赖表达与删除策略（T06）
 
