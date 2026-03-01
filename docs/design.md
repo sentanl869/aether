@@ -451,7 +451,182 @@ sequenceDiagram
 
 ## §4 执行状态机、幂等与重入（T04）
 
-待 T04 补充。
+### 4.1 需求追踪与章节边界
+
+| 追踪ID | 来源 | 设计落点 |
+| --- | --- | --- |
+| EXEC-01 | FR-EXEC-001 | CUD 受理后立即进入执行链路，接口返回不阻塞部署完成。 |
+| EXEC-03 | FR-EXEC-003 | 幂等键固定为 `request_id + workspace_id + action`，定义命中/冲突/重入规则。 |
+| Q-01 | FR-Q-001 | Query 仅返回当前可观测任务状态与任务结果，不承诺持久化时间线。 |
+| Q-02 | FR-Q-002 | Query 仅按 `task_id` 单任务查询，并与工作空间授权规则联动。 |
+| SM-01 | requirements §13.3.1 | 状态集固定为 `ACCEPTED/RUNNING/SUCCEEDED/FAILED/UNKNOWN`。 |
+| IDEMP-01 | requirements §13.3.2 | 定义请求指纹规范化算法、幂等冲突分支与重入行为。 |
+| GC-04 | requirements §13.2 | 章节必须覆盖状态流转、冲突判定、重试语义且可直接指导编码。 |
+
+章节边界：
+
+1. 本节只定义“状态与幂等判定语义”，不引入资源级并发锁或任务持久化模型（由上层治理）。
+2. 本节复用 §2 授权/作用域与 §3 DTO/错误码，不重复定义接口字段。
+3. `UNKNOWN` 仅是 Query 投影态，不参与持久状态机终态集合。
+
+### 4.2 任务事实模型与派生字段
+
+| 结构 | 字段 | 规则 |
+| --- | --- | --- |
+| `IdempotencyTuple` | `request_id`, `workspace_id`, `action` | 三元组必须来自 `CUDRequest` 已定义字段；禁止添加 `cluster_id/resource_id/operator_id` 等额外键字段。 |
+| `RequestFingerprint` | `operator_scope_hash`, `cluster_id`, `target`, `spec`, `labels`, `annotations`, `digest` | 对字段做“键排序 + 空值归一 + 稳定序列化”后计算 `SHA-256`。 |
+| `ObservedTaskFact` | `task_id`, `resource_ref`, `status`, `result`, `observed_at`, `source` | `source` 仅允许 `HELM_RELEASE`、`K8S_API`、`EXECUTOR_FEEDBACK`。 |
+| `ReentryDecision` | `mode`, `reason`, `next_action` | `mode` 取值：`RETURN_EXISTING`、`RESUME_EXECUTION`、`RETURN_CONFLICT`。 |
+
+字段与算法约束：
+
+1. `task_id = base32(sha256("task:" + request_id + "|" + workspace_id + "|" + action))`，同幂等键必须稳定产出同一 `task_id`。
+2. `action` 由调用接口方法决定：`Create -> DEPLOY_CREATE`、`Update -> DEPLOY_UPDATE`、`Delete -> DEPLOY_DELETE`。
+3. `RequestFingerprint.operator_scope_hash` 使用 `operator.roles + workspace_grants[workspace_id]` 的规范化视图，不包含 `operator_id`，以满足“同工作空间已授权操作者重试可命中同幂等结果”。
+4. 当 `Create` 未传 `target.resource_id` 时，`resource_id` 必须由 `workspace_id + resource_type + task_id + fingerprint.digest` 稳定派生，保证同幂等键同指纹返回同一 `resource_id`。
+
+### 4.3 状态机定义与流转规则
+
+状态语义：
+
+| 状态 | 类别 | 定义 | 可见接口 |
+| --- | --- | --- | --- |
+| `ACCEPTED` | 受理态 | CUD 请求通过校验并产出稳定 `task_id`，执行已触发。 | CUD 响应、Query |
+| `RUNNING` | 执行中态 | Helm/K8S 执行链路已开始，尚未得到稳定结果。 | Query |
+| `SUCCEEDED` | 终态 | Helm 执行成功且目标 release 达到期望 revision/状态。 | Query |
+| `FAILED` | 终态 | 受理后预检查失败或 Helm/K8S 执行失败。 | Query |
+| `UNKNOWN` | 查询降级态 | 查询时事实源暂不可达，无法可靠判定当前稳定状态。 | Query |
+
+允许流转（符合 requirements §13.3.1）：
+
+1. `ACCEPTED -> RUNNING`
+2. `RUNNING -> SUCCEEDED`
+3. `RUNNING -> FAILED`
+4. `ACCEPTED -> FAILED`（受理后预检查失败）
+5. `* -> UNKNOWN`（仅 Query 投影，不写入持久终态）
+
+禁止流转：
+
+1. `SUCCEEDED/FAILED -> RUNNING`（不得回退终态；重试仅产生新的“当前观测结果”，不改写历史终态语义）。
+2. `UNKNOWN -> SUCCEEDED/FAILED` 作为“状态迁移事件”写入存储（`UNKNOWN` 不是持久节点）。
+3. 跳过 `ACCEPTED` 直接返回 `RUNNING/SUCCEEDED/FAILED` 作为 CUD 同步响应。
+
+### 4.4 幂等命中、冲突与重入规则
+
+幂等判定优先级：
+
+1. 先执行 §2 授权/作用域校验；失败直接返回错误，不占用幂等计算结果。
+2. 通过后计算 `IdempotencyTuple` 与 `RequestFingerprint`。
+3. 基于 `task_id` + 当前可观测事实（Helm release 元数据、revision、资源注解）进行命中判定。
+
+命中/冲突规则（对应 FR-EXEC-003、TC-006、TC-007）：
+
+| 场景 | 判定 | 返回 |
+| --- | --- | --- |
+| 同幂等键 + 同指纹，存在在途或已完成事实 | 命中 | 返回同一 `task_id/resource_id`，不重复触发执行 |
+| 同幂等键 + 异指纹 | 冲突 | 返回 `AETHER_CONFLICT` |
+| 同幂等键 + 同指纹，但无稳定事实（首次触发） | 新受理 | 返回 `ACCEPTED` 并触发执行 |
+
+重入规则（对应 requirements §13.3.2）：
+
+1. 调用方可复用同一 `request_id + workspace_id + action` 进行重试。
+2. Aether 必须先读取目标 release 当前事实：若事实已稳定为成功，直接返回同一 `task_id/resource_id` 且 Query 可见 `SUCCEEDED`。
+3. 若事实为失败或不可达且不构成冲突，执行器继续推进到下一稳定状态（`SUCCEEDED` 或 `FAILED`）。
+4. 不得因“重入重试”重新分配 `task_id` 或重新生成不同 `resource_id`。
+
+### 4.5 Query 降级与错误分支
+
+Query 返回策略（对应 FR-Q-001、FR-Q-002、TC-003、TC-011）：
+
+| 场景 | Query 行为 | 错误码 |
+| --- | --- | --- |
+| 可读取到任务事实 | 返回 `QueryTaskResponse`，`status` 为当前观测态 | 无 |
+| 事实源暂不可达但可确认 `task_id` 属于当前作用域 | 返回 `QueryTaskResponse(status=UNKNOWN)`，`result.reason=QUERY_CONTEXT_UNAVAILABLE` | 无 |
+| 事实源不可达且无法构造最小可信响应 | 返回错误 | `AETHER_QUERY_CONTEXT_UNAVAILABLE` |
+| `task_id` 不存在或不在当前作用域 | 返回错误 | `AETHER_RESOURCE_NOT_FOUND` 或 `AETHER_PERMISSION_DENIED` |
+
+一致性要求：
+
+1. `observed_at` 必须记录本次观测时间，不可伪造成“最后成功时间线”。
+2. `result` 仅表达当前任务执行结果快照，不输出历史事件列表。
+3. Query 不得扩展分页、过滤、排序等列表语义。
+
+### 4.6 接口契约映射（状态机视角）
+
+| 上层 REST 路径 | Aether 接口 | 状态机约束 |
+| --- | --- | --- |
+| `POST /api/v1/workspaces/{workspace_id}/resources/{resource_type}` | `Create` | 同步仅返回 `ACCEPTED`，并生成稳定 `task_id`。 |
+| `PUT /api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}` | `Update` | 与 `Create` 同幂等规则；不可返回终态。 |
+| `DELETE /api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}` | `Delete` | 受理即触发执行，状态推进由 Query 观察。 |
+| `GET /api/v1/workspaces/{workspace_id}/tasks/{task_id}` | `QueryTask` | 仅返回单任务当前状态；允许 `UNKNOWN` 降级态。 |
+
+### 4.7 关键流程（Mermaid）
+
+任务状态机图：
+
+```mermaid
+stateDiagram-v2
+    [*] --> ACCEPTED : CUD accepted
+    ACCEPTED --> RUNNING : executor started
+    ACCEPTED --> FAILED : pre-check failed
+    RUNNING --> SUCCEEDED : helm/k8s success
+    RUNNING --> FAILED : helm/k8s failed
+    ACCEPTED --> UNKNOWN : query degraded
+    RUNNING --> UNKNOWN : query degraded
+    SUCCEEDED --> UNKNOWN : query degraded snapshot
+    FAILED --> UNKNOWN : query degraded snapshot
+```
+
+幂等/冲突/重入判定时序：
+
+```mermaid
+sequenceDiagram
+    participant Caller as 上层模块
+    participant Aether as DeploymentAPI
+    participant Auth as AuthZ/Scope
+    participant Facts as Helm/K8S Facts
+    participant Exec as Executor
+
+    Caller->>Aether: CUD(request_id, workspace_id, action, payload)
+    Aether->>Auth: 鉴权与作用域校验
+    alt 鉴权失败
+        Auth-->>Caller: AETHER_PERMISSION_DENIED / AETHER_INVALID_ARGUMENT
+    else 鉴权通过
+        Aether->>Aether: 计算 idempotency_key + fingerprint + task_id
+        Aether->>Facts: 查询 task_id/release 当前事实
+        alt 同幂等键同指纹且存在事实
+            Facts-->>Caller: 返回同 task_id/resource_id（不重复执行）
+        else 同幂等键异指纹
+            Facts-->>Caller: AETHER_CONFLICT
+        else 首次受理或可重入继续执行
+            Aether->>Exec: 触发或续跑执行
+            Exec-->>Caller: CUDAcceptedResponse(status=ACCEPTED)
+        end
+    end
+```
+
+### 4.8 并发约束与禁止操作
+
+并发约束：
+
+1. Aether 不对“不同幂等键指向同一资源”的并发写入提供强制互斥锁（符合 FR-EXEC-003、NFR-003）。
+2. 同一幂等键的并发请求必须收敛到单一 `task_id` 与单一路径判定结果。
+3. Query 与执行并发发生时，Query 返回的是观测瞬时值；上层需容忍 `RUNNING/UNKNOWN` 短时抖动。
+
+禁止操作：
+
+1. 禁止在幂等键中引入任何未在接口契约定义的字段。
+2. 禁止将 `UNKNOWN` 当作任务终态写入业务持久化语义。
+3. 禁止同幂等键同指纹请求返回新的 `task_id` 或新的 `resource_id`。
+4. 禁止将 Query 扩展为任务列表或历史聚合接口。
+
+### 4.9 DoD 对照
+
+| T04 DoD | 设计落点 |
+| --- | --- |
+| `UNKNOWN` 为查询降级态而非持久终态 | §4.3 状态语义与禁止流转、§4.5 Query 降级策略 |
+| 幂等键严格使用 `request_id + workspace_id + action` | §4.2 `IdempotencyTuple` 与字段约束、§4.8 禁止操作 |
+| 同幂等键同指纹返回同 `task_id/resource_id`，异指纹冲突 | §4.4 命中/冲突规则、§4.7 判定时序 |
 
 ## §5 资源类型注册与扩展机制（T05）
 
