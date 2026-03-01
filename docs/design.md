@@ -312,7 +312,8 @@ type DeploymentAPI interface {
 | `CUDRequest` | `target.resource_type` | `ResourceType` | 是 | 必须是已注册资源类型。 |
 | `CUDRequest` | `target.resource_id` | `string` | 条件必填 | `Update/Delete` 必填；`Create` 可选。 |
 | `CUDRequest` | `cluster_id` | `string` | 是 | 所有 CUD 必填；缺失返回 `AETHER_INVALID_ARGUMENT`。 |
-| `CUDRequest` | `spec` | `map[string]any` | 是 | 非空；结构校验由类型注册 schema 执行。 |
+| `CUDRequest` | `spec` | `map[string]any` | 是 | 非空；结构校验由类型注册 schema 执行。依赖相关字段（`spec.dependencies`）约束见 §6。 |
+| `CUDRequest` | `delete_options` | `map[string]any` | 条件必填 | 仅 `Delete` 可传；字段约束见 §6.5。未传时按 `RETAIN` 处理。 |
 | `CUDRequest` | `labels` | `map[string]string` | 否 | 键值需满足 K8S label 约束。 |
 | `CUDRequest` | `annotations` | `map[string]string` | 否 | 键值需满足 K8S annotation 约束。 |
 | `QueryTaskRequest` | `task_id` | `string` | 是 | 任务唯一查询键；禁止列表参数。 |
@@ -828,7 +829,255 @@ sequenceDiagram
 
 ## §6 依赖表达与删除策略（T06）
 
-待 T06 补充。
+### 6.1 需求追踪与章节边界
+
+| 追踪ID | 来源 | 设计落点 |
+| --- | --- | --- |
+| DM-02 | FR-DM-002 | 定义 `spec.dependencies` schema、显式依赖解析与展开规则。 |
+| DM-03 | FR-DM-003 | 固化“依赖展示语义由上层负责”的边界，不在 Aether 内建依赖展示模型。 |
+| DM-04 | FR-DM-004 | 定义删除策略参数与行为：`RETAIN/CASCADE_EXPLICIT/BLOCK`。 |
+| DS-13.5.1 | requirements §13.5.1 | 对齐依赖字段最小集与字段约束。 |
+| DS-13.5.2 | requirements §13.5.2 | 对齐缺失处理：`required=true` 失败、`required=false` 跳过并记录日志。 |
+| DS-13.5.3 | requirements §13.5.3 | 对齐删除策略参数与“显式请求驱动”原则。 |
+| AC-04 | AC-004 | 确保不引入依赖展示分类和隐式级联规则。 |
+
+章节边界：
+
+1. 本节仅定义“请求内显式依赖”的解析与删除行为，不承担依赖拓扑展示、可视化状态和分类模型。
+2. 本节不引入资源级业务约束（如实例数量限制、来源组合限制）；相关校验保持上层前置边界。
+3. 本节复用 §3 接口错误码与 §4 幂等语义，不新增错误类别或私有状态机。
+
+### 6.2 依赖数据结构与字段 schema
+
+#### 6.2.1 领域结构
+
+| 结构 | 字段 | 规则 |
+| --- | --- | --- |
+| `DependencyRef` | `dependency_id`, `alias`, `resource_type`, `resource_id`, `required`, `bind_path` | 对应 requirements §13.5.1 最小字段集。 |
+| `DeleteOptions` | `dependency_policy`, `dependency_ids[]` | 删除策略参数；仅在 `DEPLOY_DELETE` 生效。 |
+| `ResolvedDependency` | `dependency_id`, `alias`, `bind_path`, `resolved_resource_ref`, `resolved_values` | 依赖解析成功后的注入中间态。 |
+| `DependencyResolutionReport` | `resolved[]`, `skipped_optional[]`, `missing_required[]`, `observed_at` | 用于执行前检查与结构化日志输出。 |
+
+#### 6.2.2 `spec.dependencies` 字段约束
+
+| 字段 | 必填 | 约束 | 失败错误码 |
+| --- | --- | --- | --- |
+| `dependency_id` | 是 | 请求内唯一；格式 `^[a-z0-9][a-z0-9-_]{1,63}$`。 | `AETHER_INVALID_ARGUMENT` |
+| `alias` | 是 | 请求内唯一；用于模板渲染引用，格式同 `dependency_id`。 | `AETHER_INVALID_ARGUMENT` |
+| `resource_type` | 是 | 必须是已注册资源类型。 | `AETHER_INVALID_ARGUMENT` |
+| `resource_id` | 是 | 非空字符串；仅表示引用目标，不触发自动创建。 | `AETHER_INVALID_ARGUMENT` |
+| `required` | 是 | `true/false`；不得省略。 | `AETHER_INVALID_ARGUMENT` |
+| `bind_path` | 是 | 使用 JSON Pointer（RFC 6901）指向 `spec.values` 注入位置。 | `AETHER_INVALID_ARGUMENT` |
+
+补充规则：
+
+1. `spec.dependencies` 缺省或空数组表示“无显式依赖”，Aether 不做隐式推断。
+2. Aether 不解析 Chart 内部隐式依赖，不根据 `resource_type` 自动补全依赖。
+3. 同一 `bind_path` 只能由一个 `dependency_id` 写入；重复写入按参数冲突处理。
+
+#### 6.2.3 示例（用于实现校验）
+
+```yaml
+spec:
+  values:
+    app:
+      datastore: {}
+  dependencies:
+    - dependency_id: pg-main
+      alias: postgres
+      resource_type: DATA_SERVICE
+      resource_id: ds-postgres-001
+      required: true
+      bind_path: /app/datastore/postgres
+    - dependency_id: vec-main
+      alias: vector
+      resource_type: DATA_SERVICE
+      resource_id: ds-milvus-003
+      required: false
+      bind_path: /app/datastore/vector
+delete_options:
+  dependency_policy: CASCADE_EXPLICIT
+  dependency_ids:
+    - pg-main
+```
+
+### 6.3 依赖解析与缺失处理生命周期
+
+解析触发点：
+
+1. `Create/Update`：在渲染前执行依赖解析，以保证 `bind_path` 注入后再进入 values 渲染。
+2. `Delete`：默认不需要依赖解析，仅在 `dependency_policy=CASCADE_EXPLICIT/BLOCK` 时使用请求内显式依赖集合作为决策输入。
+
+解析步骤（`EXPLICIT_ONLY`）：
+
+1. 校验 `spec.dependencies` 结构与唯一性约束（`dependency_id`、`alias`、`bind_path`）。
+2. 逐项按 `workspace_id + cluster_id + namespace + resource_type + resource_id` 读取可观测资源事实。
+3. 解析成功时，将依赖值写入 `bind_path` 对应位置，生成 `ResolvedDependency`。
+4. 解析失败时：
+   - `required=true`：立即终止并返回 `AETHER_DEPENDENCY_MISSING`。
+   - `required=false`：记录跳过并继续处理下一项。
+5. 全部处理完成后输出 `DependencyResolutionReport`，供渲染和审计日志复用。
+
+缺失处理约束（对应 requirements §13.5.2）：
+
+1. `required=true` 缺失必须是失败分支，禁止降级为警告后继续执行。
+2. `required=false` 缺失必须记录结构化日志，且日志级别至少为 `WARN`。
+3. 可选依赖被跳过时，不得写入空占位值污染 `spec.values`。
+
+### 6.4 删除策略状态规则
+
+#### 6.4.1 策略枚举与默认值
+
+| 参数 | 取值 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `delete_options.dependency_policy` | `RETAIN`、`CASCADE_EXPLICIT`、`BLOCK` | `RETAIN` | 仅对 `Delete` 请求生效。 |
+| `delete_options.dependency_ids[]` | `[]string` | 空 | 仅 `CASCADE_EXPLICIT` 使用。 |
+
+#### 6.4.2 行为定义
+
+| 策略 | 行为 | 错误分支 |
+| --- | --- | --- |
+| `RETAIN` | 仅删除主资源；不对任何依赖资源发起删除。 | 无额外错误分支。 |
+| `CASCADE_EXPLICIT` | 仅删除 `dependency_ids` 显式列出的依赖项；不得删除未列出依赖。 | `dependency_ids` 为空或含未知 `dependency_id` -> `AETHER_INVALID_ARGUMENT` |
+| `BLOCK` | 若请求显式声明存在依赖（`spec.dependencies` 非空），拒绝删除主资源。 | 返回 `AETHER_CONFLICT` |
+
+边界规则：
+
+1. `BLOCK` 仅根据“当前请求是否显式声明依赖”判定，不反推外部依赖拓扑。
+2. `CASCADE_EXPLICIT` 的删除顺序固定为：先删显式依赖，再删主资源；任一依赖删除失败即停止并返回失败结果。
+3. `RETAIN`/`CASCADE_EXPLICIT`/`BLOCK` 均不得基于“依赖展示分类”触发隐式级联。
+
+### 6.5 接口契约与 OpenAPI 映射（依赖/删除维度）
+
+请求契约扩展（在 §3 `CUDRequest` 基础上）：
+
+| 字段路径 | 适用动作 | 必填 | 约束 |
+| --- | --- | --- | --- |
+| `spec.dependencies[]` | `DEPLOY_CREATE`、`DEPLOY_UPDATE`、`DEPLOY_DELETE` | 否 | 存在时必须满足 §6.2 schema。 |
+| `delete_options.dependency_policy` | `DEPLOY_DELETE` | 否 | 缺省按 `RETAIN` 处理。 |
+| `delete_options.dependency_ids[]` | `DEPLOY_DELETE` | 条件必填 | 当 `dependency_policy=CASCADE_EXPLICIT` 时必填且非空。 |
+
+上层 OpenAPI 3.0 RESTful 映射补充：
+
+| 上层 REST 路径 | 方法 | Aether 接口 | 依赖/删除参数落点 |
+| --- | --- | --- | --- |
+| `/api/v1/workspaces/{workspace_id}/resources/{resource_type}` | `POST` | `Create` | `spec.dependencies[]` |
+| `/api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}` | `PUT` | `Update` | `spec.dependencies[]` |
+| `/api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}` | `DELETE` | `Delete` | `spec.dependencies[]` + `delete_options` |
+
+查询边界（对应 FR-DM-003、AC-004）：
+
+1. `QueryTaskResponse` 仅返回任务状态与结果，不返回依赖展示分类、依赖拓扑树或可视化状态标签。
+2. 依赖展示和管理视图由上层业务模块维护，Aether 仅输出执行事实与错误结果。
+
+### 6.6 错误码、失败分支与日志约束
+
+| 场景 | 错误码 | 说明 |
+| --- | --- | --- |
+| `dependency_id/alias/bind_path` 非法或重复 | `AETHER_INVALID_ARGUMENT` | 请求结构不满足 schema。 |
+| `required=true` 的依赖未解析到目标资源 | `AETHER_DEPENDENCY_MISSING` | 强依赖缺失，拒绝继续执行。 |
+| `CASCADE_EXPLICIT` 且 `dependency_ids` 为空 | `AETHER_INVALID_ARGUMENT` | 策略参数不完整。 |
+| `CASCADE_EXPLICIT` 包含未在 `spec.dependencies` 声明的 `dependency_id` | `AETHER_INVALID_ARGUMENT` | 禁止删除未显式声明依赖。 |
+| `BLOCK` 且请求声明依赖 | `AETHER_CONFLICT` | 删除策略冲突。 |
+| 依赖解析或删除阶段出现非预期异常 | `AETHER_INTERNAL` | 运行时异常。 |
+
+结构化日志要求（满足 T06 DoD）：
+
+| 事件 | 必填字段 |
+| --- | --- |
+| `dependency_resolve_started` | `task_id`, `workspace_id`, `resource_type`, `resource_id`, `dependency_count` |
+| `dependency_resolved` | `task_id`, `dependency_id`, `alias`, `bind_path`, `resolved_resource_id` |
+| `dependency_optional_skipped` | `task_id`, `dependency_id`, `alias`, `reason=NOT_FOUND`, `required=false` |
+| `dependency_required_missing` | `task_id`, `dependency_id`, `alias`, `reason=NOT_FOUND`, `required=true` |
+| `delete_policy_applied` | `task_id`, `dependency_policy`, `dependency_ids`, `resource_id` |
+
+### 6.7 并发、幂等与一致性约束
+
+1. 依赖解析输入属于请求指纹的一部分（`spec`），同幂等键同指纹请求必须产生同一依赖展开结果或同一错误分支。
+2. `required=false` 跳过行为必须可重复：同一输入在同一观测条件下重复执行，跳过集合应保持一致。
+3. `CASCADE_EXPLICIT` 仅允许删除当前请求显式列出的依赖，禁止因并发请求引入额外删除目标。
+4. Aether 不为依赖删除提供跨请求分布式锁；并发冲突治理由上层模块负责（继承 NFR-003）。
+5. 删除过程中若依赖已不存在，应按“幂等删除成功”处理，不得升级为依赖展示语义错误。
+
+### 6.8 关键时序（Mermaid）
+
+依赖解析与缺失处理：
+
+```mermaid
+sequenceDiagram
+    participant Caller as 上层模块
+    participant API as DeploymentAPI
+    participant Resolver as DependencyResolver
+    participant Facts as Helm/K8S Facts
+    participant Render as ValuesRenderer
+
+    Caller->>API: Create/Update(CUDRequest with spec.dependencies)
+    API->>Resolver: 校验 schema + EXPLICIT_ONLY 解析
+    loop each dependency
+        Resolver->>Facts: 读取(resource_type, resource_id, workspace/cluster/namespace)
+        alt found
+            Facts-->>Resolver: resolved dependency facts
+            Resolver->>Resolver: 注入 bind_path
+            Resolver-->>API: dependency_resolved
+        else not found and required=true
+            Facts-->>API: AETHER_DEPENDENCY_MISSING
+            API-->>Caller: 返回错误，终止执行
+        else not found and required=false
+            Resolver-->>API: dependency_optional_skipped(WARN)
+        end
+    end
+    API->>Render: 基于已注入 values 渲染
+    Render-->>Caller: ACCEPTED / render result
+```
+
+删除策略判定：
+
+```mermaid
+sequenceDiagram
+    participant Caller as 上层模块
+    participant API as DeploymentAPI.Delete
+    participant Policy as DeletePolicyEvaluator
+    participant Exec as HelmExecutor
+
+    Caller->>API: Delete(CUDRequest + delete_options + spec.dependencies)
+    API->>Policy: 评估 dependency_policy
+    alt policy = RETAIN
+        Policy->>Exec: 删除主资源
+        Exec-->>Caller: ACCEPTED
+    else policy = CASCADE_EXPLICIT
+        Policy->>Policy: 校验 dependency_ids 非空且均显式声明
+        alt 参数非法
+            Policy-->>Caller: AETHER_INVALID_ARGUMENT
+        else 参数合法
+            Policy->>Exec: 先删 dependency_ids 显式依赖
+            Exec->>Exec: 再删主资源
+            Exec-->>Caller: ACCEPTED
+        end
+    else policy = BLOCK
+        alt spec.dependencies 非空
+            Policy-->>Caller: AETHER_CONFLICT
+        else 无显式依赖
+            Policy->>Exec: 删除主资源
+            Exec-->>Caller: ACCEPTED
+        end
+    end
+```
+
+### 6.9 边界条件与禁止操作
+
+1. 禁止基于资源类型、模板来源或历史执行结果自动推断“隐式依赖”。
+2. 禁止在 Query 返回中附加依赖分类、依赖状态机或依赖可视化模型字段。
+3. 禁止 `CASCADE_EXPLICIT` 删除未在 `dependency_ids` 明确列出的依赖。
+4. 禁止 `BLOCK` 模式下绕过冲突分支直接删除主资源。
+5. 禁止将可选依赖缺失升级为内部错误或权限错误。
+
+### 6.10 DoD 对照
+
+| T06 DoD | 设计落点 |
+| --- | --- |
+| 仅解析请求内显式依赖，不推断隐式依赖 | §6.3 解析步骤、§6.9 禁止操作 #1 |
+| `required=true/false` 的失败或跳过行为定义完整，且有日志约束 | §6.3 缺失处理、§6.6 日志事件表 |
+| 不引入“依赖展示模型”或“基于展示分类的强制级联规则” | §6.1 章节边界、§6.5 查询边界、§6.9 禁止操作 #2 |
 
 ## §7 values 渲染与 Helm 等效执行（T07）
 

@@ -279,3 +279,19 @@
   - `QueryTask` 契约保持按 `task_id` 单查，不引入来源特化查询接口。
   - 资源类型扩展继续遵循 D-003 的注册化方向，避免复制粘贴业务流程。
 - 替代关系：无（与 D-003 一致并补充细化）。
+
+## D-025 T06 依赖路径与删除策略判定收敛
+
+- 日期：2026-03-01
+- 状态：已采纳
+- 决策：
+  - `spec.dependencies[].bind_path` 统一采用 JSON Pointer（RFC 6901）指向 `spec.values` 注入位置，避免路径语法歧义。
+  - `BLOCK/CASCADE_EXPLICIT` 的删除策略判定仅依据“当前请求显式声明的依赖集合”（`spec.dependencies` 与 `delete_options.dependency_ids`），不反推或推断隐式依赖拓扑。
+- 原因：
+  - requirements §13.5.1 要求 `bind_path` 为必填，但未规定路径语法；若不收敛会导致不同实现出现注入歧义。
+  - FR-DM-003/004 与 AC-004 明确 Aether 不维护依赖展示模型；删除策略必须以显式请求为边界，避免越界承担依赖拓扑治理。
+- 影响：
+  - `docs/design.md` §6 可直接指导实现依赖注入校验与错误分支：路径非法返回 `AETHER_INVALID_ARGUMENT`，强依赖缺失返回 `AETHER_DEPENDENCY_MISSING`。
+  - `BLOCK` 策略语义稳定：仅对“请求声明存在依赖”场景返回 `AETHER_CONFLICT`，不因外部拓扑变化产生不确定行为。
+  - `CASCADE_EXPLICIT` 删除目标集合可预测且可审计，避免隐式级联删除风险。
+- 替代关系：无（对 D-015 的实现细化，不替代既有 ADR）。
