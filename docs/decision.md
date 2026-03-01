@@ -313,3 +313,21 @@
   - 上层模块可先 Render 再 CUD，或直接 CUD，均可通过 `values_digest` 完成输入对账与审计。
   - 渲染失败将稳定映射到 `AETHER_RENDER_ERROR`，执行绑定异常映射到 `AETHER_INTERNAL`，降低错误分类歧义。
 - 替代关系：无（新增补充决策）。
+
+## D-027 T08 无状态事实读取优先级与 Query 最小可信响应边界
+
+- 日期：2026-03-01
+- 状态：已采纳
+- 决策：
+  - 在无状态架构下，事实读取统一采用 `HELM_RELEASE + K8S_API` 并行采集，`EXECUTOR_FEEDBACK` 仅作为同进程辅助事实，不可单独确认为终态。
+  - Query 判定采用“最小可信响应”分界：可绑定 `task_id + resource_ref` 但状态不确定时返回 `UNKNOWN`；无法绑定最小作用域事实时返回 `AETHER_QUERY_CONTEXT_UNAVAILABLE`。
+  - Aether 不将 PostgreSQL/Redis 设为执行与查询的前置可用性依赖，且不新增任务历史持久化职责。
+- 原因：
+  - T08 DoD 要求同时落地“无持久化强依赖”“查询降级策略”“可靠性边界不越界”，需要明确事实优先级与降级分界才能避免实现分叉。
+  - FR-EXEC-002、FR-DM-001、FR-Q-001 与 TC-011 同时约束了事实来源和返回语义，若不定义最小可信响应条件，会导致 `UNKNOWN` 与查询错误码使用不一致。
+  - §4 已定义 `UNKNOWN`/`AETHER_QUERY_CONTEXT_UNAVAILABLE` 的语义，本决策补充其在无状态事实采集阶段的可执行判定规则。
+- 影响：
+  - `docs/design.md` §8 可直接指导 Query Projector/Fact Collector 的实现与测试，统一超时、冲突收敛与错误分支行为。
+  - 上层模块可稳定区分“可继续轮询的降级态（UNKNOWN）”与“上下文不可恢复错误（QUERY_CONTEXT_UNAVAILABLE）”，降低重试策略歧义。
+  - 无状态边界与 D-011、D-016 保持一致，避免后续任务引入反向存储硬依赖。
+- 替代关系：无（对 D-011、D-016 的实现细化，不替代既有 ADR）。

@@ -1278,7 +1278,217 @@ sequenceDiagram
 
 ## §8 无状态执行与任务查询架构（T08）
 
-待 T08 补充。
+### 8.1 需求追踪与章节边界
+
+| 追踪ID | 来源 | 设计落点 |
+| --- | --- | --- |
+| EXEC-02 | FR-EXEC-002 | 执行与查询事实仅来源于 Helm/K8S，且不将 PostgreSQL/Redis 设为强制依赖。 |
+| DM-01 | FR-DM-001 | 不建设资源/任务持久化主表，Query 仅返回当前观测态。 |
+| NFR-01 | NFR-001 | 架构满足 Go + Gin + Helm 技术栈，并以执行上下文 + Helm/K8S 反馈作为事实源。 |
+| NFR-03 | NFR-003 | 幂等重试与可靠性边界保持“上层可重试、Aether 无持久重试队列、并发治理上移”。 |
+| Q-01 | FR-Q-001 | Query 语义限定为“当前任务状态与结果”，不承诺历史时间线。 |
+| T08-DOD-01 | T08 DoD | 明确无强制 PostgreSQL/Redis 依赖，禁止反向引入硬依赖。 |
+| T08-DOD-02 | T08 DoD | 查询只返回“当前状态+当前结果”，不返回历史轨迹。 |
+| T08-DOD-03 | T08 DoD | 可靠性目标只覆盖 Aether 边界，不越界承担上层并发治理。 |
+
+章节边界：
+
+1. 本节定义“无状态执行与 Query 事实采集/投影架构”，复用 §3 接口契约与 §4 状态机语义，不重复定义 DTO 与状态枚举。
+2. 本节仅约束 Aether 内部事实读取和降级策略，不定义上层状态表、历史快照和审计留存模型。
+3. `UNKNOWN` 与 `AETHER_QUERY_CONTEXT_UNAVAILABLE` 的优先级沿用 §4.5；本节补充“何时可构造最小可信响应”的判定条件。
+
+### 8.2 无状态组件视图与运行时模型
+
+```mermaid
+flowchart TD
+    Caller[上层模块] --> API[DeploymentAPI\nCreate/Update/Delete/QueryTask]
+    API --> Auth[AuthZ/Scope Checker]
+    API --> Idem[Idempotency Engine]
+    API --> Render[Render Pipeline]
+    API --> QueryProj[Query Projector]
+    Idem --> Exec[Helm Executor]
+    Render --> Exec
+    Exec --> Helm[Helm CLI / SDK]
+    QueryProj --> Facts[Fact Collector]
+    Exec --> Facts
+    Facts --> Helm
+    Facts --> K8S[Kubernetes API]
+    Facts --> QueryProj
+```
+
+组件职责：
+
+| 组件 | 主要职责 | 存储约束 |
+| --- | --- | --- |
+| `Idempotency Engine` | 基于 §4 规则计算 `task_id/fingerprint` 并做命中/冲突判定。 | 只使用请求与当前可观测事实；不落幂等记录表。 |
+| `Helm Executor` | 将 §7 渲染产物绑定为唯一执行输入并触发 Helm。 | 不依赖任务队列表或分布式锁基础设施。 |
+| `Fact Collector` | 读取 `EXECUTOR_FEEDBACK/HELM_RELEASE/K8S_API` 事实并输出统一快照。 | 仅进程内短生命周期缓存；重启后可丢失。 |
+| `Query Projector` | 将事实快照投影到 `QueryTaskResponse` 或错误分支。 | 不生成历史事件存储。 |
+
+核心运行时结构：
+
+| 结构 | 字段 | 规则 |
+| --- | --- | --- |
+| `StatelessExecutionContext` | `request_id`, `workspace_id`, `action`, `task_id`, `resource_ref`, `values_digest` | 从请求与 §4 派生字段生成；一次调用内可重建。 |
+| `FactReadPlan` | `task_id`, `workspace_id`, `cluster_id`, `release_ref`, `deadline` | Query/CUD 共用读取计划，`deadline` 默认 2 秒。 |
+| `FactSnapshot` | `executor_fact`, `helm_fact`, `k8s_fact`, `observed_at`, `completeness` | `completeness` 取值：`FULL`、`PARTIAL`、`MINIMAL`、`NONE`。 |
+| `QueryProjection` | `status`, `result`, `resource_ref`, `observed_at`, `degraded` | `degraded=true` 时 `status` 仅允许 `UNKNOWN`。 |
+
+### 8.3 事实来源矩阵、读取顺序与冲突收敛
+
+事实来源矩阵：
+
+| 来源 | 读取方式 | 可信字段 | 失败处理 |
+| --- | --- | --- | --- |
+| `EXECUTOR_FEEDBACK` | 当前执行链路内存事件（同进程） | `accepted_at`, `last_step`, `render_digest`, `attempt` | 仅作辅助事实；不可单独确认为终态。 |
+| `HELM_RELEASE` | `helm status/get manifest/history`（同 release） | `revision`, `status`, `chart`, `last_deployed` | 读取失败进入降级判定，不直接改写为失败终态。 |
+| `K8S_API` | 按 `resource_ref` 与任务标签查询 workload/Job/Pod | `observed_generation`, `ready`, `failed_reason` | 与 Helm 结果冲突时按收敛规则判定。 |
+
+读取顺序与时延预算（单次 Query）：
+
+1. 并行读取 `HELM_RELEASE` 与 `K8S_API`，总预算 2 秒，单源超时预算 1.5 秒。
+2. 若 Query 与当前 CUD 同进程同周期，可并入 `EXECUTOR_FEEDBACK` 提供最小上下文。
+3. 任一来源超时不立即失败，先进入投影收敛；仅在“无法形成最小可信响应”时返回 `AETHER_QUERY_CONTEXT_UNAVAILABLE`。
+
+冲突收敛规则：
+
+| 场景 | 收敛结果 | 说明 |
+| --- | --- | --- |
+| Helm=`SUCCEEDED` 且 K8S 可达但有短时未就绪 | `RUNNING` 或 `SUCCEEDED`（以 `observed_generation` 是否对齐为准） | 避免将控制面与数据面瞬时延迟误判为失败。 |
+| Helm=`FAILED` 且 K8S 部分资源仍存活 | `FAILED` | 终态以 Helm 执行结果为主，K8S 残留交由后续修复流程处理。 |
+| Helm/K8S 均不可达，但有可信 `resource_ref` 与 `task_id` | `UNKNOWN` | 返回降级态而非错误，支持继续轮询。 |
+| 无任何可信事实可绑定 `task_id` | 错误 | 返回 `AETHER_QUERY_CONTEXT_UNAVAILABLE`。 |
+
+### 8.4 执行路径（无持久化实现）
+
+执行链路约束（对应 FR-EXEC-002、FR-DM-001）：
+
+1. CUD 受理后，先按 §2 完成鉴权，再按 §4 计算 `task_id/fingerprint`。
+2. 执行器只消费 §7 `RenderArtifact.file_content`，并将 Helm/K8S 回执写入进程内 `FactSnapshot`。
+3. 不要求 PostgreSQL/Redis 提供任务队列、任务状态表、幂等记录表或分布式锁。
+4. `QueryTask` 通过 `task_id + workspace_id` 即时拉取事实并投影，不依赖历史落库记录恢复。
+5. 进程重启后允许丢失内存缓存；Query 需通过 Helm/K8S 实时事实重建当前状态。
+
+### 8.5 Query 最小可信响应与降级策略
+
+最小可信响应判定（沿用 §4.5）：
+
+| 判定条件 | 返回 |
+| --- | --- |
+| 至少可确认 `task_id` 属于当前 `workspace_id` 且可绑定 `resource_ref`，但状态事实缺失/超时 | `QueryTaskResponse(status=UNKNOWN, result.reason=QUERY_CONTEXT_UNAVAILABLE)` |
+| 无法确认 `task_id` 对应的最小作用域事实（`resource_ref` 不可构造） | `AETHER_QUERY_CONTEXT_UNAVAILABLE` |
+| 事实源可达且确认任务不存在 | `AETHER_RESOURCE_NOT_FOUND` |
+| 事实源可达但作用域/授权不满足 | `AETHER_PERMISSION_DENIED` |
+
+语义约束：
+
+1. Query 仅返回“当前任务状态与当前任务结果快照”，不返回历史时间线、事件列表或状态转移轨迹。
+2. `observed_at` 必须是当前观测时间，不可回填“最后成功时间”。
+3. `UNKNOWN` 仅是读取降级态，不是持久终态，不得用于替代 `SUCCEEDED/FAILED` 业务结论。
+
+### 8.6 错误码映射与失败分支
+
+| 场景 | 错误码/状态 | 处理要求 |
+| --- | --- | --- |
+| Query 读取预算耗尽，但能绑定 `task_id + resource_ref` | `status=UNKNOWN` | 建议上层继续轮询。 |
+| Query 读取预算耗尽，且无法绑定最小事实 | `AETHER_QUERY_CONTEXT_UNAVAILABLE` | 标记 `retriable=true`。 |
+| Helm/K8S 返回对象不存在且作用域可确认 | `AETHER_RESOURCE_NOT_FOUND` | 不做隐式重建。 |
+| 鉴权通过前即发现参数缺失（如 `workspace_id`） | `AETHER_INVALID_ARGUMENT` | 与 §3 校验规则一致。 |
+| 事实解析器内部异常（反序列化/契约破坏） | `AETHER_INTERNAL` | 记录 `trace_id` 与失败阶段。 |
+
+### 8.7 并发、幂等与可靠性边界
+
+1. Aether 不提供内建分布式锁与持久重试队列；同资源并发治理与失败补偿由上层负责（NFR-003）。
+2. 同幂等键重试仍按 §4 命中/冲突规则执行；无状态架构不得引入新的幂等键字段。
+3. Query 与执行并发时允许出现 `RUNNING/UNKNOWN` 抖动；上层需基于轮询收敛最终业务状态。
+4. 运行时内存缓存只用于降低读取延迟，不可作为任务真实状态唯一来源。
+5. 禁止把 PostgreSQL/Redis 作为“可用性前提条件”；即使不可用也不应阻断核心 CUD/Query 语义。
+
+### 8.8 关键流程（Mermaid）
+
+无状态 CUD 执行与事实采集：
+
+```mermaid
+sequenceDiagram
+    participant Caller as 上层模块
+    participant API as DeploymentAPI.CUD
+    participant Auth as AuthZ/Scope
+    participant Idem as Idempotency Engine
+    participant Render as Render Pipeline
+    participant Exec as Helm Executor
+    participant Facts as Fact Collector
+    participant Helm as Helm
+    participant K8S as Kubernetes API
+
+    Caller->>API: Create/Update/Delete(CUDRequest)
+    API->>Auth: 鉴权与作用域校验
+    alt 校验失败
+        Auth-->>Caller: AETHER_INVALID_ARGUMENT / AETHER_PERMISSION_DENIED
+    else 通过
+        API->>Idem: 计算 task_id/fingerprint 并判定命中
+        alt 命中同幂等键同指纹
+            Idem-->>Caller: 返回同 task_id/resource_id + ACCEPTED
+        else 需执行
+            API->>Render: 渲染 values（§7）
+            Render->>Exec: RenderArtifact(file_content, values_digest)
+            Exec->>Helm: install/upgrade/uninstall
+            Exec->>K8S: 读取目标资源观测态
+            Helm-->>Facts: release status/revision
+            K8S-->>Facts: workload/job/pod facts
+            Facts-->>Caller: CUDAcceptedResponse(status=ACCEPTED)
+        end
+    end
+```
+
+Query 降级与错误分支：
+
+```mermaid
+sequenceDiagram
+    participant Caller as 上层模块
+    participant API as DeploymentAPI.QueryTask
+    participant Auth as AuthZ/Scope
+    participant Facts as Fact Collector
+    participant Proj as Query Projector
+    participant Helm as Helm
+    participant K8S as Kubernetes API
+
+    Caller->>API: QueryTask(task_id, workspace_id)
+    API->>Auth: 鉴权与作用域校验
+    alt 鉴权失败
+        Auth-->>Caller: AETHER_PERMISSION_DENIED / AETHER_INVALID_ARGUMENT
+    else 通过
+        par 读取事实
+            Facts->>Helm: 读取 release/task facts
+        and
+            Facts->>K8S: 读取 workload facts
+        end
+        Facts->>Proj: FactSnapshot(completeness)
+        alt 可构造最小可信响应但状态不确定
+            Proj-->>Caller: QueryTaskResponse(status=UNKNOWN)
+        else 可构造确定状态
+            Proj-->>Caller: QueryTaskResponse(status=RUNNING/SUCCEEDED/FAILED)
+        else 无法构造最小可信响应
+            Proj-->>Caller: AETHER_QUERY_CONTEXT_UNAVAILABLE
+        end
+    end
+```
+
+### 8.9 边界条件与禁止操作
+
+1. 禁止新增“任务历史时间线持久化”作为 Aether 内部强制职责。
+2. 禁止把 PostgreSQL/Redis 可用性作为 CUD/Query 成功前置条件。
+3. 禁止在 Query 接口返回列表、分页、排序或历史事件聚合结果。
+4. 禁止把进程内缓存当作跨重启可恢复事实来源。
+5. 禁止将事实源短时不可达直接映射为 `FAILED` 终态。
+6. 禁止将 `UNKNOWN` 持久化为业务终态并替代上层轮询收敛流程。
+
+### 8.10 DoD 对照
+
+| T08 DoD | 设计落点 |
+| --- | --- |
+| 明确“不强制依赖 PostgreSQL/Redis”且不给出反向硬依赖 | §8.2 组件存储约束、§8.4 执行路径 #3、§8.7 边界 #5、§8.9 禁止操作 #2 |
+| 查询结果语义限定为“当前任务状态与结果”，不承诺历史时间线 | §8.5 语义约束 #1/#2、§8.9 禁止操作 #1/#3 |
+| 可靠性目标只覆盖需求定义边界，不越界承担上层并发治理 | §8.7 并发与可靠性边界 #1/#3、§8.9 禁止操作 #6 |
 
 ## §9 上层集成边界与审计日志（T09）
 
