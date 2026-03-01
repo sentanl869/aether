@@ -1492,7 +1492,227 @@ sequenceDiagram
 
 ## §9 上层集成边界与审计日志（T09）
 
-待 T09 补充。
+### 9.1 需求追踪与章节边界
+
+| 追踪ID | 来源 | 设计落点 |
+| --- | --- | --- |
+| INT-01 | FR-INT-001 | 固化“上层 OpenAPI -> Aether 代码接口”映射与职责分工，不把业务约束前置校验下沉到 Aether。 |
+| NFR-04 | NFR-004 | 定义 CUD 全链路结构化日志字段、事件语义与追踪关联规则。 |
+| GC-03-9 | requirements §13.2 #2 | 补齐上层 OpenAPI 3.0 RESTful 到 Aether 接口边界映射。 |
+| TC-014 | requirements §13.6 | 明确“上层已完成前置校验后调用 Aether”的成功路径。 |
+| TC-016 | requirements §13.6 | 明确结构化日志必填字段与执行结果记录规则。 |
+
+章节边界：
+
+1. 本节只定义“集成边界与审计可观测性”，不重复定义 §3 的 DTO 字段、§4 的状态机细节、§7 的渲染算法。
+2. 上层业务约束前置校验（单实例限制、资源来源组合限制等）保持在上层模块，Aether 仅执行统一契约校验与部署执行。
+3. 审计日志以“结构化输出 + 关联字段可追踪”为目标，不引入 Aether 内部持久化审计存储职责。
+
+### 9.2 集成参与方与职责边界模型
+
+| 参与方 | 角色 | 必须承担职责 | 禁止承担职责 |
+| --- | --- | --- | --- |
+| `Upstream API Module`（高代码/低代码/DevBox/网关等） | 业务入口 | 接收业务 OpenAPI；执行业务约束前置校验；构造统一 `CUDRequest/RenderValuesRequest`；维护业务侧任务历史快照。 | 不得把未校验业务请求直接透传为“已通过前置校验”。 |
+| `Aether DeploymentAPI` | 通用部署执行层 | 执行统一参数校验、授权/作用域判定、幂等判定、渲染/执行、任务单查。 | 不得实现业务域规则（单实例、来源组合、展示语义）。 |
+| `Audit Sink`（日志平台/SIEM/链路系统） | 审计留存层 | 接收结构化日志并做持久化、检索与告警。 | 不得反向要求 Aether 构建审计数据库。 |
+
+前置校验责任清单（必须由上层完成）：
+
+1. 资源级业务约束：单实例限制、来源组合限制、租户业务配额。
+2. 依赖展示/编排策略：依赖如何展示给终端用户、业务态解释口径。
+3. 业务态状态机约束：例如“某业务对象仅允许从 `DRAFT` 进入部署”。
+4. 审计留存策略：日志保留时长、脱敏策略等级、合规检索策略。
+
+### 9.3 OpenAPI 3.0 RESTful 到 Aether 接口边界映射
+
+边界映射总表（补足 GC-03，兼容 §3/§7 已定义接口）：
+
+| 上层 OpenAPI 3.0 RESTful | 上层职责（调用前） | Aether 接口调用 | 关键转换与约束 |
+| --- | --- | --- | --- |
+| `POST /api/v1/workspaces/{workspace_id}/resources/{resource_type}` | 校验业务规则；生成/传入 `request_id`；确定 `cluster_id`。 | `Create(ctx, CUDRequest)` | 映射 `workspace_id`/`cluster_id`/`target/spec`；成功返回 `ACCEPTED + task_id`。 |
+| `PUT /api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}` | 校验更新可行性（如版本策略、变更窗口）。 | `Update(ctx, CUDRequest)` | 映射目标 `resource_id`；与 Create 复用同一幂等与鉴权规则。 |
+| `DELETE /api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}` | 决定删除策略并显式设置 `delete_options`。 | `Delete(ctx, CUDRequest)` | 仅消费显式删除策略，不推断业务级联规则。 |
+| `GET /api/v1/workspaces/{workspace_id}/tasks/{task_id}` | 校验调用方可见性并透传授权上下文。 | `QueryTask(ctx, QueryTaskRequest)` | 仍是 `task_id` 单查；`workspace_id` 只用于授权边界。 |
+| `POST /api/v1/workspaces/{workspace_id}/resources/{resource_type}/render-values` | 确认是否需要“先预览/审计后执行”。 | `RenderValues(ctx, RenderValuesRequest)` | `intent=DEPLOY_CREATE`；与 CUD 复用同一输入语义。 |
+| `POST /api/v1/workspaces/{workspace_id}/resources/{resource_type}/{resource_id}/render-values` | 同上（更新场景）。 | `RenderValues(ctx, RenderValuesRequest)` | `intent=DEPLOY_UPDATE`；输出可用于预览审计或后续执行对账。 |
+
+输入转换结构（上层到 Aether）：
+
+| 结构 | 字段 | 规则 |
+| --- | --- | --- |
+| `UpstreamRequestEnvelope` | `trace_id`, `operator`, `workspace_id`, `biz_payload`, `precheck_report` | `precheck_report.status` 必须由上层产生并透传到日志上下文。 |
+| `AetherInvocationContext` | `request_id`, `task_id?`, `action`, `cluster_id`, `resource_ref`, `values_digest?` | `task_id` 仅在 CUD 受理后可用；`values_digest` 在渲染成功后可用。 |
+| `PrecheckReport` | `status`, `rule_set_version`, `failed_rules[]`, `checked_at` | `status` 取值：`PASSED/FAILED`；`FAILED` 时上层不得调用 Aether CUD。 |
+
+### 9.4 双路径调用规范（Render->CUD / 直接 CUD）
+
+路径 A：先 Render 后 CUD（预览/审计优先）
+
+1. 上层完成业务前置校验后先调用 `RenderValues`，拿到 `template_version + values_digest`。
+2. 上层可将渲染结果用于预览、审批或审计记录，再发起 `Create/Update`。
+3. 后续 CUD 执行必须复用相同输入语义；上层应在调用前完成 `values_digest/spec_hash` 对账并记录审计事件。
+
+路径 B：直接 CUD（由 Aether 内部渲染）
+
+1. 上层完成业务前置校验后直接调用 `Create/Update/Delete`。
+2. `Create/Update` 内部按 §7 同一 `RenderPipeline` 渲染并执行。
+3. 上层通过 `task_id` 单查轮询，并维护业务任务历史。
+
+路径选择约束：
+
+1. 路径 A/B 仅是调用顺序差异，不允许形成两套参数语义或两套渲染规则。
+2. 对同幂等键请求，路径切换（A->B 或 B->A）不得改变幂等键构成与授权判定顺序。
+3. `Delete` 不支持 Render 预览路径，必须直接走 CUD。
+
+### 9.5 结构化审计日志规范
+
+#### 9.5.1 日志事件生命周期
+
+| 阶段 | 事件名 | 触发时机 | 必填关联字段 |
+| --- | --- | --- | --- |
+| 入口 | `aether.integration.request_received` | 上层准备调用 Aether 前（上层产生日志） | `trace_id`, `request_id`, `workspace_id`, `action` |
+| 校验 | `aether.integration.precheck_passed` / `aether.integration.precheck_failed` | 上层前置校验完成 | `rule_set_version`, `failed_rule_count`, `operator_id` |
+| 调用 | `aether.cud.accepted` / `aether.render.succeeded` / `aether.render.failed` | Aether 返回同步结果 | `task_id?`, `values_digest?`, `error_code?` |
+| 查询 | `aether.query.observed` | 上层轮询 QueryTask 得到观测态 | `task_id`, `observed_status`, `observed_at` |
+| 收敛 | `aether.integration.closed` | 业务侧确定本次流程完成（成功或失败） | `task_id`, `final_status`, `close_reason` |
+
+#### 9.5.2 日志字段字典（满足 NFR-004）
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `event_name` | `string` | 是 | 事件名，采用上表固定枚举。 |
+| `event_time` | `string(date-time)` | 是 | RFC3339 UTC。 |
+| `trace_id` | `string` | 是 | 跨系统链路追踪标识。 |
+| `request_id` | `string` | 是 | 幂等请求号。 |
+| `task_id` | `string` | 条件必填 | CUD 受理后、Query 与收敛阶段必填。 |
+| `workspace_id` | `string` | 是 | 核心授权/审计边界。 |
+| `cluster_id` | `string` | 条件必填 | CUD/Render 场景必填。 |
+| `resource_type` | `string` | 条件必填 | CUD/Render/Query 均应可回溯。 |
+| `resource_id` | `string` | 条件必填 | Update/Delete/已分配 Create 场景必填。 |
+| `operator_id` | `string` | 是 | 操作者身份。 |
+| `operator_roles` | `string[]` | 是 | 本次请求生效角色集合。 |
+| `action` | `string` | 是 | `DEPLOY_CREATE/DEPLOY_UPDATE/DEPLOY_DELETE/QUERY_TASK/RENDER_VALUES`。 |
+| `precheck_status` | `string` | 条件必填 | 仅在前置校验与后续调用事件中填充，取值 `PASSED/FAILED`。 |
+| `request_summary` | `object` | 是 | 请求摘要，仅允许白名单字段与摘要值。 |
+| `values_digest` | `string` | 条件必填 | Render 成功或 CUD 执行路径可用时填充。 |
+| `execution_result` | `object` | 条件必填 | 记录 `status/error_code/retriable`。 |
+| `error_code` | `string` | 条件必填 | 失败事件必填。 |
+| `message` | `string` | 否 | 人类可读补充说明。 |
+
+`request_summary` 白名单规则：
+
+1. 允许：`resource_type`、`cluster_id`、`dependency_count`、`template_profile`、`spec_hash`。
+2. 禁止：原始密钥、Token、完整 `spec.values` 明文、凭据类注解。
+3. `spec_hash` 计算规则：`sha256(canonical_json(spec))`；用于审计对账，不替代 `values_digest`。
+
+#### 9.5.3 审计数据结构
+
+| 结构 | 字段 | 规则 |
+| --- | --- | --- |
+| `AuditLogEntry` | `event_name`, `event_time`, `correlation`, `actor`, `request_summary`, `result` | `correlation` 至少包含 `trace_id/request_id/workspace_id`。 |
+| `AuditCorrelation` | `trace_id`, `request_id`, `task_id?`, `workspace_id`, `resource_ref?`, `values_digest?` | `resource_ref` 结构复用 §3。 |
+| `AuditResult` | `status`, `error_code?`, `retriable?`, `observed_status?`, `final_status?` | `status` 取值：`ACCEPTED/FAILED/OBSERVED/CLOSED`。 |
+
+### 9.6 错误码与失败分支映射（集成维度）
+
+| 阶段 | 失败场景 | 错误码/处理 | 归属边界 |
+| --- | --- | --- | --- |
+| 上层前置校验 | 业务约束未通过（如单实例冲突） | 上层直接拒绝，不调用 Aether CUD | 上层模块 |
+| Aether 参数校验 | `cluster_id` 或必填字段缺失 | `AETHER_INVALID_ARGUMENT` | Aether |
+| Aether 鉴权/作用域 | 角色不允许或集群未绑定 | `AETHER_PERMISSION_DENIED` | Aether |
+| 渲染阶段 | 模板/Schema 不满足 | `AETHER_RENDER_ERROR` | Aether |
+| 幂等冲突 | 同幂等键异请求指纹 | `AETHER_CONFLICT` | Aether |
+| 查询降级 | 最小事实可构造但状态不确定 | `status=UNKNOWN` | Aether |
+| 查询失败 | 无法构造最小可信响应 | `AETHER_QUERY_CONTEXT_UNAVAILABLE` | Aether |
+
+失败分支规则：
+
+1. 上层 `precheck_status=FAILED` 场景必须终止于上层，不得“带失败标记继续调用”。
+2. Aether 返回失败后，上层必须记录 `error_code + request_id + trace_id` 三元组，保证问题追踪闭环。
+3. `UNKNOWN` 与错误码需区分处理：`UNKNOWN` 代表可继续轮询，错误码代表本次查询失败分支。
+
+### 9.7 并发、幂等与审计关联约束
+
+1. 幂等键仍固定为 `request_id + workspace_id + action`，审计字段不得新增为幂等判定输入。
+2. 同幂等键重试请求必须复用 `request_id`，并通过结构化日志保留 `attempt`（由上层或调用链注入）用于故障分析。
+3. 路径 A（Render->CUD）中，若上层在 Render 后修改了 `spec`，必须生成新的 `request_id`；禁止沿用旧 `request_id` 规避冲突。
+4. 并发 Query 不应写入“终态审计结论”；仅记录 `observed_status`，最终结论由 `integration.closed` 事件给出。
+5. 审计链路允许“日志先到、查询后到”乱序，上层落库/检索系统必须基于 `event_time + trace_id + request_id` 重排，不要求 Aether 提供排序存储。
+
+### 9.8 关键时序（Mermaid）
+
+路径 A：先 Render 后 CUD
+
+```mermaid
+sequenceDiagram
+    participant Client as 调用方(OpenAPI)
+    participant Biz as 上层业务模块
+    participant Aether as Aether API
+    participant Log as 审计日志平台
+
+    Client->>Biz: 业务请求
+    Biz->>Biz: 前置业务约束校验
+    alt 前置校验失败
+        Biz->>Log: precheck_failed(trace_id, request_id, failed_rules)
+        Biz-->>Client: 业务错误（不上送 Aether）
+    else 前置校验通过
+        Biz->>Aether: RenderValues(intent=CREATE/UPDATE)
+        Aether-->>Biz: values_digest/template_version or AETHER_RENDER_ERROR
+        Biz->>Log: render_result(trace_id, request_id, values_digest?, error_code?)
+        alt 渲染成功
+            Biz->>Aether: Create/Update(CUDRequest)
+            Aether-->>Biz: ACCEPTED + task_id
+            Biz->>Log: cud_accepted(trace_id, request_id, task_id)
+        else 渲染失败
+            Biz-->>Client: 渲染失败
+        end
+    end
+```
+
+路径 B：直接 CUD（Aether 内部渲染）
+
+```mermaid
+sequenceDiagram
+    participant Client as 调用方(OpenAPI)
+    participant Biz as 上层业务模块
+    participant Aether as Aether API
+    participant Query as QueryTask
+    participant Log as 审计日志平台
+
+    Client->>Biz: 业务请求
+    Biz->>Biz: 前置业务约束校验
+    alt 前置校验失败
+        Biz->>Log: precheck_failed
+        Biz-->>Client: 业务错误
+    else 前置校验通过
+        Biz->>Aether: Create/Update/Delete(CUDRequest)
+        Aether-->>Biz: ACCEPTED + task_id or error
+        Biz->>Log: cud_result(trace_id, request_id, task_id?, error_code?)
+        loop 轮询直到收敛
+            Biz->>Query: QueryTask(task_id)
+            Query-->>Biz: RUNNING/SUCCEEDED/FAILED/UNKNOWN or query_error
+            Biz->>Log: query_observed(task_id, observed_status?, error_code?)
+        end
+        Biz->>Log: integration_closed(task_id, final_status)
+    end
+```
+
+### 9.9 边界条件与禁止操作
+
+1. 禁止在 Aether 内实现资源级业务前置校验规则（单实例、来源组合等）。
+2. 禁止上层将 `precheck_status=FAILED` 的请求继续下发到 Aether。
+3. 禁止审计日志输出明文敏感字段（凭据、完整 secrets、完整 values 原文）。
+4. 禁止把结构化日志字段扩展为新的查询入参或幂等键组成字段。
+5. 禁止以“Aether 无持久化”为理由省略 `trace_id/request_id/task_id` 关联字段。
+6. 禁止把 `UNKNOWN` 直接记为最终失败结论并关闭流程。
+
+### 9.10 DoD 对照
+
+| T09 DoD | 设计落点 |
+| --- | --- |
+| 设计明确上层可选“先 Render 后 CUD”与“直接 CUD 内部 Render”两条路径 | §9.4 双路径调用规范、§9.8 两条 Mermaid 时序 |
+| 前置业务约束不下沉到 Aether | §9.2 职责边界、§9.6 失败分支规则 #1、§9.9 禁止操作 #1 |
+| 审计日志字段可支撑问题追踪，不依赖 Aether 自身持久化 | §9.5 字段字典与结构、§9.7 关联约束、§9.9 禁止操作 #5 |
 
 ## §10 验收追踪矩阵与设计完成性检查（T10）
 
