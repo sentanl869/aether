@@ -1,573 +1,538 @@
-# Aether 部署模块需求分析与拆解
-
-## 背景与目标
-
-Aether 是 AI Agent 运行平台的部署模块，负责在平台已纳管的 K8S 集群上部署平台内置资源与用户 Agent 应用，并提供统一的生命周期管理能力。
-
-平台通过 kubeconfig 纳管集群。平台角色分为超级管理员、空间管理员、用户：超级管理员负责全局资源治理（含创建工作空间、配置空间管理员）；空间管理员负责其管理工作空间内的环境与成员治理（如关联 K8S 集群、镜像仓库、管理工作空间用户、开通低代码平台）；用户仅可在已关联工作空间内进行高代码应用 CRUD，并进入已开通低代码平台执行低代码应用 CRUD。
-
-平台同时支持两类 Agent 应用形态：
-
-- 高代码 Agent 应用：
-  - 由 DevBox 产出的已发布镜像创建的 Agent 实例，或用户自行上传镜像创建的 Agent 实例，
-    与平台内提前创建的数据服务组件实例组合形成对外服务 Pod 集合。
-  - 或用户上传 Helm Chart，部署一个或多个 Agent 实例，并可关联平台内数据服务组件；Chart 也可能自带数据服务组件。
-- 低代码 Agent 应用：
-  - 运行在 Dify/FastGPT/Coze Studio/n8n 等低代码平台中，由用户在低代码平台内部创建并对外提供服务。
-  - Aether 负责低代码平台实例部署与生命周期，不解析低代码平台内部应用 DSL。
-
-目标：
-
-- 支持 6 类资源的统一 CRUD：数据服务组件、低代码平台、DevBox、网关、高代码应用、记忆体。
-- 在“都部署到 K8S Pod”的前提下建立统一抽象，保证新增资源类型时可复用同一部署行为。
-- 明确共享资源与“应用内嵌资源”的可见性与管理边界，避免资源混管。
-- 支持高代码应用发布时自动生成 Helm Chart、版本化入库并可下载导出。
-- 基于工作空间实现多集群租户边界、权限边界和关联约束。
-
-## 需求范围
-
-### In Scope
-
-- 消费平台管理面输出的纳管 K8S 集群（kubeconfig）与工作空间绑定结果，并执行部署面校验与编排。
-- 消费工作空间与集群、镜像仓库关联结果；维护同名 namespace 映射与运行态一致性。
-- 6 类资源的 CRUD、状态管理、异步任务执行与审计。
-- 平台内置模板（数据服务组件、Dify/FastGPT、DevBox 模板、网关、记忆体）管理与部署。
-- 低代码平台 Helm 导入能力（Coze Studio、n8n、外部 Dify/FastGPT）。
-- 高代码应用三类创建来源：DevBox 发布镜像、用户上传镜像、用户上传 Helm Chart。
-- 高代码应用与数据服务组件关系管理、级联删除策略、引用冲突处理。
-- 记忆体内部组件编排、关系管理、级联删除策略与引用冲突处理。
-- 高代码应用发布 Chart 的自动生成、版本记录、仓库存储、下载导出。
-- 统一资源抽象与统一部署执行链路（可扩展到未来新资源类型）。
-
-### Out of Scope
-
-- 镜像仓库与 Chart 仓库基础设施搭建（由其他模块负责）。
-- Dify/FastGPT/Coze Studio/n8n 内部工作流/Agent 编排能力实现。
-- Ingress/服务网格等高级网络治理能力。
-- 工作空间与纳管集群主数据 CRUD（创建/删除/纳管/退管）及其控制台交互（由平台管理面负责）。
-
-## 实现约束（技术栈）
-
-- 后端实现语言必须使用 Go。
-- Web/API 框架必须使用 Gin。
-- 持久化数据库必须使用 PostgreSQL（Postgres）。
-- 平台内置模板与部署包统一采用 Helm Chart 作为标准形态。
-
-## 角色与租户边界
-
-- 超级管理员：
-  - 可对 Agent 平台全部资源执行 CRUD（含跨工作空间治理）。
-  - 创建/管理工作空间并配置空间管理员（平台管理面能力，Aether 仅消费结果）。
-  - 管理平台级模板、全局策略与审计治理。
-- 空间管理员：
-  - 仅可在“自身被授权管理”的工作空间内执行操作。
-  - 负责工作空间环境与成员治理：关联/解绑 K8S 集群、关联/解绑镜像仓库、管理工作空间关联用户、开通/关闭低代码平台等。
-  - 可管理其工作空间内的部署资源与生命周期，不可越权到其他工作空间。
-- 用户：
-  - 仅可在“已关联”的工作空间内操作资源，禁止跨工作空间。
-  - 可对工作空间内高代码应用、数据服务组件、记忆体执行 CRUD，并进入已开通低代码平台执行低代码应用 CRUD。
-  - 同一工作空间内资源不做“创建者隔离”，用户可操作该工作空间内全部高代码应用、数据服务组件与记忆体资源（含其他用户创建的资源）。
-  - 不可开通/关闭低代码平台，不可创建/删除网关实例，不可给工作空间关联 K8S 集群或镜像仓库。
-
-## 资源分层与关键概念
-
-- 工作空间（Workspace）：资源与权限边界；每个关联集群中映射一个同名 namespace。
-- 一级资源类型（L1 Resource Kind）：部署模块对外提供独立业务语义与管理边界的资源，固定 6 类：
-  - 数据服务组件（Postgres、Redis、milvus、weaviate、pgvector、NebulaGraph、MongoDB）
-  - 低代码平台（Dify、FastGPT、Coze Studio、n8n）
-  - DevBox
-  - 网关（Higress）
-  - 高代码应用（openclaw、zeroclaw 等）
-  - 记忆体（mem0）
-- 支撑资源（Supporting Resource）：服务于一级资源的领域对象，包括
-  `AgentInstance`、`HighCodeArtifact`、`DevBoxPublishRecord`、
-  `HighCodeReleaseChart` 及各类关系引用对象。部分支撑资源可提供独立 CRUD
-  接口，但不计入“一级资源类型”口径。
-- 统一运行抽象（Runtime Abstraction）：一级资源与支撑资源最终都映射为
-  K8S Workload/Service/PVC/Secret 等对象集合；Pod 仅作为运行时观测对象，
-  不作为控制面领域主实体。
-- 资源模板（Template）：平台内置或管理员导入的 Helm Chart 模板与参数 schema。
-- 资源实例（Instance）：模板或制品在指定工作空间/集群/namespace 的运行实体。
-- `application_id`：统一资源 ID，指 `/applications/{application_id}` 路径参数；
-  对外作为 6 类一级资源统一主标识，对内按 `resource_type` 映射到对应领域实体主键。
-- 高代码制品（HighCode Artifact）：用于高代码应用部署的镜像或 Helm Chart 来源。
-- 记忆体（mem0）：复合一级资源，至少包含一个记忆体主实例与多个内部组件子实例，统一以组件关系进行编排与生命周期管理。
-- 嵌入式数据服务（Embedded Data Service）：
-  - 随低代码平台部署自动创建的数据服务实例。
-  - 或随高代码 Helm Chart 自带创建的数据服务实例。
-  - 仅归属其宿主资源，不进入“共享数据服务组件实例池”。
-
-## 需求拆解（功能）
-
-### 1. 工作空间、集群与镜像仓库
-
-- R-ENV-001：平台管理面通过 kubeconfig 纳管 K8S 集群；Aether 消费 `ManagedCluster` 只读视图并在部署前校验可达性。
-- R-ENV-002：工作空间创建/删除与空间管理员配置由平台管理面负责且仅超级管理员可执行；工作空间关联纳管集群、镜像仓库与成员管理由平台管理面负责并允许超级管理员或该工作空间空间管理员执行；Aether 仅消费生效绑定用于鉴权与编排。
-- R-ENV-003：一个工作空间在每个关联集群必须映射同名 namespace；若不存在则自动创建。
-- R-ENV-004：用户仅能操作与其关联工作空间内的高代码应用与记忆体资源，并通过已开通低代码平台入口执行低代码应用操作；禁止跨工作空间操作。
-- R-ENV-005：创建任意资源实例时必须先选择工作空间与目标集群；namespace 由映射规则确定，禁止自定义其他 namespace。
-- R-ENV-006：工作空间与镜像仓库关联关系必须可审计、可变更、可回滚。
-- R-ENV-007：镜像仓库凭证可下发到工作空间 namespace，用于镜像与 Chart 推拉。
-- R-ENV-008：同一应用内禁止跨集群部署与关联。
-- R-ENV-009：工作空间与集群解绑采用“冻结 + 校验 + 24h 可恢复窗口 + 回收”机制。
-- R-ENV-010：工作空间与集群/镜像仓库解绑仅允许超级管理员或该工作空间空间管理员执行，必须二次确认并记录审计。
-
-### 2. 统一资源抽象与可扩展部署行为
-
-- R-ABS-001：6 类资源必须统一映射到“模板/制品 + 实例 + 关系 + 发布记录”抽象模型。
-- R-ABS-002：6 类资源的 CUD 必须复用统一执行链路：参数校验 -> 模板渲染
-  -> K8S Apply/Upgrade/Delete -> 状态回写 -> 审计落库。
-- R-ABS-003：部署驱动采用可扩展适配器机制，默认 Helm 适配器；镜像型高代码应用通过平台生成 Chart 后复用 Helm 链路。
-- R-ABS-004：新增资源类型时，不得重写任务队列、鉴权、审计、状态机主流程，只允许新增资源 schema 与适配器实现。
-- R-ABS-005：统一资源标签规范：`workspace_id`、`cluster_id`、`resource_kind`、`resource_id`、`owner_kind`、`owner_id`。
-- R-ABS-006：所有资源的可观测字段（状态、事件、最近任务）结构统一，便于通用列表与运维视图复用。
-- R-ABS-007：领域模型采用“一级资源 + 支撑资源”分层；6 类一级资源口径用于权限矩阵、配额统计、审计报表与对外能力边界。
-- R-ABS-008：控制面不得以 Pod 作为业务主实体；Pod/ReplicaSet/Job
-  等仅作为运行时观测对象，并通过 `resource_kind/resource_id`
-  回挂到领域实例。
-
-### 3. 数据服务组件
-
-- R-DSP-001：平台内置数据服务组件类型固定为：
-  Postgres、Redis、milvus、weaviate、pgvector、NebulaGraph、MongoDB。
-- R-DSP-002：上述组件模板全部由平台内置并以 Helm Chart 形式提供。
-- R-DSP-003：共享数据服务组件实例支持独立创建、更新、删除、查询。
-- R-DSP-004：高代码应用创建时可关联已创建的共享数据服务组件实例。
-- R-DSP-005：组件实例部署参数支持：目标集群、资源规格、存储（SC + 容量）、副本规模、环境配置、Service 暴露策略（ClusterIP/NodePort）。
-- R-DSP-006：组件实例支持扩缩容、升级/回滚、滚动重启与健康检查管理。
-- R-DSP-007：Service 命名策略：
-  - 应用创建时直接关联场景由平台自动生成。
-  - 独立创建场景允许用户显式自定义（同 namespace 唯一）。
-- R-DSP-008：随低代码平台部署自动创建的数据服务实例必须标记为 `embedded_by_lowcode_platform`，不在共享组件列表中展示。
-- R-DSP-009：随高代码 Helm Chart 自带创建的数据服务实例必须标记为 `embedded_by_highcode_chart`，不在共享组件列表中展示。
-- R-DSP-010：随记忆体部署自动创建的数据服务实例必须标记为 `embedded_by_memory`，不在共享组件列表中展示。
-- R-DSP-011：嵌入式数据服务实例默认仅允许其宿主资源访问与运维；允许超级管理员通过专用独立运维接口执行运维动作。嵌入式实例不允许被其他高代码应用、低代码平台或记忆体复用绑定。
-- R-DSP-012：共享组件与嵌入式组件必须在 API、控制台列表和权限校验上完全隔离展示。
-- R-DSP-013：删除宿主资源时，嵌入式组件按宿主生命周期回收，不参与共享组件引用计数。
-
-### 4. 低代码平台
-
-- R-LCP-001：平台内置低代码平台模板包含 Dify 与 FastGPT，模板格式为 Helm Chart。
-- R-LCP-002：空间管理员或超级管理员可在工作空间内开通内置低代码平台，部署到对应集群/namespace。
-- R-LCP-003：超级管理员可导入 Coze Studio、n8n 或外部 Dify/FastGPT，导入格式仅支持 Helm Chart。
-- R-LCP-004：低代码平台实例支持 CRUD、状态查询、版本升级与回滚。
-- R-LCP-005：内置 Dify/FastGPT 部署时，其依赖数据服务组件随平台一起创建并标记为嵌入式。
-- R-LCP-006：低代码平台依赖组件不可与用户手工创建的共享数据服务组件混合展示或统一运维。
-- R-LCP-007：低代码平台实例需记录入口地址、管理员账号引用、依赖组件拓扑与版本信息。
-- R-LCP-008：同一工作空间同一集群内，同一低代码平台类型默认仅允许一个活动实例（可配置是否允许多实例）。
-- R-LCP-009：用户可查看其工作空间内低代码平台实例运行状态与访问入口，不可执行空间管理员/超级管理员限定动作。
-- R-LCP-010：Aether 不接管低代码平台内部应用对象 CRUD，仅保证平台实例层可用性。
-
-### 5. DevBox
-
-- R-DBX-001：DevBox 提供高代码 Agent 开发环境，内置框架模板以 Helm Chart 形式维护。
-- R-DBX-002：用户可基于模板在目标工作空间/集群启动开发容器实例。
-- R-DBX-003：DevBox 实例支持 CRUD（创建、配置更新、停止/删除、查询）。
-- R-DBX-004：DevBox 需支持代码仓挂载、资源配额、环境变量与密钥引用配置。
-- R-DBX-005：用户在 DevBox 内完成开发后，可在平台触发镜像发布流程。
-- R-DBX-006：仅“已发布镜像”允许作为高代码应用创建来源；未发布镜像禁止入选。
-- R-DBX-007：镜像发布需记录发布版本、镜像地址、digest、发布人、发布时间与关联 DevBox 实例。
-- R-DBX-008：DevBox 模板与实例要支持版本演进与兼容性检查，避免旧模板参数直接破坏运行实例。
-- R-DBX-009：DevBox 删除不自动删除其历史发布镜像与发布记录。
-
-### 6. 网关（Higress）
-
-- R-GTW-001：网关用于提供应用发布、AI 网关、MCP 网关三类能力。
-- R-GTW-002：网关部署模板由平台内置并以 Helm Chart 形式提供。
-- R-GTW-003：同一工作空间在同一集群（同 namespace）最多只能存在一个网关实例。
-- R-GTW-004：网关实例支持 CRUD、状态查询、版本升级与回滚。
-- R-GTW-005：高代码/低代码应用对外发布前，必须校验目标工作空间网关实例可用性。
-- R-GTW-006：网关配置支持变更与回滚，并记录变更审计。
-
-### 7. 高代码应用
-
-- R-HCA-001：高代码应用支持三类创建渠道：
-  - DevBox 已发布镜像。
-  - 用户上传镜像。
-  - 用户上传 Helm Chart。
-- R-HCA-002：镜像渠道部署形态为“1 个 Agent 实例 + 0..N 个共享数据服务组件”。
-- R-HCA-003：Helm Chart 渠道部署形态为“1..N 个 Agent 实例 + 0..N 个共享数据服务组件 + 0..N 个 Chart 自带嵌入式组件”。
-- R-HCA-004：高代码应用创建支持两种流程：
-  - 先创建 Agent 实例，再关联组件创建应用。
-  - 一次提交中完成 Agent 实例创建、组件关联与应用创建。
-- R-HCA-005：Application 与 AgentInstance 关系为 1:N；同一 AgentInstance 同时仅允许归属一个 Application。
-- R-HCA-006：关联限制：仅允许同一工作空间、同一集群（同 namespace）的共享数据服务组件。
-- R-HCA-007：Chart 型高代码应用需支持 Chart 版本选择、values 覆盖、依赖镜像校验（工作空间关联仓库）。
-- R-HCA-008：部署时自动生成/管理 Deployment/StatefulSet、Service、ConfigMap/Secret，并注入组件连接信息。
-- R-HCA-009：敏感配置统一通过 Secret 引用注入，用户不可读取明文。
-- R-HCA-010：高代码应用支持 CRUD、状态查询、扩缩容、升级/回滚、滚动重启。
-- R-HCA-011：删除应用默认不级联删除共享数据服务组件；支持显式 `cascade=true`。
-- R-HCA-012：当 `cascade=true` 且共享组件仍被其他应用引用时返回 `409 Conflict` 并阻断该组件删除。
-- R-HCA-013：`cascade=true` 时删除该应用关联的 Agent 实例与独占派生资源（PVC/Secret/ConfigMap 等）。
-- R-HCA-014：Chart 自带嵌入式组件随该应用生命周期管理，不进入共享组件池。
-
-### 8. 记忆体（mem0）
-
-- R-MEM-001：记忆体（`MEMORY`）作为一级资源，支持 CRUD、状态查询、扩缩容、升级/回滚与滚动重启。
-- R-MEM-002：记忆体部署形态为“1 个记忆体主实例 + 1..N 个内部组件实例”。
-- R-MEM-003：记忆体仅支持基于平台内置模板创建，模板格式为 Helm Chart；不支持用户上传镜像/Helm Chart 或导入外部模板创建。
-- R-MEM-004：记忆体与内部组件关系为 1:N；组件关系必须记录 `shared|embedded`、`owner_kind/owner_id` 与健康状态快照。
-- R-MEM-005：关联限制：仅允许同一工作空间、同一集群（同 namespace）的实例参与同一记忆体编排。
-- R-MEM-006：删除记忆体默认不级联删除共享子实例；`cascade=true` 时可删除该记忆体独占与嵌入式子实例。若共享子实例仍被其他资源引用，返回 `409 Conflict` 并阻断该实例删除。
-- R-MEM-007：记忆体详情与组件查询必须返回“主实例 + 内部组件实例列表”，并标注运行状态与引用关系。
-- R-MEM-008：记忆体需记录版本、入口地址（如有）、依赖拓扑与最近一次编排任务结果，便于统一运维视图展示。
-
-### 9. 高代码应用发布与 Helm Chart 沉淀
-
-- R-PKG-001：用户在平台发布高代码应用时，平台必须生成该应用对应 Helm Chart 包（标准化导出包）。
-- R-PKG-002：生成的应用 Chart 必须版本化管理，并与应用发布记录一一关联。
-- R-PKG-003：应用 Chart 版本需推送并保存到工作空间关联镜像仓库（OCI Artifact）。
-- R-PKG-004：平台需提供应用 Chart 下载能力，支持用户在外部环境导入部署。
-- R-PKG-005：应用 Chart 元数据最小集合：
-  `application_id`、`release_version`、`chart_ref`、`source_type`、`source_version`、`digest`、`created_by`、`created_at`。
-- R-PKG-006：镜像型来源与 Helm 来源都必须产出可复现的导出 Chart（包含渲染后必要 values/依赖锁定信息）。
-
-### 10. 应用关系持久化与资源可见性
-
-- R-DATA-001：高代码应用保存“Agent 实例集合 + 共享数据服务组件集合 + 嵌入式组件集合”关系。
-- R-DATA-002：低代码平台保存“平台实例 + 嵌入式组件集合”关系。
-- R-DATA-003：记忆体保存“记忆体主实例 + 内部组件实例集合”关系，并标注 `shared|embedded` 与 `owner_kind/owner_id`。
-- R-DATA-004：关系查询需区分 `shared` 与 `embedded` 资源类型，并标注 `owner_kind/owner_id`。
-- R-DATA-005：查询接口不做跨资源实时聚合计算；应用状态由应用自身任务结果驱动。
-- R-DATA-006：资源软删后保留审计字段：`deleted_at`、`deleted_by`、`delete_task_id`。
-- R-DATA-007：嵌入式资源不得出现在共享资源选择器中。
-- R-DATA-008：应用查看页必须展示 Agent 集合、组件集合、入口地址、发布 Chart 版本信息。
-- R-DATA-009：关系变更（绑定/解绑/级联删除）必须记录审计轨迹。
-- R-DATA-010：应用信息查询采用统一 `applications` 接口视图，覆盖 6 类一级资源
-  `DATA_SERVICE`、`LOW_CODE_PLATFORM`、`DEVBOX`、`GATEWAY`、`HIGH_CODE_APP`、`MEMORY`；
-  低代码平台部署后信息查询必须通过应用接口获取。
-- R-DATA-011：需提供“应用下组件信息查询”能力；
-  `GET /api/v1/applications/{application_id}/components?workspace_id={workspace_id}`。
-  对 `HIGH_CODE_APP` 返回 Agent 实例与组件实例详情，对 `LOW_CODE_PLATFORM`
-  返回平台子组件与依赖组件实例详情；对 `MEMORY` 返回主实例与内部组件实例详情；
-  对 `DATA_SERVICE`、`DEVBOX`、`GATEWAY`
-  返回其运行拓扑组件明细（如 Workload/Service/PVC/Secret 映射）。
-
-### 11. CRUD、权限与异步任务
-
-- R-OPS-001：数据服务组件、低代码平台、DevBox、网关、高代码应用、记忆体 6 类资源的 CUD 统一走异步任务模型；Query 同步返回。
-- R-OPS-002：当前阶段 CUD 接口不强制暴露 `Idempotency-Key` 契约；
-  控制面幂等去重作为内部实现能力保留，后续参数版本可升级为对外必填头。
-- R-OPS-003：权限模型固定为“超级管理员 + 空间管理员 + 用户”，并按工作空间做资源边界控制。
-- R-OPS-004：用户只能操作其已关联工作空间内的高代码应用与记忆体资源；不得开通/关闭低代码平台、不得创建/删除网关实例、不得变更工作空间与集群/镜像仓库绑定；跨工作空间、跨集群、跨 namespace 请求必须拒绝并审计。
-- R-OPS-005：同资源串行化执行，防止并发更新破坏状态一致性。
-- R-OPS-006：更新/删除当前阶段通过“资源状态前置条件 + 同资源串行化”做并发控制；
-  `resource_version` 作为可选增强能力保留。
-- R-OPS-007：任务需支持重试、超时、取消与失败可诊断信息输出。
-- R-OPS-008：任务执行结果需包含最小字段：`resource_kind`、`resource_id`、`started_at`、`ended_at`、`failure_reason`；
-  对外查询以资源 `status/progress/error_message` 为主，不单独暴露任务结果接口。
-- R-OPS-009：删除宿主资源时需同时回收其嵌入式资源；回收失败需进入补偿流程并可重试。
-- R-OPS-010：所有关键操作（创建、更新、删除、发布、导出）必须记录审计日志。
-- R-OPS-011：异步 CUD 执行链路需支持前置/后置自定义埋点扩展点，供其他模块在动作前后执行业务逻辑；
-  埋点能力需支持代码级可配置（注册/开关/顺序/阻断策略），不依赖配置文件、控制台配置或持久化配置。
-- R-OPS-012：统一应用接口需提供完整 OpenAPI 契约：
-  `POST/GET /api/v1/applications`、`GET/PUT/DELETE /api/v1/applications/{application_id}`、
-  `POST /api/v1/applications/{application_id}/actions/start|stop|restart`、
-  `GET /api/v1/applications/{application_id}/components`。
-- R-OPS-013：统一应用接口需定义动作能力矩阵：`start|stop|restart` 的可用性按
-  `resource_type` 约束并在 OpenAPI 中显式声明；不支持的动作返回 `409 Conflict` 与标准错误对象。
-
-## 领域模型与唯一性约束（设计输入）
-
-模型分层约束：
-
-- 一级资源实体固定为：`DataServiceInstance`、`LowCodePlatformInstance`、`DevBoxInstance`、`GatewayInstance`、`HighCodeApplication`、`MemoryInstance`。
-- 支撑资源实体包括：`AgentInstance`、`HighCodeArtifact`、`DevBoxPublishRecord`、`HighCodeReleaseChart`、`MemoryComponentRef`、关系引用实体、任务实体与密钥版本实体。
-- 一级资源承担平台一级能力边界；支撑资源可独立存储或独立接口化，但不改变“6 类一级资源”口径。
-
-- `Workspace`
-  - 主标识：`workspace_id`
-  - 唯一约束：`workspace_name` 全局唯一
-  - 删除策略：软删
-- `ManagedCluster`
-  - 主标识：`cluster_id`
-  - 唯一约束：`cluster_name` 全局唯一
-  - 删除策略：软删
-- `WorkspaceClusterBinding`
-  - 主标识：`binding_id`
-  - 唯一约束：`(workspace_id, cluster_id)` 唯一
-  - 删除策略：软删
-  - 备注：维护 `namespace_name`
-- `WorkspaceRegistryBinding`
-  - 主标识：`registry_binding_id`
-  - 唯一约束：`(workspace_id, registry_id)` 唯一
-  - 删除策略：软删
-- `ResourceTemplate`
-  - 主标识：`template_id`
-  - 唯一约束：`(template_kind, template_name, template_version)` 唯一
-  - 删除策略：软删
-  - 备注：`template_kind` in `{data_service, lowcode_platform, devbox, gateway, memory}`
-- `HighCodeArtifact`
-  - 主标识：`artifact_id`
-  - 唯一约束：`(workspace_id, artifact_name, artifact_version, artifact_type)` 唯一
-  - 删除策略：软删
-  - 备注：`artifact_type` in `{devbox_published_image, uploaded_image, uploaded_helm_chart}`
-- `DataServiceInstance`
-  - 主标识：`data_service_instance_id`
-  - 唯一约束：`(workspace_id, cluster_id, instance_name)` 唯一
-  - 删除策略：软删
-  - 备注：`visibility` in `{shared, embedded}`；`owner_kind/owner_id`
-    可空或必填（embedded 必填）
-- `LowCodePlatformInstance`
-  - 主标识：`lowcode_platform_instance_id`
-  - 唯一约束：`(workspace_id, cluster_id, platform_type, instance_name)` 唯一
-  - 删除策略：软删
-- `DevBoxInstance`
-  - 主标识：`devbox_instance_id`
-  - 唯一约束：`(workspace_id, cluster_id, instance_name)` 唯一
-  - 删除策略：软删
-- `DevBoxPublishRecord`
-  - 主标识：`publish_id`
-  - 唯一约束：`(devbox_instance_id, publish_version)` 唯一
-  - 删除策略：硬删禁止（仅归档）
-- `GatewayInstance`
-  - 主标识：`gateway_instance_id`
-  - 唯一约束：`(workspace_id, cluster_id)` 唯一
-  - 删除策略：软删
-- `HighCodeApplication`
-  - 主标识：`application_id`
-  - 唯一约束：`(workspace_id, cluster_id, application_name)` 唯一
-  - 删除策略：软删
-- `MemoryInstance`
-  - 主标识：`memory_instance_id`
-  - 唯一约束：`(workspace_id, cluster_id, memory_name)` 唯一
-  - 删除策略：软删
-- `MemoryComponentRef`
-  - 主标识：`id`
-  - 唯一约束：`(memory_instance_id, component_id)` 唯一
-  - 删除策略：硬删
-  - 备注：必须记录 `visibility`、`owner_kind/owner_id`
-- `AgentInstance`
-  - 主标识：`agent_instance_id`
-  - 唯一约束：`(workspace_id, cluster_id, agent_instance_name)` 唯一
-  - 删除策略：软删
-  - 备注：由 `artifact_id` 创建
-- `HighCodeApplicationAgentRef`
-  - 主标识：`id`
-  - 唯一约束：`(application_id, agent_instance_id)` 唯一
-  - 删除策略：硬删
-  - 备注：`agent_instance_id` 需唯一归属一个 `application_id`
-- `HighCodeApplicationDataServiceRef`
-  - 主标识：`id`
-  - 唯一约束：`(application_id, data_service_instance_id)` 唯一
-  - 删除策略：硬删
-- `HighCodeReleaseChart`
-  - 主标识：`release_chart_id`
-  - 唯一约束：`(application_id, release_version)` 唯一
-  - 删除策略：软删
-  - 备注：记录 chart OCI 地址、digest、导出包元数据
-- `AsyncTask`
-  - 主标识：`task_id`
-  - 唯一约束：`(idempotency_scope)` 唯一（24h 去重窗口内）
-  - 删除策略：不删除（归档）
-  - 备注：`idempotency_key` 保留原始请求头审计语义；`request_fingerprint` 用于同键异载荷冲突判定；`idempotency_expire_at` 用于 TTL 清理。
-- `SecretVersion`
-  - 主标识：`secret_version_id`
-  - 唯一约束：`(workspace_id, namespace, secret_name, version)` 唯一
-  - 删除策略：软删
-
-补充规则：
-
-- 高代码应用创建时必须至少关联 1 个 Agent 实例。
-- `DataServiceInstance.visibility=embedded` 时，必须存在合法 `owner_kind/owner_id`。
-- 删除高代码应用且 `cascade=true` 时，共享组件若被其他应用引用返回 `409 Conflict`。
-- 删除低代码平台实例时，回收其 `embedded` 组件，不影响共享组件。
-- 删除记忆体且 `cascade=true` 时，共享子实例若被其他资源引用返回 `409 Conflict`。
-- 软删实体必须保留审计字段并支持按 `delete_task_id` 追踪任务。
-
-## 资源状态机（设计输入）
-
-### 资源状态（六类一级资源 + AgentInstance）
-
-- `Creating`：已受理创建任务，资源尚未可用。
-- `Running`：资源可用，健康检查通过。
-- `Updating`：资源升级、配置变更或扩缩容进行中。
-- `Degraded`：资源部分可用，存在告警或副本异常。
-- `Failed`：最近一次创建或更新失败且未恢复。
-- `Deleting`：资源删除进行中。
-- `Deleted`：资源逻辑删除完成。
-- `DeleteFailed`：删除失败，需重试或人工干预。
-
-说明：上述状态为控制面领域状态，不与 K8S Pod Phase 一一对应。
-
-DevBox 补充状态：
-
-- `Stopped`：实例停止但未删除，可恢复启动。
-- `Publishing`：镜像发布任务进行中。
-
-高代码发布包补充状态（ReleaseChart）：
-
-- `Packaging`：Chart 正在生成。
-- `Pushed`：Chart 推送仓库成功。
-- `ExportFailed`：生成或推送失败。
-
-### 异步任务状态（AsyncTask）
-
-- 状态集合：`Pending`、`Running`、`Succeeded`、`Failed`、`Canceled`。
-- 结果字段最小集合：`resource_kind`、`resource_id`、`started_at`、`ended_at`、`failure_reason`、`retry_count`、`serialized_key`。
-
-任务执行规则：
-
-- CUD 请求进入统一任务队列；任务实体作为控制面内部对象，不单独对外提供 Task API。
-- 客户端通过资源详情轮询任务执行进展（`status/progress/error_message`）。
-- 幂等去重、请求指纹冲突判定作为内部能力保留，待参数契约冻结后再对外显式化。
-- 异步 CUD 支持 `before_hook`/`after_hook` 代码扩展点；
-  `before_hook` 用于执行前置校验或上下文改写，`after_hook` 用于执行后置通知或数据同步。
-- 埋点扩展点按资源类型与动作类型（Create/Update/Delete）可配置；
-  配置形态限定为代码注册，不要求配置文件、配置中心或数据库持久化。
-- 去重窗口 24 小时，自首次写入起算；窗口到期后允许生成新任务。
-- 串行化键：`workspace_id:cluster_id:resource_kind:resource_id_or_name`。
-- 重试策略：最多 5 次，指数退避（5s、15s、45s、135s、300s）。
-- 超时策略：创建/更新默认 30 分钟，删除默认 15 分钟，发布导出默认 20 分钟。
-- 取消策略：`Pending` 可取消；`Running` 仅可中断任务可取消。
-
-## 接口契约要求（设计输入）
-
-### 通用契约
-
-- API 前缀统一为 `/api/v1`。
-- 当前阶段资源主路径统一为 `/api/v1/applications`；
-  不再保留 `/api/v1/instances` 顶层资源接口。
-- `workspace_id` 作为查询与鉴权作用域参数（query）；
-  创建请求体必须包含 `workspace_id` 与 `cluster_id`。
-- CUD 接口统一返回 `202 Accepted`，并通过 `Location` + 资源详情轮询获取异步执行结果。
-- Query 同步返回，支持分页、过滤、排序。
-- 返回结构采用“资源对象/列表 + 分页 + 标准错误对象”模式。
-
-### 错误码最小集合
-
-- `400`：参数非法或 schema 校验失败。
-- `401`：未认证。
-- `404`：资源不存在。
-- `409`：冲突（如同名实例冲突、删除级联冲突等）。
-- `500`：系统内部错误。
-
-### 资源接口分组
-
-- 设计约束（OpenAPI 3.0）：
-  - 路径采用“资源集合 + 资源标识”建模，`LIST` 统一使用 `GET` 集合接口表达。
-  - 同一路径通过不同 HTTP Method 区分语义，不使用 `POST/GET/LIST` 混写。
-  - Path 段尽量使用单一单词的复数名词，避免连字符拼接命名。
-
-- 统一应用接口（当前阶段必选，路径参数统一为 `application_id`）：
-  - `POST /api/v1/applications`（请求体包含 `workspace_id`、`cluster_id`、`resource_type`）
-  - `GET /api/v1/applications?workspace_id={workspace_id}&resource_type={DATA_SERVICE|LOW_CODE_PLATFORM|DEVBOX|GATEWAY|HIGH_CODE_APP|MEMORY}`
-  - `GET /api/v1/applications/{application_id}?workspace_id={workspace_id}`
-  - `PUT /api/v1/applications/{application_id}?workspace_id={workspace_id}`
-  - `DELETE /api/v1/applications/{application_id}?workspace_id={workspace_id}`
-  - `POST /api/v1/applications/{application_id}/actions/start|stop|restart?workspace_id={workspace_id}`
-  - `GET /api/v1/applications/{application_id}/components?workspace_id={workspace_id}`（应用下运行组件信息查询）
-
-- 说明：
-  - 现有 OpenAPI 中 `/api/v1/instances/*` 若仍存在，仅可作为短期兼容路径；
-    当前需求基线不再将其作为必选主接口。
-  - 发布产物（Release/Chart 下载）与模板/制品独立查询接口在后续版本补齐，不作为当前 API 基线阻断项。
-  - 异步任务查询通过资源详情轮询实现，不单独开放 `/tasks/*`。
-
-## 权限动作矩阵（设计输入）
-
-| 资源/动作 | 超级管理员 | 空间管理员（已授权 workspace） | 用户（已关联 workspace） | 用户（未关联 workspace） |
-| --- | --- | --- | --- | --- |
-| 工作空间创建/删除/配置空间管理员（平台管理面） | 允许（平台管理面） | 拒绝 | 拒绝 | 拒绝 |
-| 集群纳管与解绑（平台管理面） | 允许（平台管理面） | 拒绝 | 拒绝 | 拒绝 |
-| 工作空间绑定集群/仓库（平台管理面） | 允许（平台管理面） | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
-| 工作空间成员管理（平台管理面） | 允许（平台管理面） | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
-| 数据服务组件实例 CRUD（共享） | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
-| 低代码平台实例开通/变更/删除 | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
-| 低代码平台实例查询 | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
-| 记忆体实例 CRUD | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
-| DevBox 实例 CRUD | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
-| DevBox 镜像发布 | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
-| 网关实例 CRUD | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
-| 高代码制品查询 | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace，用于高代码应用操作） | 拒绝 |
-| Agent 实例 CRUD | 允许 | 允许（仅授权 workspace） | 拒绝 | 拒绝 |
-| 高代码应用 CRUD | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
-| 高代码应用发布与 Chart 下载 | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
-| 低代码平台内应用 CRUD（平台内鉴权） | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
-| 嵌入式组件独立运维 | 允许（超管专用独立接口） | 拒绝（默认） | 拒绝（仅随宿主管理） | 拒绝 |
-| Secret 明文读取 | 拒绝（仅平台控制面服务账号可读） | 拒绝 | 拒绝 | 拒绝 |
-| 资源异步执行状态查询（通过资源详情轮询） | 允许 | 允许（仅授权 workspace） | 允许（仅本 workspace） | 拒绝 |
-
-## Secret 生命周期与审计（设计输入）
-
-- S-SEC-001：Secret 必须保存在工作空间 namespace。
-- S-SEC-002：用户不可查看明文，仅可引用 `secret_ref`。
-- S-SEC-003：Secret 采用版本化命名：`{secret_name}.v{n}`。
-- S-SEC-004：更新 Secret 写入新版本并切换当前版本指针，默认保留 10 个历史版本。
-- S-SEC-005：支持版本回滚。
-- S-SEC-006：当前阶段使用 K8S Secret 默认机制，不引入额外 KMS。
-- S-SEC-007：审计字段最小集合：
-  `secret_name`、`version`、`action`、`actor`、`workspace_id`、`cluster_id`、`timestamp`、`request_id`、`result`。
-
-## 非功能需求（量化）
-
-### 性能与可用性
-
-- NFR-001：CUD 提交接口（仅提交任务）P95 <= 300ms，P99 <= 800ms。
-- NFR-002：Query 接口（非聚合）P95 <= 800ms，P99 <= 2s。
-- NFR-003：任务从 `Pending` 到 `Running` 排队时间 P95 <= 5s。
-- NFR-004：常规创建/更新任务完成时间 P95 <= 10 分钟；删除 P95 <= 5 分钟；发布导出 P95 <= 8 分钟。
-- NFR-005：控制面月度可用性 >= 99.9%。
-
-### 容量
-
-- NFR-006：支持 >= 100 个工作空间，>= 50 个纳管集群。
-- NFR-007：支持 >= 5000 个共享数据服务实例。
-- NFR-008：支持 >= 2000 个低代码平台实例、>= 5000 个 DevBox 实例、>= 5000 个网关实例、>= 5000 个记忆体实例。
-- NFR-009：支持 >= 5000 个高代码应用实例，>= 10000 个 Agent 实例，>= 20000 个记忆体子实例关系。
-- NFR-010：支持日均 >= 10000 个异步任务提交。
-- NFR-011：支持日均 >= 2000 次高代码应用发布 Chart 产物生成与存储。
-
-### 安全与审计
-
-- NFR-012：敏感信息不得明文持久化。
-- NFR-013：审计日志保留期 >= 180 天，任务执行日志保留期 >= 30 天。
-- NFR-014：跨工作空间/跨集群/跨 namespace 关联请求必须拒绝并审计。
-- NFR-015：发布制品元数据（来源、版本、digest、操作者）必须可追溯。
-
-### 可扩展性与运维
-
-- NFR-016：新增资源类型应在不修改任务队列、鉴权主流程前提下完成接入。
-- NFR-017：模板参数必须具备 schema 校验能力，非法参数在提交阶段失败。
-- NFR-018：任务失败需提供可诊断失败原因（错误码、错误信息、失败步骤）。
-- NFR-019：状态更新延迟 <= 30s。
-
-## 验收标准与追踪矩阵
-
-| 需求 ID | 验收条件 | 测试类型 | 责任方 |
+# Aether 模块需求文档
+
+## 1. 文档目标
+
+本文档定义 Agent 平台中 Aether 部署模块的完整需求基线，覆盖：
+
+- 六类资源的统一 CUD 与任务 Query（CUD 触发部署、Query 基于 `task_id` 同步读取当前部署任务状态与任务结果）
+- 统一接口入参与返回值约束
+- 基于调用参数渲染 Helm `values.yaml` 数据的能力，并保证部署执行与 `helm install/upgrade -f values.yaml` 语义等效
+- 多角色、多工作空间、多集群场景下的资源作用域与权限边界
+- 可扩展到新资源类型的通用部署抽象
+
+## 2. 背景与范围
+
+### 2.1 业务背景
+
+Agent 平台需同时支持：
+
+- 高代码 Agent 应用：DevBox 发布镜像或用户上传镜像/Helm Chart 创建
+- 低代码 Agent 应用：平台内置 Dify/FastGPT 或用户上传 Helm Chart 的 Coze Studio/n8n
+
+所有资源底层均通过 Helm 在 Kubernetes 部署。
+
+### 2.2 Aether 责任范围（In Scope）
+
+- 提供通用、复用的资源 CUD/Query 能力
+- 统一资源部署动作管理（创建、更新、删除）与部署任务状态/结果查询接口
+- 提供无状态部署执行能力（不承担资源/任务状态持久化）
+- 基于工作空间/集群/命名空间的部署落地
+- 为上层模块提供可复用接口函数（非对外 OpenAPI）
+- 提供按调用参数渲染 Helm `values.yaml`（文件或数据）的能力，供部署执行与上层预览/审计复用
+
+### 2.3 非目标（Out of Scope）
+
+- 不负责低代码平台内部业务功能（如 Dify/FastGPT 的工作流细节）
+- 不负责平台账号登录认证流程本身
+- 不负责资源级业务约束前置校验（如单实例限制、资源来源组合限制等）
+- 不负责部署状态、任务状态、历史快照的落库维护（由上层业务模块维护）
+- 不负责资源运行态统一查询视图（由上层业务模块按需聚合）
+
+## 3. 术语与对象
+
+- 工作空间（Workspace）：资源管理与权限作用域的核心边界
+- 纳管集群（Managed Cluster）：被平台接入的 Kubernetes 集群
+- 命名空间（Namespace）：工作空间在关联集群中的同名 namespace
+- 纳管镜像仓库（Managed Registry）：被平台接入的 Harbor 仓库
+- 资源类型（Resource Type）：Aether 管理的部署对象类型
+- 资源实例（Resource Instance）：某资源类型的一次实例化部署
+- 部署执行（Deployment Execution）：一次 CUD 动作触发的实际 Helm/K8S 执行过程
+
+## 4. 参与角色与权限要求
+
+### 4.1 角色定义
+
+- 超级管理员
+- 空间管理员
+- 普通用户
+
+### 4.2 权限规则
+
+#### FR-ACL-001 超级管理员权限
+
+超级管理员可操作全部资源，至少包括：
+
+- 纳管 K8S 集群 CRUD
+- 纳管镜像仓库（Harbor）CRUD
+- 工作空间 CRUD
+- 工作空间关联集群 CRUD
+- 工作空间关联镜像仓库 CRUD
+- 工作空间网关实例 CRUD
+- 工作空间空间管理员配置
+- 空间管理员与普通用户全部能力
+
+#### FR-ACL-002 空间管理员权限
+
+空间管理员可在授权工作空间内：
+
+- 开通低代码平台
+- 关联与管理普通用户（CRUD）
+- 执行普通用户全部能力
+
+#### FR-ACL-003 普通用户权限
+
+普通用户可在被关联工作空间内：
+
+- 创建数据服务组件实例
+- 使用 DevBox（CRUD）
+- 创建记忆体实例
+- 创建高代码应用
+- 进入工作空间内低代码平台并操作
+
+#### FR-ACL-004 工作空间内无细粒度隔离
+
+同一工作空间内用户可操作该空间内资源，不做按“资源创建者”维度的二级隔离。
+
+## 5. 资源类型与部署形态
+
+### 5.1 资源类型清单
+
+#### FR-RT-001 Aether 必须支持以下六类资源
+
+- 数据服务组件：PostgreSQL、Redis、Milvus、Weaviate、pgvector、NebulaGraph、MongoDB
+- 低代码平台：Dify、FastGPT、Coze Studio、n8n
+- DevBox
+- 网关（Higress）
+- 高代码应用（openclaw、zeroclaw，以及用户自定义镜像/Chart）
+- 记忆体（mem0）
+
+### 5.2 资源形态说明
+
+以下条目用于约定 Aether 需要承载的资源模板与来源能力，不定义资源级业务约束校验。
+资源级业务约束（如单实例限制、资源来源组合限制）应由上层业务模块在下发资源操作前完成判断。
+
+#### FR-RT-002 数据服务组件形态
+
+- 数据服务组件模板由平台内置（Helm Chart）
+- 高代码应用可绑定用户预先创建的数据服务组件
+- 依赖数据服务的创建与展示策略由上层业务模块定义，Aether 仅按请求执行部署
+
+#### FR-RT-003 低代码平台形态
+
+- 平台内置 Dify/FastGPT 模板，且模板形态为 Helm Chart
+- 支持超级管理员导入 Coze Studio、n8n 或外部 Dify/FastGPT，导入格式仅 Helm Chart
+- 低代码平台依赖项由上层业务模块在请求中显式定义
+
+#### FR-RT-004 DevBox 形态
+
+- DevBox 基于平台内置高代码模板（Helm Chart）创建开发容器
+
+#### FR-RT-005 网关形态
+
+- 网关模板为平台内置 Helm Chart
+
+#### FR-RT-006 高代码应用形态
+
+- 支持三种来源创建：DevBox 发布镜像、用户上传镜像、用户上传 Helm Chart
+- 镜像方式：1 个 Agent 实例 + 1..N 个预创建数据服务组件
+- Helm Chart 方式：1..N 个 Agent 实例 + 1..N 个预创建数据服务组件
+- Helm Chart 内部依赖的解释与展示边界由上层业务模块负责
+
+#### FR-RT-007 记忆体形态
+
+- 模板形态为平台内置 Helm Chart
+- 一个记忆体实例由 1..N 记忆体业务实例 + 1..N 不同数据服务组件实例构成
+- 记忆体依赖项由上层业务模块在请求中显式定义
+
+## 6. 工作空间与多集群映射
+
+### FR-WS-001 工作空间与集群命名空间映射
+
+- 每个工作空间可关联 1..N 纳管集群
+- 每个关联集群中必须创建与工作空间同名 namespace
+- 若关联多个集群，必须在每个集群均创建同名 namespace
+
+### FR-WS-002 工作空间与镜像仓库关联
+
+- 每个工作空间可关联 0..N 纳管镜像仓库
+- Aether 仅消费请求中的镜像/Chart 来源引用，不负责该引用关系持久化（由上层维护）
+
+### FR-WS-003 部署位置必选
+
+- 资源创建请求必须显式传入部署位置，部署位置即目标 K8S 集群
+- 部署位置为必选参数，未传入时请求必须被拒绝并返回参数错误
+
+## 7. Aether 通用能力需求
+
+### 7.1 通用抽象与扩展机制
+
+#### FR-CORE-001 统一部署抽象
+
+Aether 必须提供统一资源部署抽象，至少包括：
+
+- 资源类型注册机制（类型标识、模板来源、参数结构校验规则、默认值规则）
+- 通用 Helm 生命周期执行器（install/upgrade/uninstall）
+- 通用部署任务查询适配器（基于 `task_id` 返回当前部署任务状态与任务结果）
+
+#### FR-CORE-002 可扩展性
+
+新增资源类型时，不允许复制粘贴现有业务流程；应通过“类型注册 + 配置化规则 + 复用执行器”完成接入。
+
+#### FR-CORE-003 统一资源标识
+
+所有资源实例必须具有全局唯一 `resource_id`，并包含 `workspace_id`、`cluster_id`、`namespace`、`resource_type`；唯一性校验与冲突治理由上层模块负责。
+
+#### FR-CORE-004 统一 values 渲染抽象
+
+Aether 必须提供统一的 values 渲染能力，将调用方请求参数渲染为 Helm 可消费的 `values.yaml` 语义等价数据，并支持：
+
+- 以“YAML 数据”形式输出（用于接口返回、预览、审计、调试）
+- 以“可执行输入文件”形式输出（用于 Helm 生命周期执行）
+- 同一请求在同一模板版本下渲染结果必须保持语义确定性
+
+### 7.2 接口函数契约
+
+#### FR-API-001 Aether 仅提供代码级接口
+
+Aether 不直接暴露外部 OpenAPI，仅提供可供其他模块调用的 Go 接口。
+
+#### FR-API-002 统一 CUD 入参
+
+CUD 接口必须复用统一请求结构，最小字段包括：
+
+- `request_id`（幂等请求号）
+- `operator`（操作者身份与角色信息）
+- `workspace_id`
+- `target`（resource_type、resource_id，可选）
+- `cluster_id`（目标部署集群，必填）
+- `spec`（资源声明配置，含 Helm values/依赖引用）
+- `labels` / `annotations`（可选）
+
+#### FR-API-003 统一 CUD 返回
+
+CUD 接口必须同步返回受理结果，不阻塞部署完成，最小字段包括：
+
+- `request_id`（回显）
+- `task_id`（用于后续任务状态查询）
+- `resource_id`（创建场景可先分配）
+- `accepted_at`
+- `status`（固定为 `ACCEPTED`）
+
+#### FR-API-004 Query 接口能力
+
+Query 接口必须同步返回，且仅支持按 `task_id` 执行单任务查询：
+
+- 请求参数：`task_id`（必填）
+- Query 返回值定义为“该 `task_id` 对应部署任务的当前状态与任务结果”，不承诺资源运行态视图与历史时间线聚合
+
+#### FR-API-005 统一错误模型
+
+接口错误必须采用统一错误码体系，至少区分：
+
+- 参数错误
+- 权限错误
+- 资源不存在
+- 资源冲突
+- 依赖缺失
+- 渲染错误（values 渲染失败、渲染结果不满足模板/Schema 约束）
+- 任务查询上下文不可用（执行器/K8S/Helm 反馈不可达）
+- 内部错误
+
+#### FR-API-006 values 渲染接口能力
+
+Aether 必须向上层调用方提供 values 渲染能力（代码级接口），用于将调用参数渲染为 `values.yaml`；该能力至少支持：
+
+- 基于统一请求语义进行渲染（与 CUD 输入语义一致）
+- 输出格式可选：`values.yaml` 数据或可执行输入文件
+- 对同一请求的 CUD 执行，必须复用同一渲染规则，避免“预览渲染结果”与“实际执行输入”分叉
+
+### 7.3 部署执行模型（无状态）
+
+#### FR-EXEC-001 CUD 触发执行
+
+Create/Update/Delete 均以“受理即触发执行”方式运行，CUD 接口不阻塞部署完成。
+
+#### FR-EXEC-002 技术实现约束
+
+- 执行与查询的事实来源为 Kubernetes/Helm
+- Aether 不强制依赖 PostgreSQL 持久化资源/任务元数据
+- Aether 不强制依赖 Redis 作为任务队列或分布式锁基础设施
+
+#### FR-EXEC-003 幂等与重入
+
+- 基于 `request_id + workspace_id + action` 提供幂等保护能力（仅使用已在接口契约中定义的字段）
+- 可恢复错误的重试策略由调用方或上层编排模块负责，Aether 不要求内建持久重试队列
+- 同一资源并发互斥不作为 Aether 强制内建能力，可由上层模块治理
+
+#### FR-EXEC-004 Helm 命令语义等效约束
+
+Aether 的 Create/Update 执行语义必须与以下命令保持等效：
+
+- Create 等效于 `helm install <release> <chart> -f <rendered-values.yaml>`
+- Update 等效于 `helm upgrade <release> <chart> -f <rendered-values.yaml>`
+
+其中 `<rendered-values.yaml>` 必须来自 Aether 对同一请求参数的标准化渲染结果；Aether 不得在执行路径引入与渲染接口不同的第二套 values 组装逻辑。
+
+### 7.4 查询与一致性
+
+#### FR-Q-001 查询一致性要求
+
+Query 返回“当前部署任务状态与任务结果”，状态来源于当前执行上下文与 Helm/K8S 执行反馈；不承诺返回持久化中间态时间线。
+
+#### FR-Q-002 部署任务状态与结果查询
+
+必须提供任务查询接口函数（按 `task_id`）供上层轮询，并由上层自行维护任务历史快照。
+
+## 8. 数据与状态管理需求
+
+### FR-DM-001 无强制落库
+
+Aether 不强制建设资源实例主表、任务表、任务事件表等持久化实体；任务状态与任务结果基于当前执行上下文与 Helm/K8S 执行反馈提供。
+
+### FR-DM-002 依赖关系表达
+
+资源依赖关系需通过请求 `spec` 显式表达，并在部署执行阶段正确展开：
+
+- 高代码应用 -> 数据服务组件引用
+- 低代码平台 -> 上层定义的依赖集合
+- 记忆体 -> 上层定义的依赖集合
+- Helm 高代码应用 -> 上层定义的依赖集合
+
+### FR-DM-003 依赖展示责任边界
+
+Aether 不维护依赖展示语义及其状态模型，相关策略由上层业务模块负责。
+
+### FR-DM-004 依赖删除策略责任边界
+
+- 依赖删除/保留策略由上层业务模块决定并在请求中显式声明
+- Aether 不内置基于依赖展示分类的强制级联规则
+
+## 9. 非功能需求
+
+### NFR-001 技术栈约束
+
+- 后端语言：Go
+- Web/API 框架：Gin
+- 模板/部署包标准：Helm Chart
+- 任务状态/结果事实来源：部署执行上下文 + Kubernetes API / Helm 执行反馈
+
+### NFR-002 可扩展性目标
+
+新增资源类型不应修改通用部署编排核心逻辑，仅新增类型定义和规则。
+
+### NFR-003 可靠性目标
+
+- 部署执行失败可由调用方复用同一 `request_id + workspace_id + action` 触发幂等重试
+- 任务查询结果应可反映当前部署任务状态与任务结果
+- 对同一资源并发变更的治理由上层模块负责
+
+### NFR-004 可审计性目标
+
+所有 CUD 行为需输出结构化日志（含操作者、请求参数摘要、执行结果），持久审计留存由上层模块负责。
+
+### NFR-005 values 渲染一致性目标
+
+- 同一请求参数 + 同一模板版本在重复渲染时应输出语义等价的 `values.yaml`
+- CUD 执行实际使用的 values 输入应可追溯到对应渲染结果（可通过摘要/指纹等方式）
+
+## 10. 边界集成需求
+
+### FR-INT-001 与上层模块集成方式
+
+各业务模块（高代码应用、低代码平台、DevBox、网关等）负责：
+
+- 接收自身 OpenAPI 请求
+- 在调用 Aether 前完成资源级业务约束前置校验（如单实例限制、资源来源组合限制等）
+- 将业务请求转换为 Aether 统一入参
+- 按业务需要选择：先调用 values 渲染能力做预览/审计，再发起 CUD；或直接发起 CUD 由 Aether 内部渲染
+- 调用 Aether 通用接口函数
+- 轮询 Aether 任务查询接口并维护业务侧任务状态表/历史快照
+
+## 11. 验收标准
+
+### AC-001 统一接口
+
+六类资源均可通过同一套 CUD/Query 接口完成生命周期操作，无需为每类资源单独实现一套引擎。
+
+### AC-002 异步执行
+
+CUD 请求返回 `ACCEPTED` 受理结果；上层可通过任务查询接口轮询当前部署任务状态与任务结果，并自行维护状态流转。
+
+### AC-003 查询能力
+
+任务查询仅支持按 `task_id` 单任务查询，并在工作空间维度满足权限规则。
+
+### AC-004 依赖策略边界
+
+依赖展示与管理策略由上层业务模块维护，Aether 仅执行部署与任务状态/结果查询，不提供依赖分类规则。
+
+### AC-005 values 渲染能力
+
+上层调用方可基于统一请求语义获取 `values.yaml` 渲染结果，且支持“YAML 数据”与“可执行输入文件”两种输出形态。
+
+### AC-006 Helm 执行等效性
+
+在相同 Chart 与相同渲染结果前提下，Aether Create/Update 的实际部署效果应与手工执行 `helm install/upgrade -f values.yaml` 等效。
+
+## 12. 待澄清项（需产品/架构进一步确认）
+
+- 当前无
+
+## 13. 设计与任务拆解补充基线（规范性附录）
+
+本章节用于将现有需求条目转换为可直接拆分设计任务与开发任务的实现输入，约束级别与 FR/NFR/AC 等价。
+
+### 13.1 当前生效决策基线（一页版）
+
+- 适用日期：2026-03-01
+- 生效决策（纳入设计输入）：D-001、D-003、D-005、D-007、D-010、D-011、D-012、D-013、D-015、D-016、D-017、D-018、D-019
+- 废止决策（不得作为设计输入）：D-002、D-004、D-006、D-008、D-009、D-014
+
+当前生效决策收敛后的实现边界如下：
+
+- Aether 仅负责部署执行与任务状态/结果查询，不承担资源/任务状态持久化。
+- CUD 同步受理并返回 `ACCEPTED + task_id`；Query 仅支持按 `task_id` 单任务查询。
+- 幂等键仅允许使用 `request_id + workspace_id + action`。
+- Aether 必须具备 `values.yaml` 标准化渲染能力，且 Create/Update 执行语义需等效 `helm install/upgrade -f values.yaml`。
+- 资源级业务约束前置校验、依赖展示语义、依赖删除策略由上层业务模块负责并显式传参。
+- 扩展新资源类型必须通过“类型注册 + 配置化规则 + 通用执行器复用”完成，禁止复制现有业务流程。
+- 工作空间是核心授权边界；同空间内不按资源创建者做二级隔离。
+
+### 13.2 设计文档强制约束（接口定义归属设计阶段）
+
+`requirements.md` 仅定义“做什么”和边界，不承载函数接口定义、DTO 字段定义、OpenAPI 定义等设计产物；该类内容必须在设计文档中提供。
+
+设计文档（`docs/design.md`）至少必须包含以下内容：
+
+1. 代码级接口定义：Go 接口签名、请求/响应 DTO、枚举、字段校验规则、错误码表。
+2. 接口边界映射：上层模块 OpenAPI 与 Aether 代码级接口之间的映射关系（Aether 自身仍不对外暴露 OpenAPI）。
+3. 任务状态机与幂等/重入判定规则：状态枚举、状态流转、重试语义、冲突判定语义。
+4. 资源类型注册与扩展机制：注册 schema、默认值策略、生命周期执行策略、新资源接入模板。
+5. 依赖表达与删除策略：依赖字段 schema、解析/缺失处理、删除策略参数与行为。
+6. 验收测试追踪矩阵：FR/NFR/AC 到测试点的一一映射关系。
+7. 图示语法约束：凡需画图的内容（架构图、状态图、时序图、流程图）必须使用 Mermaid 语法；禁止使用图片、PlantUML 或其他图形语法。
+8. 设计完成粒度约束：所有任务完成后，`docs/design.md` 必须达到“可直接指导编码”的粒度，至少覆盖：数据结构、状态流转、接口契约、异常码、并发/幂等、关键流程时序、边界条件。
+9. values 渲染与执行等效性设计：必须定义参数到 `values.yaml` 的渲染规则、输出形态（数据/文件）、渲染一致性策略，以及与 `helm install/upgrade -f values.yaml` 的等效性保证机制。
+
+任务拆解文档（`docs/task/task_design.md`）必须显式引用上述设计章节，并保证每个任务可追踪到对应需求条目与验收测试点。
+
+### 13.3 任务状态机与幂等处理规则
+
+#### 13.3.1 任务状态机
+
+- CUD 受理态：`ACCEPTED`
+- 执行中态：`RUNNING`
+- 终态：`SUCCEEDED`、`FAILED`
+- 查询降级态：`UNKNOWN`（仅表示查询时上下文不可达，不改变任务终态语义）
+
+状态流转规则：
+
+- `ACCEPTED -> RUNNING`
+- `RUNNING -> SUCCEEDED | FAILED`
+- `ACCEPTED -> FAILED`（受理后预检查失败）
+- `* -> UNKNOWN`（查询时临时降级，不作为持久状态机终态）
+
+#### 13.3.2 幂等与重入规则
+
+- 幂等键：`request_id + workspace_id + action`
+- 请求指纹：对 `operator + cluster_id + target + spec + labels + annotations` 做规范化哈希
+- 无状态前提：Aether 不依赖资源表/任务表/幂等记录表进行幂等判定
+- 事实来源：幂等与重入判定仅基于当前请求计算结果 + Helm/K8S 当前可观测事实（release 元数据、revision、资源注解）
+- 命中规则：
+  - 由幂等键生成稳定 `task_id` 与 release 标识；若查询到同幂等键且同请求指纹的在途/已完成执行事实，则返回同一 `task_id/resource_id`，不重复触发执行
+  - 幂等键命中但请求指纹不一致：返回 `AETHER_CONFLICT`
+- 重入规则：
+  - 调用方可复用同一 `request_id + workspace_id + action` 发起重试
+  - Aether 需先读取目标 release 当前事实状态；若已成功则直接返回成功结果，若未成功则继续执行到下一稳定状态
+
+### 13.4 资源类型注册 schema 与新增资源接入模板
+
+#### 13.4.1 注册 schema（示例）
+
+```yaml
+resource_type: HIGH_CODE_APP
+category: HIGH_CODE
+template:
+  source_kind: BUILTIN_CHART # BUILTIN_CHART | IMAGE | EXTERNAL_CHART
+  ref: charts/highcode
+  version: ">=1.0.0"
+spec_schema_ref: schemas/high_code_app.schema.json
+defaults_ref: values/high_code_app.defaults.yaml
+lifecycle:
+  install_timeout_seconds: 900
+  upgrade_timeout_seconds: 900
+  uninstall_timeout_seconds: 600
+  atomic: true
+capabilities:
+  supports_create: true
+  supports_update: true
+  supports_delete: true
+  dependency_mode: EXPLICIT_ONLY
+query:
+  adapter: HELM_TASK_ADAPTER
+```
+
+#### 13.4.2 新增资源类型接入模板
+
+1. 注册资源类型元数据：补齐 `resource_type/category/template/spec_schema_ref/defaults_ref`。
+2. 定义参数 schema 与默认值：确保 `spec.values` 可验证、可补默认值。
+3. 配置生命周期执行参数：install/upgrade/uninstall 超时、原子性、回滚策略。
+4. 配置依赖展开规则：声明是否启用 `EXPLICIT_ONLY` 依赖解析。
+5. 编写资源类型契约测试：覆盖 Create/Update/Delete/QueryTask 与错误码分支。
+6. 编写扩展性回归测试：验证新增类型无需改动通用执行编排核心逻辑（NFR-002）。
+
+### 13.5 依赖表达 schema 与执行/删除策略参数
+
+#### 13.5.1 `spec.dependencies` schema（最小集）
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `dependency_id` | 是 | 依赖项唯一标识（请求内唯一） |
+| `alias` | 是 | 绑定别名，供模板渲染引用 |
+| `resource_type` | 是 | 依赖资源类型 |
+| `resource_id` | 是 | 依赖资源实例标识 |
+| `required` | 是 | `true` 缺失即失败；`false` 可按策略忽略 |
+| `bind_path` | 是 | 注入到 `spec.values` 的目标路径 |
+
+#### 13.5.2 依赖执行策略
+
+- 展开原则：仅解析请求内显式声明的依赖项，不推断隐式依赖。
+- 缺失处理：
+  - `required=true` 且无法解析：返回 `AETHER_DEPENDENCY_MISSING`
+  - `required=false` 且无法解析：允许跳过该绑定并记录结构化日志
+- Aether 不维护“依赖展示模型”，仅负责请求内依赖展开与执行。
+
+#### 13.5.3 依赖删除策略参数
+
+- 枚举值：`RETAIN`、`CASCADE_EXPLICIT`、`BLOCK`。
+- `RETAIN`：删除主资源时不处理依赖资源（默认）。
+- `CASCADE_EXPLICIT`：仅删除 `delete_options.dependency_ids` 显式列出的依赖。
+- `BLOCK`：若请求声明存在依赖关系，直接拒绝删除并返回冲突错误。
+- Aether 不内置任何基于依赖“展示分类”的强制级联规则。
+
+### 13.6 验收用例矩阵（FR/NFR/AC -> 测试点）
+
+| TC-ID | 覆盖需求 | 测试场景 | 期望结果 |
 | --- | --- | --- | --- |
-| R-ENV-003 | 绑定 workspace 与 cluster 后，自动创建/复用同名 namespace | 集成测试 | 后端 |
-| R-ABS-002 | 6 类资源 CUD 均复用统一执行链路并产出统一状态结构 | 集成测试 | 后端 |
-| R-DSP-008 | 低代码平台嵌入式组件不出现在共享组件列表 | 集成测试 + E2E | 后端 + 前端 |
-| R-LCP-003 | 超级管理员可通过 Helm 导入 Coze/n8n/外部 Dify/FastGPT | 集成测试 | 后端 |
-| R-DBX-006 | 未发布镜像不能创建高代码应用 | 单元测试 + 集成测试 | 后端 |
-| R-GTW-003 | 每 workspace+cluster 仅允许一个网关实例 | 单元测试 + 集成测试 | 后端 |
-| R-HCA-003 | Chart 渠道可部署多 Agent 并处理 Chart 自带组件 | 集成测试 + E2E | 后端 |
-| R-HCA-012 | `cascade=true` 且共享组件被复用时返回 `409` | 集成测试 | 后端 |
-| R-DATA-010 | 应用信息查询统一走 `applications` 接口并覆盖 6 类一级资源 | 集成测试 + E2E | 后端 + 前端 |
-| R-DATA-011 | 应用组件查询接口可按应用类型返回对应运行组件明细 | 集成测试 + E2E | 后端 + 前端 |
-| R-MEM-002 | 记忆体可按“主实例 + 内部组件实例”完成创建/更新编排 | 集成测试 + E2E | 后端 + 前端 |
-| R-MEM-007 | 记忆体组件查询返回主实例与内部组件实例详情 | 集成测试 + E2E | 后端 + 前端 |
-| R-PKG-001 | 发布高代码应用后自动生成可用 Helm Chart 包 | 集成测试 + E2E | 后端 |
-| R-PKG-003 | 发布 Chart 成功推送到工作空间关联仓库并可追溯版本 | 集成测试 | 后端 |
-| R-PKG-004 | 用户可下载发布 Chart 并在外部环境导入成功 | E2E | 前端 + 后端 |
-| R-OPS-001 | 6 类资源 CUD 异步、Query 同步符合契约 | E2E | 前端 + 后端 |
-| R-OPS-011 | 异步 CUD 支持代码级可配置的前后置埋点扩展点，其他模块可注册并生效 | 单元测试 + 集成测试 | 后端 |
-| R-OPS-012 | 统一应用接口 CURD+start/stop/restart+components 在 OpenAPI 中完整定义并可用 | 集成测试 + E2E | 后端 + 前端 |
-| R-OPS-013 | 按 `resource_type` 的动作能力矩阵在 OpenAPI 与运行时校验中一致生效 | 集成测试 + E2E | 后端 + 前端 |
-| NFR-001~005 | 性能与可用性满足量化指标 | 压测 + 运行验收 | SRE + 后端 |
-
-## 交付物与接口（面向设计）
-
-- OpenAPI 3.0 草案（基于 `applications` 单资源模型，含 6 类资源、状态轮询契约与错误码）。
-- 统一资源抽象模型与 ERD（含 owner/visibility 语义、唯一性约束）。
-- 统一状态机定义（资源状态机、任务状态机、发布包状态机、解绑状态机）。
-- 异步任务与补偿设计说明（串行化键、重试、超时、取消、回收补偿；任务为内部模型）。
-- 异步 CUD 埋点扩展机制设计说明（before/after hook、代码注册与执行策略）。
-- 模板与制品适配设计（内置 Helm、导入 Helm、镜像转发布 Chart）。
-- 权限矩阵与鉴权流程说明（角色、workspace 边界、嵌入式资源边界）。
-- NFR 验收报告模板与需求追踪矩阵。
-
-## 需求管理
-
-- 需求持续演进，不设置冻结点；每次变更必须同步更新 `docs/requirements.md` 与 `docs/decision.md`。
+| TC-001 | FR-API-002、FR-WS-003 | Create 缺少 `cluster_id` | 返回 `AETHER_INVALID_ARGUMENT` |
+| TC-002 | FR-API-003、FR-EXEC-001、AC-002 | 提交合法 Create | 同步返回 `ACCEPTED + task_id`，不阻塞部署完成 |
+| TC-003 | FR-API-004、FR-Q-002、AC-003 | 通过 `task_id` 查询任务 | 返回当前任务状态与结果，仅支持单任务查询 |
+| TC-004 | FR-API-005、FR-ACL-001/002/003 | 非授权角色调用 CUD | 返回 `AETHER_PERMISSION_DENIED` |
+| TC-005 | FR-ACL-004 | 同空间不同用户操作同一资源 | 在工作空间维度允许操作，不按创建者隔离 |
+| TC-006 | FR-EXEC-003、NFR-003 | 同幂等键重复提交且请求指纹一致 | 返回同一 `task_id/resource_id`，不重复执行 |
+| TC-007 | FR-EXEC-003、NFR-003 | 同幂等键重复提交但请求指纹不同 | 返回 `AETHER_CONFLICT` |
+| TC-008 | FR-DM-002、FR-RT-006/007 | 请求包含 `required=true` 且缺失依赖 | 返回 `AETHER_DEPENDENCY_MISSING` |
+| TC-009 | FR-DM-004、AC-004 | Delete 使用 `RETAIN` | 主资源删除后依赖不被 Aether 强制处理 |
+| TC-010 | FR-DM-004 | Delete 使用 `CASCADE_EXPLICIT` 并传依赖列表 | 仅删除显式列出的依赖项 |
+| TC-011 | FR-Q-001、FR-API-005 | Query 时 K8S/Helm 不可达 | 返回 `AETHER_QUERY_CONTEXT_UNAVAILABLE` 或 `UNKNOWN` 状态 |
+| TC-012 | FR-CORE-001、AC-001 | 六类资源分别执行 CUD + QueryTask | 通过同一套接口完成生命周期操作 |
+| TC-013 | FR-CORE-002、NFR-002 | 新增资源类型接入 | 仅新增注册与规则，无需改通用执行核心 |
+| TC-014 | FR-INT-001 | 上层模块传入已完成前置校验的请求 | Aether 正常受理，不重复执行业务约束校验 |
+| TC-015 | NFR-001 | 技术栈合规检查 | 代码实现满足 Go + Gin + Helm 约束 |
+| TC-016 | NFR-004 | CUD 全链路日志检查 | 日志包含操作者、请求摘要、执行结果 |
+| TC-017 | AC-001、AC-003 | 六类资源的 QueryTask 权限校验 | 均按工作空间权限边界生效 |
+| TC-018 | AC-004、FR-DM-003 | 查询返回中验证依赖展示职责 | 不输出依赖展示语义模型，仅返回任务状态/结果 |
+| TC-019 | FR-CORE-004、FR-API-006、AC-005 | 对同一请求执行 values 渲染（数据输出 + 文件输出） | 两种输出语义等价且均可被 Helm 消费 |
+| TC-020 | FR-EXEC-004、AC-006 | 使用同一 Chart 与渲染结果对比 Aether Create/Update 与手工 Helm 命令 | 部署结果语义等效 |
+| TC-021 | FR-API-005 | values 渲染失败或不满足模板/Schema 约束 | 返回“渲染错误”类别错误码 |
+| TC-022 | NFR-005 | 同一请求 + 同一模板版本重复渲染 | 输出语义保持一致，且执行输入可追溯到渲染结果摘要 |

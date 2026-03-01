@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pre-commit Fixer"
+  short_description: "Run pre-commit and apply lossless fixes"
+  default_prompt: "Use $pre-commit-fixer to run `uv run pre-commit run --all-files`, fix findings without waiver comments, and preserve semantics and content."
